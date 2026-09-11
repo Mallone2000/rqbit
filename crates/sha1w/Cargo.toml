@@ -12,10 +12,13 @@ readme = "README.md"
 
 [features]
 default = ["sha1-crypto-hash"]
-sha1-crypto-hash = ["crypto-hash"]
+# Keep the public feature name for downstream compatibility while using the
+# maintained RustCrypto implementation.
+sha1-crypto-hash = ["sha1", "sha2"]
 sha1-ring = ["aws-lc-rs"]
 
 [dependencies]
 assert_cfg.workspace = true
-crypto-hash = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 aws-lc-rs = { workspace = true, optional = true }

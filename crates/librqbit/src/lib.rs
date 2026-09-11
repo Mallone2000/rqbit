@@ -43,6 +43,7 @@ mod stat_gen;
 
 pub mod api;
 mod api_error;
+mod automation;
 mod bitv;
 mod bitv_factory;
 mod chunk_tracker;
@@ -86,6 +87,7 @@ pub use error::{Error, Result};
 
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};
+pub use automation::{AutomationCategory, TorrentAutomationMetadata};
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
 pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;

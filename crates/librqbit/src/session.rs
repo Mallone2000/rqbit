@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::Read,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
@@ -8,11 +8,12 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
-    ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared,
+    ApiError, AutomationCategory, CreateTorrentOptions, FileInfos, ManagedTorrent,
+    ManagedTorrentShared, TorrentAutomationMetadata,
     api::TorrentIdOrHash,
     api_error::WithStatus,
     bitv_factory::{BitVFactory, NonPersistentBitVFactory},
@@ -36,7 +37,8 @@ use crate::{
     },
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
-        TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
+        TorrentAutomationRuntime, TorrentMetadata, TorrentStateLive,
+        initializing::TorrentStateInitializing,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
 };
@@ -74,7 +76,18 @@ use tracker_comms::{TrackerComms, UdpTrackerClient};
 
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
+const MAX_PENDING_AUTOMATION_TORRENTS: usize = 64;
+const MAX_CONCURRENT_AUTOMATION_RESOLUTIONS: usize = 8;
+const AUTOMATION_METADATA_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 pub type TorrentId = usize;
+
+pub(crate) fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 struct ParsedTorrentFile {
     meta: TorrentMetaV1Owned,
@@ -96,6 +109,23 @@ fn torrent_from_bytes(bytes: Bytes) -> anyhow::Result<ParsedTorrentFile> {
 #[derive(Default)]
 pub struct SessionDatabase {
     torrents: HashMap<TorrentId, ManagedTorrentHandle>,
+    automation_categories: BTreeMap<String, AutomationCategory>,
+    pending_automation_torrents: HashMap<Id20, PendingAutomationTorrent>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PendingAutomationTorrentState {
+    ResolvingMetadata,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingAutomationTorrent {
+    pub info_hash: Id20,
+    pub name: Option<String>,
+    pub automation: TorrentAutomationMetadata,
+    pub state: PendingAutomationTorrentState,
+    cancellation_token: CancellationToken,
 }
 
 impl SessionDatabase {
@@ -136,6 +166,7 @@ pub struct Session {
 
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
+    pending_automation_resolution_semaphore: Arc<tokio::sync::Semaphore>,
     pub ratelimits: Limits,
 
     pub blocklist: IpRanges,
@@ -291,6 +322,10 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    /// Metadata used by download automation integrations.
+    #[serde(default)]
+    pub automation: TorrentAutomationMetadata,
 }
 
 pub struct ListOnlyResponse {
@@ -546,6 +581,11 @@ struct InternalAddResult {
     name: Option<String>,
 }
 
+struct MagnetResolutionControl {
+    cancellation_token: CancellationToken,
+    timeout: Duration,
+}
+
 impl Session {
     /// Create a new session with default options.
     /// The passed in folder will be used as a default unless overridden per torrent.
@@ -561,6 +601,120 @@ impl Session {
 
     pub fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+
+    pub fn output_folder(&self) -> &Path {
+        &self.output_folder
+    }
+
+    pub fn is_dht_enabled(&self) -> bool {
+        self.dht.is_some()
+    }
+
+    pub fn automation_categories(&self) -> Vec<AutomationCategory> {
+        self.db
+            .read()
+            .automation_categories
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn has_automation_category(&self, name: &str) -> bool {
+        name.is_empty() || self.db.read().automation_categories.contains_key(name)
+    }
+
+    /// Returns false when the category already exists.
+    pub async fn create_automation_category(&self, name: String) -> anyhow::Result<bool> {
+        if self.db.read().automation_categories.contains_key(&name) {
+            return Ok(false);
+        }
+
+        let category = AutomationCategory { name };
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.store_automation_category(&category).await?;
+        }
+
+        let mut db = self.db.write();
+        if db.automation_categories.contains_key(&category.name) {
+            return Ok(false);
+        }
+        db.automation_categories
+            .insert(category.name.clone(), category);
+        Ok(true)
+    }
+
+    /// Delete a category and unassign it from managed and pending torrents.
+    /// Returns false when the category does not exist.
+    pub async fn delete_automation_category(&self, name: &str) -> anyhow::Result<bool> {
+        if !self.db.read().automation_categories.contains_key(name) {
+            return Ok(false);
+        }
+
+        let torrent_ids = self.with_torrents(|torrents| {
+            torrents
+                .filter_map(|(id, torrent)| {
+                    (torrent.automation_metadata().category == name).then_some(id)
+                })
+                .collect::<Vec<_>>()
+        });
+        for id in torrent_ids {
+            self.set_torrent_automation_category(id.into(), String::new())
+                .await?;
+        }
+
+        {
+            let mut db = self.db.write();
+            for pending in db.pending_automation_torrents.values_mut() {
+                if pending.automation.category == name {
+                    pending.automation.category.clear();
+                }
+            }
+        }
+
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.delete_automation_category(name).await?;
+        }
+
+        Ok(self.db.write().automation_categories.remove(name).is_some())
+    }
+
+    pub async fn set_torrent_automation_category(
+        &self,
+        id: TorrentIdOrHash,
+        category: String,
+    ) -> anyhow::Result<()> {
+        if !self.has_automation_category(&category) {
+            bail!("automation category does not exist");
+        }
+        let torrent = self.get(id).context("no such torrent in db")?;
+        let old_category = torrent.automation_metadata().category;
+        torrent.set_automation_category(category);
+        if let Some(persistence) = self.persistence.as_ref()
+            && let Err(error) = persistence.update_metadata(torrent.id(), &torrent).await
+        {
+            torrent.set_automation_category(old_category);
+            return Err(error).context("error persisting automation category");
+        }
+        Ok(())
+    }
+
+    pub async fn set_torrent_automation_limits(
+        &self,
+        id: TorrentIdOrHash,
+        ratio_limit: Option<f64>,
+        seeding_time_limit_seconds: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let torrent = self.get(id).context("no such torrent in db")?;
+        let old = torrent.automation_metadata();
+        torrent.set_automation_limits(ratio_limit, seeding_time_limit_seconds);
+        if let Some(persistence) = self.persistence.as_ref()
+            && let Err(error) = persistence.update_metadata(torrent.id(), &torrent).await
+        {
+            torrent.set_automation_limits(old.ratio_limit, old.seeding_time_limit_seconds);
+            return Err(error).context("error persisting automation limits");
+        }
+        Ok(())
     }
 
     /// Create a new session with options.
@@ -799,6 +953,9 @@ impl Session {
                 concurrent_initialize_semaphore: Arc::new(tokio::sync::Semaphore::new(
                     opts.concurrent_init_limit.unwrap_or(3),
                 )),
+                pending_automation_resolution_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                    MAX_CONCURRENT_AUTOMATION_RESOLUTIONS,
+                )),
                 udp_tracker_client,
                 ratelimits: Limits::new(opts.ratelimits),
                 ipv4_only: opts.ipv4_only,
@@ -861,6 +1018,15 @@ impl Session {
             if let Some(persistence) = session.persistence.as_ref() {
                 info!("will use {persistence:?} for session persistence");
 
+                let categories = persistence.load_automation_categories().await?;
+                {
+                    let mut db = session.db.write();
+                    for category in categories {
+                        db.automation_categories
+                            .insert(category.name.clone(), category);
+                    }
+                }
+
                 let mut ps = persistence.stream_all().await?;
                 let mut added_all = false;
                 let mut futs = FuturesUnordered::new();
@@ -895,6 +1061,7 @@ impl Session {
             }
 
             session.start_speed_estimator_updater();
+            session.start_automation_updater();
 
             Ok(session)
         }
@@ -1065,7 +1232,10 @@ impl Session {
             .cloned()
             .collect::<Vec<_>>();
         for torrent in torrents {
-            if let Err(e) = torrent.pause() {
+            torrent.refresh_automation_stats(unix_time_seconds());
+            if torrent.is_paused() {
+                self.try_update_persistence_metadata(&torrent).await;
+            } else if let Err(e) = self.pause(&torrent).await {
                 debug!("error pausing torrent: {e:#}");
             }
         }
@@ -1082,12 +1252,174 @@ impl Session {
         callback(&mut self.db.read().torrents.iter().map(|(id, t)| (*id, t)))
     }
 
+    pub(crate) fn pending_automation_torrents(&self) -> Vec<PendingAutomationTorrent> {
+        self.db
+            .read()
+            .pending_automation_torrents
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Register a magnet immediately, then resolve its metadata in the session task set.
+    /// Returns false when the hash is already managed or already pending.
+    pub(crate) fn add_pending_automation_magnet(
+        self: &Arc<Self>,
+        magnet_url: String,
+        opts: AddTorrentOptions,
+    ) -> anyhow::Result<bool> {
+        let magnet = Magnet::parse(&magnet_url).context("provided URL is not a valid magnet")?;
+        let info_hash = magnet
+            .as_id20()
+            .context("magnet link didn't contain a BTv1 infohash")?;
+        let cancellation_token = self.cancellation_token.child_token();
+
+        {
+            let mut db = self.db.write();
+            if db
+                .torrents
+                .values()
+                .any(|torrent| torrent.info_hash() == info_hash)
+                || db.pending_automation_torrents.contains_key(&info_hash)
+            {
+                return Ok(false);
+            }
+            if db.pending_automation_torrents.len() >= MAX_PENDING_AUTOMATION_TORRENTS {
+                bail!(
+                    "too many pending automation torrents (maximum {})",
+                    MAX_PENDING_AUTOMATION_TORRENTS
+                );
+            }
+            db.pending_automation_torrents.insert(
+                info_hash,
+                PendingAutomationTorrent {
+                    info_hash,
+                    name: magnet.name,
+                    automation: opts.automation.clone(),
+                    state: PendingAutomationTorrentState::ResolvingMetadata,
+                    cancellation_token: cancellation_token.clone(),
+                },
+            );
+        }
+
+        let session = self.clone();
+        self.spawn(
+            debug_span!(parent: self.rs(), "resolve_pending_magnet", ?info_hash),
+            "resolve_pending_magnet",
+            async move {
+                let permit = tokio::select! {
+                    _ = cancellation_token.cancelled() => return Ok(()),
+                    permit = session
+                        .pending_automation_resolution_semaphore
+                        .clone()
+                        .acquire_owned()
+                        => permit.context("automation resolution semaphore is closed")?,
+                };
+                let result = session
+                    .add_torrent_with_resolution_control(
+                        AddTorrent::Url(magnet_url.into()),
+                        Some(opts),
+                        Some(MagnetResolutionControl {
+                            cancellation_token: cancellation_token.clone(),
+                            timeout: AUTOMATION_METADATA_RESOLUTION_TIMEOUT,
+                        }),
+                    )
+                    .await;
+                drop(permit);
+                match result {
+                    Ok(response) => {
+                        let pending = session
+                            .db
+                            .write()
+                            .pending_automation_torrents
+                            .remove(&info_hash);
+                        match response {
+                            AddTorrentResponse::Added(_, torrent) => {
+                                if let Some(pending) = pending {
+                                    torrent.set_automation_category(pending.automation.category);
+                                    torrent.set_automation_limits(
+                                        pending.automation.ratio_limit,
+                                        pending.automation.seeding_time_limit_seconds,
+                                    );
+                                    session.try_update_persistence_metadata(&torrent).await;
+                                } else if let Err(error) = session
+                                    .delete(TorrentIdOrHash::Hash(info_hash), false)
+                                    .await
+                                {
+                                    warn!(?info_hash, error = ?error, "could not forget cancelled pending magnet");
+                                }
+                            }
+                            AddTorrentResponse::AlreadyManaged(_, torrent) => {
+                                let Some(pending) = pending else {
+                                    return Ok(());
+                                };
+                                torrent.set_automation_category(pending.automation.category);
+                                torrent.set_automation_limits(
+                                    pending.automation.ratio_limit,
+                                    pending.automation.seeding_time_limit_seconds,
+                                );
+                                session.try_update_persistence_metadata(&torrent).await;
+                            }
+                            AddTorrentResponse::ListOnly(_) => unreachable!(
+                                "pending automation torrents are never added in list-only mode"
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        if cancellation_token.is_cancelled() {
+                            return Ok(());
+                        }
+                        warn!(?info_hash, error = ?error, "error resolving pending magnet");
+                        if let Some(pending) = session
+                            .db
+                            .write()
+                            .pending_automation_torrents
+                            .get_mut(&info_hash)
+                        {
+                            pending.state = PendingAutomationTorrentState::Error;
+                        }
+                    }
+                }
+                Ok(())
+            },
+        );
+        Ok(true)
+    }
+
+    pub(crate) fn forget_pending_automation_torrent(&self, id: Id20) -> bool {
+        let pending = self.db.write().pending_automation_torrents.remove(&id);
+        if let Some(pending) = pending {
+            pending.cancellation_token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn set_pending_automation_category(&self, id: Id20, category: String) -> bool {
+        let mut db = self.db.write();
+        let Some(pending) = db.pending_automation_torrents.get_mut(&id) else {
+            return false;
+        };
+        pending.automation.category = category;
+        true
+    }
+
     /// Add a torrent to the session.
     #[inline(never)]
     pub fn add_torrent<'a>(
         self: &'a Arc<Self>,
         add: AddTorrent<'a>,
         opts: Option<AddTorrentOptions>,
+    ) -> BoxFuture<'a, anyhow::Result<AddTorrentResponse>> {
+        self.add_torrent_with_resolution_control(add, opts, None)
+    }
+
+    fn add_torrent_with_resolution_control<'a>(
+        self: &'a Arc<Self>,
+        add: AddTorrent<'a>,
+        opts: Option<AddTorrentOptions>,
+        resolution_control: Option<MagnetResolutionControl>,
     ) -> BoxFuture<'a, anyhow::Result<AddTorrentResponse>> {
         async move {
             let mut opts = opts.unwrap_or_default();
@@ -1166,7 +1498,8 @@ impl Session {
                 }
             };
 
-            self.add_torrent_internal(add_res, opts).await
+            self.add_torrent_internal(add_res, opts, resolution_control)
+                .await
         }
         .instrument(debug_span!(parent: self.rs(), "add_torrent"))
         .boxed()
@@ -1219,6 +1552,7 @@ impl Session {
         self: &Arc<Self>,
         add_res: InternalAddResult,
         mut opts: AddTorrentOptions,
+        resolution_control: Option<MagnetResolutionControl>,
     ) -> anyhow::Result<AddTorrentResponse> {
         let InternalAddResult {
             info_hash,
@@ -1226,6 +1560,11 @@ impl Session {
             trackers,
             name,
         } = add_res;
+
+        let now = unix_time_seconds();
+        if opts.automation.added_at_unix_seconds == 0 {
+            opts.automation.added_at_unix_seconds = now;
+        }
 
         let private = metadata.as_ref().is_some_and(|m| m.info.info().private);
 
@@ -1255,9 +1594,21 @@ impl Session {
                     let peer_rx = make_peer_rx().context(
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
-                    let resolved_magnet = self
-                        .resolve_magnet(info_hash, peer_rx, &trackers, opts.peer_opts)
-                        .await?;
+                    let resolve =
+                        self.resolve_magnet(info_hash, peer_rx, &trackers, opts.peer_opts);
+                    let resolved_magnet = if let Some(control) = resolution_control {
+                        tokio::select! {
+                            _ = control.cancellation_token.cancelled() => {
+                                bail!("magnet metadata resolution was cancelled")
+                            }
+                            result = tokio::time::timeout(control.timeout, resolve) => {
+                                result
+                                    .context("timed out resolving automation torrent metadata")??
+                            }
+                        }
+                    } else {
+                        resolve.await?
+                    };
 
                     // Add back seen_peers into the peer stream, as we consumed some peers
                     // while resolving the magnet.
@@ -1362,6 +1713,8 @@ impl Session {
                 session: Arc::downgrade(self),
                 magnet_name: name,
                 client_name_and_version: self.client_name_and_version.clone(),
+                automation: RwLock::new(opts.automation),
+                automation_runtime: parking_lot::Mutex::new(TorrentAutomationRuntime::new()),
             });
 
             let initializing = Arc::new(TorrentStateInitializing::new(
@@ -1437,72 +1790,59 @@ impl Session {
                 })
                 .context("no such torrent in db")?,
         };
-        let removed = self
+        let torrent = self
             .db
-            .write()
+            .read()
             .torrents
-            .remove(&id)
+            .get(&id)
+            .cloned()
             .with_context(|| format!("torrent with id {id} did not exist"))?;
 
-        if let Err(e) = removed.pause() {
+        if let Err(e) = torrent.pause() {
             debug!("error pausing torrent before deletion: {e:#}")
         }
 
-        let metadata = removed.metadata.load_full().expect("TODO");
+        let metadata = torrent
+            .metadata
+            .load_full()
+            .context("torrent metadata is not available")?;
 
-        let storage = removed
-            .with_state_mut(|s| match s.take() {
-                ManagedTorrentState::Initializing(p) => p.files.take().ok(),
-                ManagedTorrentState::Paused(p) => Some(p.files),
-                ManagedTorrentState::Live(l) => l
-                    .pause()
-                    // inspect_err not available in 1.75
-                    .map_err(|e| {
-                        warn!(?id, "error pausing torrent: {e:#}");
-                        e
-                    })
-                    .ok()
-                    .map(|p| p.files),
-                _ => None,
-            })
-            .map(Ok)
-            .unwrap_or_else(|| {
-                removed
+        if delete_files {
+            let storage = torrent.with_state(|state| match state {
+                ManagedTorrentState::Initializing(initializing) => initializing.files.take(),
+                ManagedTorrentState::Paused(paused) => paused.files.take(),
+                _ => torrent
                     .shared
                     .storage_factory
-                    .create(removed.shared(), &metadata)
-            });
-
-        if let Some(p) = self.persistence.as_ref() {
-            if let Err(e) = p.delete(id).await {
-                error!(
-                    ?id,
-                    "error deleting torrent from persistence database: {e:#}"
-                );
-            } else {
-                debug!(?id, "deleted torrent from persistence database")
-            }
-        }
-
-        match (storage, delete_files) {
-            (Err(e), true) => return Err(e).context("torrent deleted, but could not delete files"),
-            (Ok(storage), true) => {
+                    .create(torrent.shared(), &metadata),
+            })?;
+            {
                 debug!("will delete files");
-                remove_files_and_dirs(&metadata.file_infos, &storage);
-                if removed.shared().options.output_folder != self.output_folder
-                    && let Err(e) = storage.remove_directory_if_empty(Path::new(""))
-                {
-                    warn!(
-                        ?id,
-                        "error removing {:?}: {e:#}",
-                        removed.shared().options.output_folder
-                    )
+                remove_files_and_dirs(&metadata.file_infos, &*storage)
+                    .context("could not delete all managed content")?;
+                if torrent.shared().options.output_folder != self.output_folder {
+                    storage
+                        .remove_directory_if_empty(Path::new(""))
+                        .context("could not remove empty managed torrent directory")?;
                 }
             }
-            (_, false) => {
-                debug!("not deleting files")
-            }
-        };
+        } else {
+            debug!("not deleting files")
+        }
+
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence
+                .delete(id)
+                .await
+                .context("error deleting torrent from persistence database")?;
+            debug!(?id, "deleted torrent from persistence database");
+        }
+
+        self.db
+            .write()
+            .torrents
+            .remove(&id)
+            .context("torrent disappeared while deleting")?;
 
         info!(id, "deleted torrent");
         Ok(())
@@ -1594,23 +1934,63 @@ impl Session {
     }
 
     async fn try_update_persistence_metadata(&self, handle: &ManagedTorrentHandle) {
-        if let Some(p) = self.persistence.as_ref()
-            && let Err(e) = p.update_metadata(handle.id(), handle).await
-        {
-            warn!(storage=?p, error=?e, "error updating metadata")
+        if let Err(e) = self.update_persistence_metadata(handle).await {
+            warn!(error=?e, "error updating persistence metadata")
         }
     }
 
-    pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
-        handle.pause()?;
-        self.try_update_persistence_metadata(handle).await;
+    async fn update_persistence_metadata(
+        &self,
+        handle: &ManagedTorrentHandle,
+    ) -> anyhow::Result<()> {
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.update_metadata(handle.id(), handle).await?;
+        }
         Ok(())
+    }
+
+    pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        handle.refresh_automation_stats(unix_time_seconds());
+        handle.pause()?;
+        self.update_persistence_metadata(handle).await?;
+        Ok(())
+    }
+
+    fn start_automation_updater(self: &Arc<Self>) {
+        let session = Arc::downgrade(self);
+        self.spawn(
+            debug_span!(parent: self.rs(), "automation_limits"),
+            "automation_limits",
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                let mut ticks = 0_u8;
+                loop {
+                    interval.tick().await;
+                    let session = session.upgrade().context("session is dead")?;
+                    let torrents = session.with_torrents(|torrents| {
+                        torrents.map(|(_, torrent)| torrent.clone()).collect::<Vec<_>>()
+                    });
+                    let now = unix_time_seconds();
+                    ticks = ticks.wrapping_add(1);
+                    for torrent in torrents {
+                        let (_, _, limit_reached) = torrent.refresh_automation_stats(now);
+                        if limit_reached && !torrent.is_paused() {
+                            if let Err(error) = session.pause(&torrent).await {
+                                warn!(id = torrent.id(), error = ?error, "could not enforce automation seed limit");
+                            }
+                        } else if ticks.is_multiple_of(30) {
+                            session.try_update_persistence_metadata(&torrent).await;
+                        }
+                    }
+                }
+            },
+        );
     }
 
     pub async fn unpause(self: &Arc<Self>, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
         let peer_rx = self.make_peer_rx_managed_torrent(handle, true);
         handle.start(peer_rx, false)?;
-        self.try_update_persistence_metadata(handle).await;
+        self.update_persistence_metadata(handle).await?;
         Ok(())
     }
 
@@ -1620,7 +2000,7 @@ impl Session {
         only_files: &HashSet<usize>,
     ) -> anyhow::Result<()> {
         handle.update_only_files(only_files)?;
-        self.try_update_persistence_metadata(handle).await;
+        self.update_persistence_metadata(handle).await?;
         Ok(())
     }
 
@@ -1728,8 +2108,9 @@ pub(crate) struct ResolveMagnetResult {
     pub seen_peers: Vec<SocketAddr>,
 }
 
-fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
+fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) -> anyhow::Result<()> {
     let mut all_dirs = HashSet::new();
+    let mut first_error = None;
     for (id, fi) in infos.iter().enumerate() {
         if fi.attrs.padding {
             continue;
@@ -1737,6 +2118,10 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
         let mut fname = &*fi.relative_filename;
         if let Err(e) = files.remove_file(id, fname) {
             warn!(?fi.relative_filename, error=?e, "could not delete file");
+            if first_error.is_none() {
+                first_error =
+                    Some(e.context(format!("could not delete {:?}", fi.relative_filename)));
+            }
         } else {
             debug!(?fi.relative_filename, "deleted the file")
         }
@@ -1756,10 +2141,17 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
     for dir in all_dirs {
         if let Err(e) = files.remove_directory_if_empty(dir) {
             warn!("error removing {dir:?}: {e:#}");
+            if first_error.is_none() {
+                first_error = Some(e.context(format!("could not remove directory {dir:?}")));
+            }
         } else {
             debug!("removed {dir:?}")
         }
     }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 // Ad adapter for converting stats into the format that tracker_comms accepts.
@@ -1810,7 +2202,10 @@ mod tests {
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
 
-    use super::torrent_file_from_info_bytes;
+    use super::{
+        AddTorrentOptions, MAX_PENDING_AUTOMATION_TORRENTS, Session, SessionOptions,
+        torrent_file_from_info_bytes,
+    };
 
     #[test]
     fn test_torrent_file_from_info_and_bytes() {
@@ -1832,5 +2227,71 @@ mod tests {
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);
         assert_eq!(parsed_trackers, get_trackers(&generated_parsed));
+    }
+
+    #[tokio::test]
+    async fn pending_automation_torrents_are_bounded() {
+        let output = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            output.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        for index in 0..MAX_PENDING_AUTOMATION_TORRENTS {
+            let magnet = format!("magnet:?xt=urn:btih:{index:040x}");
+            assert!(
+                session
+                    .add_pending_automation_magnet(magnet, AddTorrentOptions::default())
+                    .unwrap()
+            );
+        }
+
+        let overflow = format!(
+            "magnet:?xt=urn:btih:{:040x}",
+            MAX_PENDING_AUTOMATION_TORRENTS
+        );
+        let error = session
+            .add_pending_automation_magnet(overflow, AddTorrentOptions::default())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("too many pending automation torrents")
+        );
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn forgetting_pending_automation_torrent_cancels_resolution() {
+        let output = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            output.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let magnet = "magnet:?xt=urn:btih:0000000000000000000000000000000000000001";
+        session
+            .add_pending_automation_magnet(magnet.to_owned(), AddTorrentOptions::default())
+            .unwrap();
+        let (info_hash, cancellation_token) = {
+            let db = session.db.read();
+            let pending = db.pending_automation_torrents.values().next().unwrap();
+            (pending.info_hash, pending.cancellation_token.clone())
+        };
+
+        assert!(session.forget_pending_automation_torrent(info_hash));
+        assert!(cancellation_token.is_cancelled());
+        session.stop().await;
     }
 }

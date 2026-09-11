@@ -9,9 +9,10 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use http::{HeaderMap, StatusCode};
 use librqbit_dualstack_sockets::TcpListener;
+use sha1w::{ISha256, Sha256};
 use std::sync::Arc;
 use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, OnFailure};
-use tracing::{Span, debug, debug_span, info};
+use tracing::{Span, debug_span, info};
 
 use axum::Router;
 
@@ -21,6 +22,7 @@ use crate::ApiError;
 use crate::api::Result;
 
 mod handlers;
+mod qbittorrent;
 mod timeout;
 #[cfg(feature = "webui")]
 mod webui;
@@ -29,9 +31,10 @@ mod webui;
 pub struct HttpApi {
     api: Api,
     opts: HttpApiOptions,
+    qbittorrent_sessions: qbittorrent::auth::Sessions,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct HttpApiOptions {
     pub read_only: bool,
     pub basic_auth: Option<(String, String)>,
@@ -39,13 +42,34 @@ pub struct HttpApiOptions {
     pub allow_create: bool,
     /// Maximum upload body size.
     pub max_upload_body_size: Option<usize>,
+    /// Expose the Servarr-focused qBittorrent Web API compatibility routes.
+    pub enable_qbittorrent_api: bool,
     #[cfg(feature = "prometheus")]
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+}
+
+impl std::fmt::Debug for HttpApiOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("HttpApiOptions");
+        debug
+            .field("read_only", &self.read_only)
+            .field(
+                "basic_auth",
+                &self.basic_auth.as_ref().map(|_| "<redacted>"),
+            )
+            .field("allow_create", &self.allow_create)
+            .field("max_upload_body_size", &self.max_upload_body_size)
+            .field("enable_qbittorrent_api", &self.enable_qbittorrent_api);
+        #[cfg(feature = "prometheus")]
+        debug.field("prometheus_handle", &self.prometheus_handle);
+        debug.finish()
+    }
 }
 
 async fn simple_basic_auth(
     expected_username: Option<&str>,
     expected_password: Option<&str>,
+    sessions: &qbittorrent::auth::Sessions,
     headers: HeaderMap,
     request: axum::extract::Request,
     next: Next,
@@ -54,27 +78,77 @@ async fn simple_basic_auth(
         (Some(u), Some(p)) => (u, p),
         _ => return Ok(next.run(request).await),
     };
-    let user_pass = headers
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Basic "))
-        .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
-        .and_then(|v| String::from_utf8(v).ok());
-    let user_pass = match user_pass {
-        Some(user_pass) => user_pass,
-        None => {
+    let client_ip = request
+        .extensions()
+        .get::<ConnectInfo<librqbit_dualstack_sockets::WrappedSocketAddr>>()
+        .map(|ConnectInfo(address)| address.0.ip());
+    if !sessions.login_is_allowed(client_ip) {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many authentication failures",
+        )
+            .into_response());
+    }
+    if !credentials_match_basic(
+        Some(&(expected_user.to_owned(), expected_pass.to_owned())),
+        &headers,
+    ) {
+        if headers.get("Authorization").is_none() {
             return Ok((
                 StatusCode::UNAUTHORIZED,
                 [("WWW-Authenticate", "Basic realm=\"API\"")],
             )
                 .into_response());
         }
-    };
-    // TODO: constant time compare
-    match user_pass.split_once(':') {
-        Some((u, p)) if u == expected_user && p == expected_pass => Ok(next.run(request).await),
-        _ => Err(ApiError::unauthorized()),
+        sessions.record_login_failure(client_ip);
+        return Err(ApiError::unauthorized());
     }
+    sessions.clear_login_failures(client_ip);
+    Ok(next.run(request).await)
+}
+
+pub(crate) fn credentials_match_basic(
+    expected: Option<&(String, String)>,
+    headers: &HeaderMap,
+) -> bool {
+    let Some((expected_user, expected_pass)) = expected else {
+        return true;
+    };
+    let Some((user, pass)) = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Basic "))
+        .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
+        .and_then(|v| String::from_utf8(v).ok())
+        .and_then(|v| v.split_once(':').map(|(u, p)| (u.to_owned(), p.to_owned())))
+    else {
+        return false;
+    };
+    constant_time_credentials_match(expected_user, expected_pass, &user, &pass)
+}
+
+pub(crate) fn constant_time_credentials_match(
+    expected_user: &str,
+    expected_pass: &str,
+    user: &str,
+    pass: &str,
+) -> bool {
+    constant_time_eq(&credential_digest(expected_user), &credential_digest(user))
+        & constant_time_eq(&credential_digest(expected_pass), &credential_digest(pass))
+}
+
+fn credential_digest(value: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(value.as_bytes());
+    digest.finish()
+}
+
+fn constant_time_eq(expected: &[u8; 32], actual: &[u8; 32]) -> bool {
+    let mut difference = 0_u8;
+    for index in 0..expected.len() {
+        difference |= expected[index] ^ actual[index];
+    }
+    difference == 0
 }
 
 impl HttpApi {
@@ -82,6 +156,7 @@ impl HttpApi {
         Self {
             api,
             opts: opts.unwrap_or_default(),
+            qbittorrent_sessions: Default::default(),
         }
     }
 
@@ -93,6 +168,31 @@ impl HttpApi {
         listener: TcpListener,
         upnp_router: Option<Router>,
     ) -> BoxFuture<'static, anyhow::Result<()>> {
+        let credentials_configured = self
+            .opts
+            .basic_auth
+            .as_ref()
+            .is_some_and(|(user, pass)| !user.is_empty() && !pass.is_empty());
+        if self.opts.enable_qbittorrent_api && !credentials_configured {
+            return async {
+                anyhow::bail!(
+                    "the qBittorrent compatibility API requires a non-empty username and password"
+                )
+            }
+            .boxed();
+        }
+        if !self.opts.read_only
+            && !listener.bind_addr().ip().is_loopback()
+            && !credentials_configured
+        {
+            return async {
+                anyhow::bail!(
+                    "a writable HTTP API on a non-loopback address requires a non-empty username and password"
+                )
+            }
+            .boxed();
+        }
+
         #[cfg(feature = "prometheus")]
         let mut prometheus_handle = self.opts.prometheus_handle.take();
 
@@ -153,15 +253,30 @@ impl HttpApi {
         // Simple one-user basic auth
         if let Some((user, pass)) = state.opts.basic_auth.clone() {
             info!("Enabling simple basic authentication in HTTP API");
+            let auth_state = state.clone();
             main_router = main_router.route_layer(axum::middleware::from_fn(
                 move |headers, request, next| {
                     let user = user.clone();
                     let pass = pass.clone();
+                    let auth_state = auth_state.clone();
                     async move {
-                        simple_basic_auth(Some(&user), Some(&pass), headers, request, next).await
+                        simple_basic_auth(
+                            Some(&user),
+                            Some(&pass),
+                            &auth_state.qbittorrent_sessions,
+                            headers,
+                            request,
+                            next,
+                        )
+                        .await
                     }
                 },
             ));
+        }
+
+        if state.opts.enable_qbittorrent_api {
+            info!("Enabling qBittorrent Web API compatibility routes");
+            main_router = main_router.nest("/api/v2", qbittorrent::make_api_router(state.clone()));
         }
 
         if let Some(upnp_router) = upnp_router {
@@ -174,22 +289,20 @@ impl HttpApi {
                 tower_http::trace::TraceLayer::new_for_http()
                     .make_span_with(|req: &Request| {
                         let method = req.method();
-                        let uri = req.uri();
+                        // Query strings can contain magnet links and private tracker passkeys.
+                        let path = req.uri().path();
                         if let Some(ConnectInfo(addr)) = req
                             .extensions()
                             .get::<ConnectInfo<librqbit_dualstack_sockets::WrappedSocketAddr>>()
                         {
-                            debug_span!("request", %method, %uri, addr=%addr.0)
+                            debug_span!("request", %method, %path, addr=%addr.0)
                         } else {
-                            debug_span!("request", %method, %uri)
+                            debug_span!("request", %method, %path)
                         }
                     })
-                    .on_request(|req: &Request, _: &Span| {
-                        if req.uri().path().starts_with("/upnp") {
-                            debug!(headers=?req.headers())
-                        }
-                    })
-                    .on_response(DefaultOnResponse::new().include_headers(true))
+                    // Never log raw request headers: they may contain credentials or cookies.
+                    // Response headers may contain authentication cookies.
+                    .on_response(DefaultOnResponse::new())
                     .on_failure({
                         let mut default = DefaultOnFailure::new();
                         move |failure_class, latency, span: &Span| match failure_class {
@@ -208,5 +321,23 @@ impl HttpApi {
                 .context("error running HTTP API")
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HttpApiOptions;
+
+    #[test]
+    fn debug_output_redacts_basic_auth_credentials() {
+        let options = HttpApiOptions {
+            basic_auth: Some(("sensitive-user".to_owned(), "sensitive-pass".to_owned())),
+            ..Default::default()
+        };
+
+        let debug = format!("{options:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("sensitive-user"));
+        assert!(!debug.contains("sensitive-pass"));
     }
 }

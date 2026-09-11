@@ -31,56 +31,47 @@ assert_cfg::exactly_one! {
 }
 
 #[cfg(feature = "sha1-crypto-hash")]
-mod crypto_hash_impl {
+mod rust_crypto_impl {
     use super::{ISha1, ISha256};
+    use sha1::Digest;
 
-    pub struct Sha1CryptoHash {
-        inner: crypto_hash::Hasher,
+    pub struct Sha1RustCrypto {
+        inner: sha1::Sha1,
     }
 
-    impl ISha1 for Sha1CryptoHash {
+    impl ISha1 for Sha1RustCrypto {
         fn new() -> Self {
             Self {
-                inner: crypto_hash::Hasher::new(crypto_hash::Algorithm::SHA1),
+                inner: sha1::Sha1::new(),
             }
         }
 
         fn update(&mut self, buf: &[u8]) {
-            use std::io::Write;
-            self.inner.write_all(buf).unwrap();
+            self.inner.update(buf);
         }
 
-        fn finish(mut self) -> [u8; 20] {
-            let result = self.inner.finish();
-            debug_assert_eq!(result.len(), 20);
-            let mut result_arr = [0u8; 20];
-            result_arr.copy_from_slice(&result);
-            result_arr
+        fn finish(self) -> [u8; 20] {
+            self.inner.finalize().into()
         }
     }
 
-    pub struct Sha256CryptoHash {
-        inner: crypto_hash::Hasher,
+    pub struct Sha256RustCrypto {
+        inner: sha2::Sha256,
     }
 
-    impl ISha256 for Sha256CryptoHash {
+    impl ISha256 for Sha256RustCrypto {
         fn new() -> Self {
             Self {
-                inner: crypto_hash::Hasher::new(crypto_hash::Algorithm::SHA256),
+                inner: sha2::Sha256::new(),
             }
         }
 
         fn update(&mut self, buf: &[u8]) {
-            use std::io::Write;
-            self.inner.write_all(buf).unwrap();
+            self.inner.update(buf);
         }
 
-        fn finish(mut self) -> [u8; 32] {
-            let result = self.inner.finish();
-            debug_assert_eq!(result.len(), 32);
-            let mut result_arr = [0u8; 32];
-            result_arr.copy_from_slice(&result);
-            result_arr
+        fn finish(self) -> [u8; 32] {
+            self.inner.finalize().into()
         }
     }
 }
@@ -141,20 +132,33 @@ mod ring_impl {
 }
 
 #[cfg(feature = "sha1-crypto-hash")]
-pub type Sha1 = crypto_hash_impl::Sha1CryptoHash;
+pub type Sha1 = rust_crypto_impl::Sha1RustCrypto;
 
 #[cfg(feature = "sha1-ring")]
 pub type Sha1 = ring_impl::Sha1Ring;
 
 #[cfg(feature = "sha1-crypto-hash")]
-pub type Sha256 = crypto_hash_impl::Sha256CryptoHash;
+pub type Sha256 = rust_crypto_impl::Sha256RustCrypto;
 
 #[cfg(feature = "sha1-ring")]
 pub type Sha256 = ring_impl::Sha256Ring;
 
 #[cfg(test)]
 mod tests {
-    use super::{ISha256, Sha256};
+    use super::{ISha1, ISha256, Sha1, Sha256};
+
+    #[test]
+    fn test_sha1_known_vector_empty() {
+        let mut hash = Sha1::new();
+        hash.update(b"");
+        assert_eq!(
+            hash.finish(),
+            [
+                0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60,
+                0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09,
+            ]
+        );
+    }
 
     fn assert_sha256_impl<T: ISha256>() {}
 

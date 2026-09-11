@@ -205,6 +205,14 @@ impl Default for RqbitDesktopConfig {
 
 impl RqbitDesktopConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.http_api.disable
+            && !self.http_api.read_only
+            && !self.http_api.listen_addr.ip().is_loopback()
+        {
+            anyhow::bail!(
+                "the desktop HTTP API must be read-only when listening on a non-loopback address"
+            )
+        }
         if self.upnp.enable_server {
             if self.http_api.disable {
                 anyhow::bail!("if UPnP server is enabled, you need to enable the HTTP API also.")
@@ -216,5 +224,24 @@ impl RqbitDesktopConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    use super::RqbitDesktopConfig;
+
+    #[test]
+    fn writable_http_api_must_remain_on_loopback() {
+        let mut config = RqbitDesktopConfig::default();
+        config.http_api.listen_addr =
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 3030));
+
+        assert!(config.validate().is_err());
+
+        config.http_api.read_only = true;
+        assert!(config.validate().is_ok());
     }
 }

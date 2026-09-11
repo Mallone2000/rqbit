@@ -99,8 +99,8 @@ const makeRequest = async (
     }
     return Promise.reject(error);
   }
-  const result = await response.json();
-  return result;
+  const responseBody = await response.text();
+  return responseBody ? JSON.parse(responseBody) : undefined;
 };
 
 export const API: RqbitAPI & { getVersion: () => Promise<string> } = {
@@ -203,5 +203,26 @@ export const API: RqbitAPI & { getVersion: () => Promise<string> } = {
   },
   setLimits: (limits: LimitsConfig): Promise<void> => {
     return makeRequest("POST", "/torrents/limits", limits, true);
+  },
+  listCategories: async (): Promise<string[]> => {
+    const categories = (await makeRequest(
+      "GET",
+      "/api/v2/torrents/categories",
+    )) as Record<string, unknown>;
+    return Object.keys(categories).sort((a, b) => a.localeCompare(b));
+  },
+  createCategory: (name: string): Promise<void> => {
+    return makeRequest(
+      "POST",
+      "/api/v2/torrents/createCategory",
+      new URLSearchParams({ category: name }),
+    );
+  },
+  removeCategories: (names: string[]): Promise<void> => {
+    return makeRequest(
+      "POST",
+      "/api/v2/torrents/removeCategories",
+      new URLSearchParams({ categories: names.join("\n") }),
+    );
   },
 };

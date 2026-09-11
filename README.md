@@ -52,7 +52,7 @@ rqbit can advertise managed torrents to LAN, e.g. your TVs and stream torrents t
 Usage from CLI
 
 ```
-rqbit --enable-upnp-server server start ...
+RQBIT_HTTP_BASIC_AUTH_USERPASS=username:password rqbit --enable-upnp-server --http-api-listen-addr 0.0.0.0:3030 server start ...
 ```
 
 ## mDNS advertising
@@ -62,7 +62,7 @@ rqbit can advertise its HTTP API on your LAN via mDNS/DNS-SD, so you can open th
 Usage from CLI (requires a non-loopback listen address):
 
 ```
-rqbit --enable-mdns --http-api-listen-addr 0.0.0.0:3030 server start ...
+RQBIT_HTTP_BASIC_AUTH_USERPASS=username:password rqbit --enable-mdns --http-api-listen-addr 0.0.0.0:3030 server start ...
 ```
 
 ## IPv6
@@ -124,6 +124,9 @@ cargo install rqbit
 ## Docker
 
 Docker images are published at [ikatson/rqbit](https://hub.docker.com/r/ikatson/rqbit)
+
+For a Sonarr/Radarr deployment sharing a Gluetun network namespace, see the
+[Servarr Compose guide](docker/compose-examples/servarr.md).
 
 ## Build
 
@@ -195,6 +198,9 @@ Use a regex here to select files by their names.
 ## HTTP API
 
 By default it listens on http://127.0.0.1:3030.
+Writable API listeners on a non-loopback address require Basic authentication.
+Use an HTTPS reverse proxy when the connection crosses an untrusted network;
+Basic authentication does not encrypt the connection.
 
 ```
 curl -s 'http://127.0.0.1:3030/'

@@ -3,22 +3,21 @@ use std::path::Path;
 use std::process::Command;
 
 #[allow(dead_code)]
-fn run_cmd(cwd: &Path, cmd: &str) -> anyhow::Result<()> {
+fn run_npm(cwd: &Path, args: &[&str]) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
-    let (shell, shell_args) = ("powershell", ["-command"].as_slice());
+    let npm = "npm.cmd";
     #[cfg(not(target_os = "windows"))]
-    let (shell, shell_args) = ("sh", ["-c"].as_slice());
+    let npm = "npm";
+    let command = format!("npm {}", args.join(" "));
 
-    // Run "npm install" in the webui directory
-    let output = Command::new(shell)
-        .args(shell_args)
-        .arg(cmd)
+    let output = Command::new(npm)
+        .args(args)
         .current_dir(cwd)
         .output()
         .with_context(|| {
             format!(
                 "Failed to execute {} in {:?}. PATH: {:?}",
-                cmd,
+                command,
                 cwd,
                 std::env::var("PATH").unwrap_or_default()
             )
@@ -27,7 +26,7 @@ fn run_cmd(cwd: &Path, cmd: &str) -> anyhow::Result<()> {
     if !output.status.success() {
         bail!(
             "\"{}\" failed\n\nstderr: {}\n\nstdout: {}",
-            cmd,
+            command,
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(&output.stdout)
         );
@@ -47,9 +46,9 @@ fn main() {
 
         println!("cargo:rerun-if-changed={}", webui_src_dir.to_str().unwrap());
 
-        // Run "npm install && npm run build" in the webui directory
-        for cmd in ["npm install", "npm run build"] {
-            run_cmd(webui_dir, cmd).unwrap();
+        // Use the lockfile and invoke npm directly without a command shell.
+        for args in [["ci"].as_slice(), ["run", "build"].as_slice()] {
+            run_npm(webui_dir, args).unwrap();
         }
     }
 }

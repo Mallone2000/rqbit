@@ -63,6 +63,10 @@ fn parse_umask(value: &str) -> anyhow::Result<libc::mode_t> {
     Ok(output)
 }
 
+fn parse_cli_duration(value: &str) -> Result<Duration, humantime::DurationError> {
+    humantime::parse_duration(value)
+}
+
 #[derive(Parser)]
 #[command(version, author, about)]
 struct Opts {
@@ -87,7 +91,7 @@ struct Opts {
     /// The interval to poll trackers, e.g. 30s.
     /// Trackers send the refresh interval when we connect to them. Often this is
     /// pretty big, e.g. 30 minutes. This can force a certain value.
-    #[arg(short = 'i', long = "tracker-refresh-interval", value_parser = parse_duration::parse, env="RQBIT_TRACKER_REFRESH_INTERVAL")]
+    #[arg(short = 'i', long = "tracker-refresh-interval", value_parser = parse_cli_duration, env="RQBIT_TRACKER_REFRESH_INTERVAL")]
     force_tracker_interval: Option<Duration>,
 
     /// The listen address for HTTP API.
@@ -109,6 +113,11 @@ struct Opts {
         env = "RQBIT_HTTP_API_MAX_UPLOAD_SIZE"
     )]
     http_api_max_upload_size: Option<usize>,
+
+    /// Expose the Servarr-focused qBittorrent Web API compatibility routes.
+    /// Requires a non-empty RQBIT_HTTP_BASIC_AUTH_USERPASS value.
+    #[arg(long = "qbittorrent-api-enable", env = "RQBIT_QBITTORRENT_API_ENABLE")]
+    qbittorrent_api_enable: bool,
 
     /// Advertise the HTTP API on the local network via mDNS/DNS-SD, so it can
     /// be reached at http://rqbit.local:PORT from other devices on your LAN.
@@ -142,11 +151,11 @@ struct Opts {
     dht_bootstrap_addrs: Option<String>,
 
     /// The connect timeout, e.g. 1s, 1.5s, 100ms etc.
-    #[arg(long = "peer-connect-timeout", value_parser = parse_duration::parse, default_value="2s", env="RQBIT_PEER_CONNECT_TIMEOUT")]
+    #[arg(long = "peer-connect-timeout", value_parser = parse_cli_duration, default_value="2s", env="RQBIT_PEER_CONNECT_TIMEOUT")]
     peer_connect_timeout: Duration,
 
     /// The timeout for read() and write() operations, e.g. 1s, 1.5s, 100ms etc.
-    #[arg(long = "peer-read-write-timeout" , value_parser = parse_duration::parse, default_value="10s", env="RQBIT_PEER_READ_WRITE_TIMEOUT")]
+    #[arg(long = "peer-read-write-timeout" , value_parser = parse_cli_duration, default_value="10s", env="RQBIT_PEER_READ_WRITE_TIMEOUT")]
     peer_read_write_timeout: Duration,
 
     /// The maximum number of connected peers per torrent.
@@ -706,6 +715,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         },
         allow_create: opts.http_api_allow_create,
         max_upload_body_size: opts.http_api_max_upload_size,
+        enable_qbittorrent_api: opts.qbittorrent_api_enable,
 
         // We need to install prometheus recorder early before we registered any metrics.
         #[cfg(feature = "prometheus")]
@@ -1238,6 +1248,21 @@ fn spawn_stats_printer(session: Arc<Session>) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn cli_duration_parser_accepts_documented_formats_and_rejects_huge_exponents() {
+        assert_eq!(
+            crate::parse_cli_duration("1.5s").unwrap(),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            crate::parse_cli_duration("100ms").unwrap(),
+            Duration::from_millis(100)
+        );
+        assert!(crate::parse_cli_duration("1e999999999 seconds").is_err());
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn test_parse_umask() {

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use anyhow::bail;
@@ -26,7 +26,7 @@ use librqbit_core::lengths::Lengths;
 use librqbit_core::spawn_utils::spawn_with_cancel;
 use librqbit_core::torrent_metainfo::ValidatedTorrentMetaV1Info;
 pub use live::*;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -38,6 +38,7 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::Session;
+use crate::TorrentAutomationMetadata;
 use crate::chunk_tracker::ChunkTracker;
 use crate::file_info::FileInfo;
 use crate::limits::LimitsConfig;
@@ -194,6 +195,23 @@ pub struct ManagedTorrentShared {
     pub(crate) magnet_name: Option<String>,
 
     pub(crate) client_name_and_version: String,
+
+    pub(crate) automation: RwLock<TorrentAutomationMetadata>,
+    pub(crate) automation_runtime: Mutex<TorrentAutomationRuntime>,
+}
+
+pub(crate) struct TorrentAutomationRuntime {
+    pub(crate) last_seed_tick: Instant,
+    last_observed_uploaded: u64,
+}
+
+impl TorrentAutomationRuntime {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_seed_tick: Instant::now(),
+            last_observed_uploaded: 0,
+        }
+    }
 }
 
 impl ManagedTorrentShared {
@@ -231,6 +249,79 @@ impl ManagedTorrent {
         &self.shared
     }
 
+    pub fn automation_metadata(&self) -> TorrentAutomationMetadata {
+        self.shared.automation.read().clone()
+    }
+
+    pub fn set_automation_category(&self, category: String) {
+        self.shared.automation.write().category = category;
+    }
+
+    pub fn set_automation_limits(
+        &self,
+        ratio_limit: Option<f64>,
+        seeding_time_limit_seconds: Option<u64>,
+    ) {
+        let mut automation = self.shared.automation.write();
+        automation.ratio_limit = ratio_limit;
+        automation.seeding_time_limit_seconds = seeding_time_limit_seconds;
+    }
+
+    pub(crate) fn refresh_automation_stats(
+        &self,
+        now_unix_seconds: u64,
+    ) -> (TorrentStats, TorrentAutomationMetadata, bool) {
+        // Serialize observation so concurrent HTTP polls and the periodic
+        // updater cannot count the same upload delta twice.
+        let mut runtime = self.shared.automation_runtime.lock();
+        let stats = self.stats();
+        let previous_uploaded = runtime.last_observed_uploaded;
+        runtime.last_observed_uploaded = stats.uploaded_bytes;
+        let uploaded_delta = if stats.uploaded_bytes >= previous_uploaded {
+            stats.uploaded_bytes - previous_uploaded
+        } else {
+            stats.uploaded_bytes
+        };
+        let seeding_elapsed_seconds = {
+            let now = Instant::now();
+            if stats.finished && matches!(stats.state, TorrentStatsState::Live) {
+                let elapsed = now.duration_since(runtime.last_seed_tick).as_secs();
+                runtime.last_seed_tick += Duration::from_secs(elapsed);
+                elapsed
+            } else {
+                runtime.last_seed_tick = now;
+                0
+            }
+        };
+        drop(runtime);
+
+        let mut automation = self.shared.automation.write();
+        automation.uploaded_bytes = automation.uploaded_bytes.saturating_add(uploaded_delta);
+        if uploaded_delta > 0 {
+            automation.last_activity_unix_seconds = Some(now_unix_seconds);
+        }
+        if stats.finished {
+            automation
+                .completed_at_unix_seconds
+                .get_or_insert(now_unix_seconds);
+            automation.seeding_seconds = automation
+                .seeding_seconds
+                .saturating_add(seeding_elapsed_seconds);
+        }
+
+        let ratio = if stats.total_bytes == 0 {
+            0.0
+        } else {
+            automation.uploaded_bytes as f64 / stats.total_bytes as f64
+        };
+        let limit_reached = stats.finished
+            && (automation.ratio_limit.is_some_and(|limit| ratio >= limit)
+                || automation
+                    .seeding_time_limit_seconds
+                    .is_some_and(|limit| automation.seeding_seconds >= limit));
+        (stats, automation.clone(), limit_reached)
+    }
+
     /// The resolved on-disk folder this torrent's files are written under.
     pub fn output_folder(&self) -> &Path {
         &self.shared.options.output_folder
@@ -255,10 +346,6 @@ impl ManagedTorrent {
 
     pub fn with_state<R>(&self, f: impl FnOnce(&ManagedTorrentState) -> R) -> R {
         f(&self.locked.read().state)
-    }
-
-    pub(crate) fn with_state_mut<R>(&self, f: impl FnOnce(&mut ManagedTorrentState) -> R) -> R {
-        f(&mut self.locked.write().state)
     }
 
     pub(crate) fn with_chunk_tracker<R>(
