@@ -3,7 +3,9 @@ import ReactDOM from "react-dom/client";
 import { RqbitWebUI } from "./rqbit-web";
 import { customSetInterval } from "./helper/customSetInterval";
 import { APIContext } from "./context";
-import { API } from "./http-api";
+import { API, AUTHENTICATION_REQUIRED_EVENT } from "./http-api";
+import { LoginForm } from "./components/LoginForm";
+import { Spinner } from "./components/Spinner";
 import "./globals.css";
 
 const RootWithVersion = () => {
@@ -36,8 +38,59 @@ const RootWithVersion = () => {
   );
 };
 
+const Root = () => {
+  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [statusError, setStatusError] = useState("");
+
+  useEffect(() => {
+    API.getAuthStatus().then(
+      ({ authenticated }) => setAuthenticated(authenticated),
+      () => {
+        setStatusError("Unable to connect to rqbit.");
+        setAuthenticated(false);
+      },
+    );
+  }, []);
+
+  useEffect(() => {
+    const requireAuthentication = () => setAuthenticated(false);
+    window.addEventListener(
+      AUTHENTICATION_REQUIRED_EVENT,
+      requireAuthentication,
+    );
+    return () =>
+      window.removeEventListener(
+        AUTHENTICATION_REQUIRED_EVENT,
+        requireAuthentication,
+      );
+  }, []);
+
+  if (authenticated === null) {
+    return (
+      <div className="bg-surface min-h-dvh flex items-center justify-center">
+        <Spinner label="Connecting" />
+      </div>
+    );
+  }
+
+  if (!authenticated) {
+    return (
+      <LoginForm
+        initialError={statusError}
+        onLogin={async (username, password) => {
+          await API.login(username, password);
+          setStatusError("");
+          setAuthenticated(true);
+        }}
+      />
+    );
+  }
+
+  return <RootWithVersion />;
+};
+
 ReactDOM.createRoot(document.getElementById("app") as HTMLInputElement).render(
   <StrictMode>
-    <RootWithVersion />
+    <Root />
   </StrictMode>,
 );

@@ -10,6 +10,18 @@ import {
   TorrentStats,
 } from "./api-types";
 
+export interface AuthStatus {
+  authenticated: boolean;
+}
+
+export const AUTHENTICATION_REQUIRED_EVENT = "rqbit-authentication-required";
+
+const notifyIfAuthenticationRequired = (response: Response) => {
+  if (response.status === 401) {
+    window.dispatchEvent(new Event(AUTHENTICATION_REQUIRED_EVENT));
+  }
+};
+
 // Define API URL and base path
 const apiUrl = (() => {
   if (window.origin === "null") {
@@ -32,10 +44,12 @@ const makeBinaryRequest = async (path: string): Promise<ArrayBuffer> => {
   const url = apiUrl + path;
   const response = await fetch(url, {
     method: "GET",
+    credentials: "include",
     headers: {
       Accept: "application/octet-stream",
     },
   });
+  notifyIfAuthenticationRequired(response);
 
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -54,6 +68,7 @@ const makeRequest = async (
   const url = apiUrl + path;
   let options: RequestInit = {
     method,
+    credentials: "include",
     headers: {
       Accept: "application/json",
     },
@@ -82,6 +97,7 @@ const makeRequest = async (
     error.text = "network error";
     return Promise.reject(error);
   }
+  notifyIfAuthenticationRequired(response);
 
   error.status = response.status;
   error.statusText = `${response.status} ${response.statusText}`;
@@ -103,7 +119,21 @@ const makeRequest = async (
   return responseBody ? JSON.parse(responseBody) : undefined;
 };
 
-export const API: RqbitAPI & { getVersion: () => Promise<string> } = {
+export const API: RqbitAPI & {
+  getVersion: () => Promise<string>;
+  getAuthStatus: () => Promise<AuthStatus>;
+  login: (username: string, password: string) => Promise<void>;
+} = {
+  getAuthStatus: (): Promise<AuthStatus> => {
+    return makeRequest("GET", "/web/auth/status");
+  },
+  login: (username: string, password: string): Promise<void> => {
+    return makeRequest(
+      "POST",
+      "/web/auth/login",
+      new URLSearchParams({ username, password }),
+    );
+  },
   getStreamLogsUrl: () => apiUrl + "/stream_logs",
   listTorrents: (opts?: {
     withStats?: boolean;

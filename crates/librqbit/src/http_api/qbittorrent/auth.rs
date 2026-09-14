@@ -67,6 +67,10 @@ impl Sessions {
         entries.get(sid).is_some_and(|expires| *expires > now)
     }
 
+    pub(crate) fn authenticates(&self, headers: &HeaderMap) -> bool {
+        sid_from_headers(headers).is_some_and(|sid| self.is_valid(sid))
+    }
+
     fn revoke(&self, sid: &str) {
         self.entries.lock().remove(sid);
     }
@@ -175,6 +179,73 @@ pub(super) async fn login(State(state): State<ApiState>, request: Request) -> Re
     response
 }
 
+pub(in crate::http_api) async fn web_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    let authenticated =
+        state.opts.basic_auth.is_none() || state.qbittorrent_sessions.authenticates(&headers);
+    let mut response = axum::Json(serde_json::json!({
+        "authenticated": authenticated,
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+pub(in crate::http_api) async fn web_login(
+    State(state): State<ApiState>,
+    request: Request,
+) -> Response {
+    let client_ip = request
+        .extensions()
+        .get::<ConnectInfo<WrappedSocketAddr>>()
+        .map(|ConnectInfo(address)| address.0.ip());
+    let Some((expected_user, expected_pass)) = state.opts.basic_auth.as_ref() else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+
+    if !state.qbittorrent_sessions.login_is_allowed(client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many authentication failures",
+        )
+            .into_response();
+    }
+    let Form(login) = match Form::<Login>::from_request(request, &state).await {
+        Ok(login) => login,
+        Err(error) => return error.into_response(),
+    };
+
+    if !crate::http_api::constant_time_credentials_match(
+        expected_user,
+        expected_pass,
+        &login.username,
+        &login.password,
+    ) {
+        state.qbittorrent_sessions.record_login_failure(client_ip);
+        return (StatusCode::UNAUTHORIZED, "Invalid username or password").into_response();
+    }
+
+    state.qbittorrent_sessions.clear_login_failures(client_ip);
+    let sid = state.qbittorrent_sessions.issue();
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "SID={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+            SESSION_TTL.as_secs()
+        ))
+        .expect("UUID SID always makes a valid cookie"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 pub(super) async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Some(sid) = sid_from_headers(&headers) {
         state.qbittorrent_sessions.revoke(sid);
@@ -200,7 +271,7 @@ pub(super) async fn require_auth(
         return next.run(request).await;
     }
 
-    if sid_from_headers(&headers).is_some_and(|sid| state.qbittorrent_sessions.is_valid(sid)) {
+    if state.qbittorrent_sessions.authenticates(&headers) {
         return next.run(request).await;
     }
 

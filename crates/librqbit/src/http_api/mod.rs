@@ -78,6 +78,18 @@ async fn simple_basic_auth(
         (Some(u), Some(p)) => (u, p),
         _ => return Ok(next.run(request).await),
     };
+    #[cfg(feature = "webui")]
+    if request.uri().path() == "/"
+        && headers
+            .get(http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/html"))
+    {
+        return Ok(next.run(request).await);
+    }
+    if sessions.authenticates(&headers) {
+        return Ok(next.run(request).await);
+    }
     let client_ip = request
         .extensions()
         .get::<ConnectInfo<librqbit_dualstack_sockets::WrappedSocketAddr>>()
@@ -226,15 +238,6 @@ impl HttpApi {
 
         let mut main_router = handlers::make_api_router(state.clone());
 
-        #[cfg(feature = "webui")]
-        {
-            use axum::response::Redirect;
-
-            let webui_router = webui::make_webui_router();
-            main_router = main_router.nest("/web/", webui_router);
-            main_router = main_router.route("/web", get(|| async { Redirect::permanent("./web/") }))
-        }
-
         #[cfg(feature = "prometheus")]
         if let Some(handle) = prometheus_handle.take() {
             let session = state.api.session().clone();
@@ -273,7 +276,8 @@ impl HttpApi {
                             .map(move |r| r.is_match(v.as_bytes()))
                             .unwrap_or(false)
                 }))
-                .allow_headers(AllowHeaders::any())
+                .allow_headers(AllowHeaders::mirror_request())
+                .allow_credentials(true)
         };
 
         // Simple one-user basic auth
@@ -298,6 +302,24 @@ impl HttpApi {
                     }
                 },
             ));
+        }
+
+        #[cfg(feature = "webui")]
+        {
+            use axum::response::Redirect;
+            use axum::{middleware, routing::post};
+
+            let webui_router = webui::make_webui_router::<Arc<HttpApi>>()
+                .route("/auth/status", get(qbittorrent::auth::web_status))
+                .route(
+                    "/auth/login",
+                    post(qbittorrent::auth::web_login)
+                        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+                )
+                .route_layer(middleware::from_fn(qbittorrent::auth::require_same_origin))
+                .with_state(state.clone());
+            main_router = main_router.nest("/web/", webui_router);
+            main_router = main_router.route("/web", get(|| async { Redirect::permanent("./web/") }))
         }
 
         if state.opts.enable_qbittorrent_api {
@@ -428,6 +450,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
+        task.abort();
+    }
+
+    #[cfg(feature = "webui")]
+    #[tokio::test]
+    async fn web_login_uses_a_session_and_keeps_basic_auth_compatible() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+        let address = listener.bind_addr();
+        let server = HttpApi::new(
+            Api::new(session, None, None),
+            Some(HttpApiOptions {
+                basic_auth: Some(("servarr".to_owned(), "secret".to_owned())),
+                enable_qbittorrent_api: true,
+                ..Default::default()
+            }),
+        )
+        .make_http_api_and_run(listener, None);
+        let task = tokio::spawn(async move { server.await.unwrap() });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let base = format!("http://{address}");
+
+        let response = client
+            .get(format!("{base}/"))
+            .header("Accept", "text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(response.headers().get("WWW-Authenticate").is_none());
+
+        let response = client.get(format!("{base}/web/")).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.headers().get("WWW-Authenticate").is_none());
+
+        let status: serde_json::Value = client
+            .get(format!("{base}/web/auth/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["authenticated"], false);
+
+        let response = client
+            .get(format!("{base}/"))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let response = client
+            .post(format!("{base}/web/auth/login"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("username=servarr&password=wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get("WWW-Authenticate").is_none());
+
+        let response = client
+            .post(format!("{base}/web/auth/login"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("username=servarr&password=secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let cookie = response
+            .headers()
+            .get("Set-Cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let response = client
+            .get(format!("{base}/"))
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let response = client
+            .get(format!("{base}/api/v2/app/version"))
+            .basic_auth("servarr", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
         task.abort();
     }
 }
