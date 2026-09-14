@@ -5,7 +5,12 @@ use clone_to_owned::CloneToOwned;
 use encoding_rs::Encoding;
 use itertools::Either;
 use serde_derive::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::HashSet, iter::once, path::PathBuf};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    iter::once,
+    path::{Component, Path, PathBuf},
+};
 use tracing::debug;
 
 use crate::{Error, hash_id::Id20, lengths::Lengths};
@@ -331,6 +336,19 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
                 if memchr(b'/', bit).is_some() || memchr(b'\\', bit).is_some() {
                     return Err(Error::BadTorrentSeparatorInName);
                 }
+
+                // Path syntax differs by platform. In particular, on Windows a
+                // single component such as `C:escape` is a drive-relative path;
+                // pushing it onto the download directory replaces that directory.
+                // Validate the decoded component with the host path parser so every
+                // component remains exactly one ordinary filename on this platform.
+                let decoded = encoding.decode(bit).0;
+                let mut components = Path::new(decoded.as_ref()).components();
+                if !matches!(components.next(), Some(Component::Normal(_)))
+                    || components.next().is_some()
+                {
+                    return Err(Error::BadTorrentInvalidPathComponent);
+                }
             }
             if !seen_a_bit {
                 return Err(Error::BadTorrentFileNoName);
@@ -576,5 +594,36 @@ mod tests {
         let buf = include_bytes!("resources/test/private.torrent");
         let torrent: TorrentMetaV1Borrowed = from_bytes(buf).unwrap();
         assert!(torrent.info.data.private);
+    }
+
+    #[test]
+    fn validation_rejects_non_normal_path_components() {
+        let info = TorrentMetaV1Info {
+            name: Some(ByteBufOwned::from(&b"."[..])),
+            pieces: ByteBufOwned::from(&[0_u8; 20][..]),
+            piece_length: 1,
+            length: Some(1),
+            ..Default::default()
+        };
+        assert!(matches!(
+            info.validate(),
+            Err(Error::BadTorrentInvalidPathComponent)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validation_rejects_windows_drive_relative_path_components() {
+        let info = TorrentMetaV1Info {
+            name: Some(ByteBufOwned::from(&b"C:escape"[..])),
+            pieces: ByteBufOwned::from(&[0_u8; 20][..]),
+            piece_length: 1,
+            length: Some(1),
+            ..Default::default()
+        };
+        assert!(matches!(
+            info.validate(),
+            Err(Error::BadTorrentInvalidPathComponent)
+        ));
     }
 }

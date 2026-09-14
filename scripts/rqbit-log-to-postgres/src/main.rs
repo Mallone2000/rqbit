@@ -94,8 +94,7 @@ fn connect(database_url: &str) -> Result<Client> {
             .with_context(|| format!("failed to connect to database {dbname:?} via local socket"));
     }
 
-    Client::connect(database_url, NoTls)
-        .with_context(|| format!("failed to connect to {database_url:?}"))
+    Client::connect(database_url, NoTls).context("failed to connect to PostgreSQL")
 }
 
 fn recreate_table(client: &mut Client, table: &SqlTableName) -> Result<()> {

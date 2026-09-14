@@ -241,6 +241,7 @@ pub mod subscription {
         let body = super::get_system_update_id::render_notify(system_update_id);
 
         let resp = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()?
             .request(Method::from_bytes(b"NOTIFY")?, url.clone())
             .header("Content-Type", r#"text/xml; charset="utf-8""#)

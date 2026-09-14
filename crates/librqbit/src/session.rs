@@ -45,7 +45,7 @@ use crate::{
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
 use bencode::bencode_serialize_to_writer;
-use buffers::{ByteBuf, ByteBufOwned};
+use buffers::ByteBufOwned;
 use bytes::Bytes;
 use clone_to_owned::CloneToOwned;
 use dht::{Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, dht_listen_addr};
@@ -79,6 +79,17 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 const MAX_PENDING_AUTOMATION_TORRENTS: usize = 64;
 const MAX_CONCURRENT_AUTOMATION_RESOLUTIONS: usize = 8;
 const AUTOMATION_METADATA_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_REMOTE_TORRENT_SIZE: usize = 10 * 1024 * 1024;
+
+fn validate_sub_folder(path: &Path) -> anyhow::Result<()> {
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("sub_folder must be a relative path without traversal components")
+    }
+    Ok(())
+}
 
 pub type TorrentId = usize;
 
@@ -95,10 +106,7 @@ struct ParsedTorrentFile {
 }
 
 fn torrent_from_bytes(bytes: Bytes) -> anyhow::Result<ParsedTorrentFile> {
-    trace!(
-        "all fields in torrent: {:#?}",
-        bencode::dyn_from_bytes::<ByteBuf>(&bytes)
-    );
+    trace!(torrent_bytes = bytes.len(), "parsing torrent metadata");
     let parsed = librqbit_core::torrent_metainfo::torrent_from_bytes(&bytes)?;
     Ok(ParsedTorrentFile {
         meta: parsed.clone_to_owned(Some(&bytes)),
@@ -192,15 +200,37 @@ async fn torrent_from_url(
         .get(url)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("error downloading torrent metadata")?;
     if !response.status().is_success() {
-        bail!("GET {} returned {}", url, response.status())
+        bail!("torrent metadata request returned {}", response.status())
     }
-    let b = response
-        .bytes()
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REMOTE_TORRENT_SIZE as u64)
+    {
+        bail!("torrent metadata exceeds {MAX_REMOTE_TORRENT_SIZE} bytes")
+    }
+    let mut response = response;
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(MAX_REMOTE_TORRENT_SIZE),
+    );
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .with_context(|| format!("error reading response body from {url}"))?;
-    torrent_from_bytes(b).context("error decoding torrent")
+        .map_err(reqwest::Error::without_url)
+        .context("error reading torrent metadata response body")?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_REMOTE_TORRENT_SIZE {
+            bail!("torrent metadata exceeds {MAX_REMOTE_TORRENT_SIZE} bytes")
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    torrent_from_bytes(bytes.into()).context("error decoding torrent")
 }
 
 fn compute_only_files_regex<ByteBuf: AsRef<[u8]>>(
@@ -848,7 +878,7 @@ impl Session {
             let proxy_config = match proxy_url {
                 Some(pu) => Some(
                     SocksProxyConfig::parse(pu)
-                        .with_context(|| format!("error parsing proxy url {pu}"))?,
+                        .context("error parsing proxy URL")?,
                 ),
                 None => None,
             };
@@ -891,10 +921,10 @@ impl Session {
             );
 
             let blocklist = if let Some(blocklist_url) = opts.blocklist_url {
-                info!(url = blocklist_url, "loading p2p blocklist");
+                info!(url = %crate::redact_url_for_logging(&blocklist_url), "loading p2p blocklist");
                 let bl = IpRanges::load_from_url(&blocklist_url)
                     .await
-                    .with_context(|| format!("error reading blocklist from {blocklist_url}"))?;
+                    .context("error reading blocklist")?;
                 info!(len = bl.len(), "loaded blocklist");
                 bl
             } else {
@@ -902,10 +932,10 @@ impl Session {
             };
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
-                info!(url = allowlist_url, "loading p2p allowlist");
+                info!(url = %crate::redact_url_for_logging(&allowlist_url), "loading p2p allowlist");
                 let al = IpRanges::load_from_url(&allowlist_url)
                     .await
-                    .with_context(|| format!("error reading allowlist from {allowlist_url}"))?;
+                    .context("error reading allowlist")?;
                 info!(len = al.len(), "loaded allowlist");
                 Some(al)
             } else {
@@ -1455,11 +1485,8 @@ impl Session {
                         {
                             torrent_from_url(&self.reqwest_client, &url).await?
                         }
-                        AddTorrent::Url(url) => {
-                            bail!(
-                                "unsupported URL {:?}. Supporting magnet:, http:, and https",
-                                url
-                            )
+                        AddTorrent::Url(_) => {
+                            bail!("unsupported URL scheme; supported schemes are magnet, http, and https")
                         }
                         AddTorrent::TorrentFileBytes(bytes) => {
                             torrent_from_bytes(bytes).context("error decoding torrent")?
@@ -1643,7 +1670,11 @@ impl Session {
             (Some(_), Some(_)) => {
                 bail!("you can't provide both output_folder and sub_folder")
             }
-            (None, Some(s)) => self.output_folder.join(s),
+            (None, Some(s)) => {
+                let sub_folder = PathBuf::from(s);
+                validate_sub_folder(&sub_folder)?;
+                self.output_folder.join(sub_folder)
+            }
         };
 
         if opts.list_only {
@@ -2201,11 +2232,50 @@ mod tests {
     use buffers::ByteBuf;
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
+    use tokio::io::AsyncWriteExt;
 
     use super::{
-        AddTorrentOptions, MAX_PENDING_AUTOMATION_TORRENTS, Session, SessionOptions,
-        torrent_file_from_info_bytes,
+        AddTorrentOptions, MAX_PENDING_AUTOMATION_TORRENTS, MAX_REMOTE_TORRENT_SIZE, Session,
+        SessionOptions, torrent_file_from_info_bytes, torrent_from_url, validate_sub_folder,
     };
+
+    #[test]
+    fn sub_folder_rejects_absolute_and_traversal_paths() {
+        assert!(validate_sub_folder(std::path::Path::new("safe/nested")).is_ok());
+        assert!(validate_sub_folder(std::path::Path::new("../escape")).is_err());
+        assert!(validate_sub_folder(std::path::Path::new("./relative")).is_err());
+        assert!(validate_sub_folder(std::path::Path::new("/absolute")).is_err());
+
+        #[cfg(windows)]
+        assert!(validate_sub_folder(std::path::Path::new(r"C:escape")).is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_torrent_response_size_is_bounded() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_REMOTE_TORRENT_SIZE + 1
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+
+        let result = torrent_from_url(&reqwest::Client::new(), &format!("http://{address}")).await;
+        let Err(error) = result else {
+            panic!("oversized response was accepted")
+        };
+        assert!(
+            format!("{error:#}").contains("exceeds"),
+            "unexpected error: {error:#}"
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn test_torrent_file_from_info_and_bytes() {

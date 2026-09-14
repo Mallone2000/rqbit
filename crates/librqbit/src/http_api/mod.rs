@@ -7,7 +7,7 @@ use axum::routing::get;
 use base64::Engine;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, StatusCode, header::HOST};
 use librqbit_dualstack_sockets::TcpListener;
 use sha1w::{ISha256, Sha256};
 use std::sync::Arc;
@@ -151,6 +151,29 @@ fn constant_time_eq(expected: &[u8; 32], actual: &[u8; 32]) -> bool {
     difference == 0
 }
 
+async fn require_loopback_host(
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> impl IntoResponse {
+    let is_loopback = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|host| host.parse::<http::uri::Authority>().ok())
+        .is_some_and(|authority| {
+            let host = authority.host();
+            host.eq_ignore_ascii_case("localhost")
+                || host.eq_ignore_ascii_case("localhost.")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+    if !is_loopback {
+        return (StatusCode::FORBIDDEN, "Invalid Host header").into_response();
+    }
+    next.run(request).await
+}
+
 impl HttpApi {
     pub fn new(api: Api, opts: Option<HttpApiOptions>) -> Self {
         Self {
@@ -173,6 +196,9 @@ impl HttpApi {
             .basic_auth
             .as_ref()
             .is_some_and(|(user, pass)| !user.is_empty() && !pass.is_empty());
+        let enforce_loopback_host = !self.opts.read_only
+            && listener.bind_addr().ip().is_loopback()
+            && !credentials_configured;
         if self.opts.enable_qbittorrent_api && !credentials_configured {
             return async {
                 anyhow::bail!(
@@ -283,6 +309,13 @@ impl HttpApi {
             main_router = main_router.nest("/upnp", upnp_router);
         }
 
+        // An unauthenticated loopback API otherwise remains reachable through
+        // DNS rebinding, where an attacker-controlled hostname resolves to
+        // 127.0.0.1 and makes Origin and Host appear to match.
+        if enforce_loopback_host {
+            main_router = main_router.layer(axum::middleware::from_fn(require_loopback_host));
+        }
+
         let app = main_router
             .layer(cors_layer)
             .layer(
@@ -326,7 +359,10 @@ impl HttpApi {
 
 #[cfg(test)]
 mod tests {
-    use super::HttpApiOptions;
+    use std::net::Ipv4Addr;
+
+    use super::{HttpApi, HttpApiOptions};
+    use crate::{Api, Session, SessionOptions};
 
     #[test]
     fn debug_output_redacts_basic_auth_credentials() {
@@ -339,5 +375,59 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("sensitive-user"));
         assert!(!debug.contains("sensitive-pass"));
+    }
+
+    #[tokio::test]
+    async fn writable_api_rejects_cross_origin_and_dns_rebinding_requests() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+        let address = listener.bind_addr();
+        let server =
+            HttpApi::new(Api::new(session, None, None), None).make_http_api_and_run(listener, None);
+        let task = tokio::spawn(async move { server.await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{address}/torrents/limits"))
+            .header("Origin", "https://attacker.example")
+            .json(&serde_json::json!({"upload_bps": null, "download_bps": null}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let response = client
+            .post(format!("http://{address}/torrents/limits"))
+            .header("Host", "attacker.example")
+            .header("Origin", "http://attacker.example")
+            .json(&serde_json::json!({"upload_bps": null, "download_bps": null}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let response = client
+            .post(format!("http://{address}/torrents/limits"))
+            .json(&serde_json::json!({"upload_bps": null, "download_bps": null}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        task.abort();
     }
 }

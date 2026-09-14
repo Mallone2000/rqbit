@@ -226,7 +226,7 @@ pub(super) async fn require_auth(
     (StatusCode::FORBIDDEN, "Forbidden").into_response()
 }
 
-pub(super) async fn require_same_origin(
+pub(in crate::http_api) async fn require_same_origin(
     headers: HeaderMap,
     request: Request,
     next: Next,
@@ -246,14 +246,31 @@ fn request_source_matches_host(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
         return false;
     };
-    source
-        .parse::<http::Uri>()
-        .ok()
-        .and_then(|uri| {
-            uri.authority()
-                .map(|authority| authority.as_str().to_owned())
-        })
-        .is_some_and(|authority| authority.eq_ignore_ascii_case(host))
+    let Some(source) = source.parse::<http::Uri>().ok() else {
+        return false;
+    };
+    let Some(source_authority) = source.authority() else {
+        return false;
+    };
+    if source_authority.as_str().eq_ignore_ascii_case(host) {
+        return true;
+    }
+
+    // The development Web UI and Tauri use a different port from the API.
+    // Treat loopback names/addresses as one trusted local site while still
+    // rejecting arbitrary cross-site browser requests.
+    let Ok(host_authority) = host.parse::<http::uri::Authority>() else {
+        return false;
+    };
+    is_loopback_host(source_authority.host()) && is_loopback_host(host_authority.host())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("localhost.")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn sid_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -305,6 +322,12 @@ mod tests {
             HeaderValue::from_str("https://attacker.example").unwrap(),
         );
         assert!(!request_source_matches_host(&headers));
+
+        headers.insert(
+            super::ORIGIN,
+            HeaderValue::from_static("http://localhost:3031"),
+        );
+        assert!(request_source_matches_host(&headers));
     }
 
     #[test]

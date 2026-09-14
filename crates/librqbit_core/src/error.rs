@@ -10,6 +10,8 @@ pub enum Error {
     BadTorrentPathTraversal,
     #[error("suspicious separator in filename")]
     BadTorrentSeparatorInName,
+    #[error("filename contains a path component that is unsafe on this platform")]
+    BadTorrentInvalidPathComponent,
     #[error("torrent with 0 length is useless")]
     BadTorrentZeroLength,
     #[error("invalid piece index {0}")]

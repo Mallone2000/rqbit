@@ -12,7 +12,7 @@ use std::sync::Arc;
 use axum::response::Redirect;
 
 use axum::{
-    Router,
+    Router, middleware,
     response::IntoResponse,
     routing::{get, post},
 };
@@ -79,7 +79,6 @@ pub fn make_api_router(state: ApiState) -> Router {
     let mut api_router = Router::new()
         .route("/", get(h_api_root))
         .route("/stream_logs", get(logging::h_stream_logs))
-        .route("/rust_log", post(logging::h_set_rust_log))
         .route("/dht/stats", get(dht::h_dht_stats))
         .route("/dht/table", get(dht::h_dht_table))
         .route("/stats", get(torrents::h_session_stats))
@@ -96,7 +95,6 @@ pub fn make_api_router(state: ApiState) -> Router {
         )
         .route("/torrents/{id}/playlist", get(playlist::h_torrent_playlist))
         .route("/torrents/playlist", get(playlist::h_global_playlist))
-        .route("/torrents/resolve_magnet", post(other::h_resolve_magnet))
         .route(
             "/torrents/{id}/stream/{file_id}",
             get(streaming::h_torrent_stream_file),
@@ -107,8 +105,16 @@ pub fn make_api_router(state: ApiState) -> Router {
         )
         .route("/torrents/limits", get(configure::h_get_session_ratelimits));
 
+    let utility_post_router = Router::new()
+        .route("/rust_log", post(logging::h_set_rust_log))
+        .route("/torrents/resolve_magnet", post(other::h_resolve_magnet))
+        .route_layer(middleware::from_fn(
+            super::qbittorrent::auth::require_same_origin,
+        ));
+    api_router = api_router.merge(utility_post_router);
+
     if !state.opts.read_only {
-        api_router = api_router
+        let write_router = Router::new()
             .route("/torrents", post(torrents::h_torrents_post))
             .route(
                 "/torrents/limits",
@@ -135,7 +141,11 @@ pub fn make_api_router(state: ApiState) -> Router {
                 post(torrents::h_torrent_action_update_only_files),
             )
             .route("/torrents/{id}/add_peers", post(torrents::h_add_peers))
-            .route("/torrents/create", post(torrents::h_create_torrent));
+            .route("/torrents/create", post(torrents::h_create_torrent))
+            .route_layer(middleware::from_fn(
+                super::qbittorrent::auth::require_same_origin,
+            ));
+        api_router = api_router.merge(write_router);
     }
 
     api_router.with_state(state)

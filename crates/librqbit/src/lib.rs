@@ -118,6 +118,18 @@ pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+pub(crate) fn redact_url_for_logging(value: &str) -> String {
+    let Ok(url) = url::Url::parse(value) else {
+        return "<invalid URL>".to_owned();
+    };
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        format!("{}:<redacted>", url.scheme())
+    } else {
+        origin
+    }
+}
+
 pub const fn client_name_and_version() -> &'static str {
     concat!("rqbit ", env!("CARGO_PKG_VERSION"))
 }

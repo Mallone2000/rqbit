@@ -4,7 +4,7 @@ FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
 FROM --platform=$BUILDPLATFORM rust:alpine AS builder
 COPY --from=xx / /
 
-RUN apk update && apk add clang lld npm pkgconf
+RUN apk update && apk add ca-certificates clang lld npm pkgconf
 
 ARG TARGETPLATFORM
 RUN xx-apk add gcc musl-dev openssl-dev openssl-libs-static
@@ -40,3 +40,4 @@ EOF
 FROM scratch
 
 COPY --from=builder /bin/rqbit /rqbit
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /cacert.pem

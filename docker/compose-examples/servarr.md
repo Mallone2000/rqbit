@@ -17,6 +17,10 @@ HTTPS reverse proxy or another trusted encrypted access layer in front of them.
 rqbit refuses to start the qBittorrent compatibility API unless a non-empty
 `RQBIT_HTTP_BASIC_AUTH_USERPASS` value is configured.
 
+Set `GLUETUN_IMAGE`, `RQBIT_IMAGE`, `SONARR_IMAGE`, and `RADARR_IMAGE` to
+reviewed image references pinned by digest (`name@sha256:...`). The Compose
+example intentionally has no mutable `latest` fallback.
+
 On Windows, build and export a deployable Linux image from the repository root:
 
 ```powershell

@@ -51,11 +51,25 @@ impl Default for ConnectionOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct SocksProxyConfig {
     pub host: String,
     pub port: u16,
     pub username_password: Option<(String, String)>,
+}
+
+impl std::fmt::Debug for SocksProxyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SocksProxyConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field(
+                "username_password",
+                &self.username_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -322,5 +336,20 @@ impl StreamConnector {
                 },
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SocksProxyConfig;
+
+    #[test]
+    fn proxy_debug_output_redacts_credentials() {
+        let config =
+            SocksProxyConfig::parse("socks5://private-user:private-pass@localhost:1080").unwrap();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("private-user"));
+        assert!(!debug.contains("private-pass"));
     }
 }

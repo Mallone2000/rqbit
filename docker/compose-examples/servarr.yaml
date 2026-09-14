@@ -1,6 +1,6 @@
 services:
   gluetun:
-    image: qmcgaw/gluetun
+    image: ${GLUETUN_IMAGE:?set this to qmcgaw/gluetun@sha256:<trusted digest>}
     container_name: gluetun
     cap_add:
       - NET_ADMIN
@@ -44,7 +44,7 @@ services:
     restart: unless-stopped
 
   sonarr:
-    image: lscr.io/linuxserver/sonarr:latest
+    image: ${SONARR_IMAGE:?set this to lscr.io/linuxserver/sonarr@sha256:<trusted digest>}
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -57,7 +57,7 @@ services:
     restart: unless-stopped
 
   radarr:
-    image: lscr.io/linuxserver/radarr:latest
+    image: ${RADARR_IMAGE:?set this to lscr.io/linuxserver/radarr@sha256:<trusted digest>}
     network_mode: "service:gluetun"
     depends_on:
       gluetun:

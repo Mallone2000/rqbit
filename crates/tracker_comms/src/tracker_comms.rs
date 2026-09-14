@@ -26,6 +26,8 @@ use crate::tracker_comms_udp;
 use crate::tracker_comms_udp::UdpTrackerClient;
 use librqbit_core::hash_id::Id20;
 
+const MAX_HTTP_TRACKER_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
+
 pub struct TrackerComms {
     info_hash: Id20,
     peer_id: Id20,
@@ -236,7 +238,12 @@ impl TrackerComms {
     }
 
     async fn task_single_tracker_monitor_http(&self, tracker_url: Url) -> anyhow::Result<()> {
-        trace!(url=%tracker_url, "starting monitor");
+        trace!(
+            scheme = tracker_url.scheme(),
+            host = tracker_url.host_str().unwrap_or("<missing>"),
+            port = tracker_url.port_or_known_default(),
+            "starting tracker monitor"
+        );
         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
 
         loop {
@@ -290,11 +297,39 @@ impl TrackerComms {
         }
         url.set_query(Some(&queries));
 
-        let response: reqwest::Response = self.reqwest_client.get(url).send().await?;
+        let mut response: reqwest::Response = self
+            .reqwest_client
+            .get(url)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("HTTP tracker request failed")?;
         if !response.status().is_success() {
             anyhow::bail!("tracker responded with {:?}", response.status());
         }
-        let bytes = response.bytes().await?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_HTTP_TRACKER_RESPONSE_SIZE as u64)
+        {
+            bail!("HTTP tracker response exceeds {MAX_HTTP_TRACKER_RESPONSE_SIZE} bytes")
+        }
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default()
+                .min(MAX_HTTP_TRACKER_RESPONSE_SIZE),
+        );
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_HTTP_TRACKER_RESPONSE_SIZE {
+                bail!("HTTP tracker response exceeds {MAX_HTTP_TRACKER_RESPONSE_SIZE} bytes")
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         if let Ok((error, _)) =
             bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
         {
