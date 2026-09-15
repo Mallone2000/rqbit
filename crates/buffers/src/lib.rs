@@ -214,3 +214,49 @@ impl<'de> serde::de::Deserialize<'de> for ByteBufOwned {
         deserializer.deserialize_byte_buf(Visitor {})
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use clone_to_owned::CloneToOwned;
+
+    use super::{ByteBuf, ByteBufOwned};
+
+    #[test]
+    fn formatting_covers_text_zeroes_short_binary_and_long_binary() {
+        assert_eq!(format!("{}", ByteBuf(b"hello")), "hello");
+        assert_eq!(format!("{:?}", ByteBuf(b"hello")), "\"hello\"");
+        assert_eq!(format!("{}", ByteBuf(&[0; 4])), "<4 bytes, all zeroes>");
+        assert_eq!(format!("{}", ByteBuf(&[0xff, 1])), "<2 bytes, 0xff01>");
+        assert_eq!(format!("{}", ByteBuf(&[0xff; 21])), "<21 bytes>");
+        assert_eq!(format!("{}", ByteBuf(&[])), "");
+    }
+
+    #[test]
+    fn borrowed_clone_without_source_buffer_copies_bytes() {
+        let source = vec![1, 2, 3];
+        let owned = ByteBuf(&source).clone_to_owned(None);
+        assert_eq!(owned.as_ref(), source);
+    }
+
+    #[test]
+    fn borrowed_clone_with_source_buffer_is_zero_copy_slice() {
+        let source = Bytes::from_static(b"prefix-payload-suffix");
+        let payload = &source[7..14];
+        let owned = ByteBuf(payload).clone_to_owned(Some(&source));
+
+        assert_eq!(owned.as_ref(), b"payload");
+        assert_eq!(owned.0.as_ptr(), payload.as_ptr());
+    }
+
+    #[test]
+    fn owned_conversions_and_clone_preserve_contents() {
+        let from_slice = ByteBufOwned::from(&b"data"[..]);
+        let from_vec = ByteBufOwned::from(b"data".to_vec());
+        let cloned = from_vec.clone_to_owned(None);
+
+        assert_eq!(from_slice, from_vec);
+        assert_eq!(cloned, from_vec);
+        assert_eq!(cloned.0.as_ptr(), from_vec.0.as_ptr());
+    }
+}

@@ -6,6 +6,7 @@
     "dev": "vite",
     "dev:mock": "vite --port 3032 --open /mock.html",
     "build": "tsc --noEmit && vite build && node post-build",
+    "test": "vitest run",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -30,6 +31,7 @@
     "tailwindcss": "^4.1.18",
     "typescript": "^5.3.2",
     "vite": "^7",
-    "vite-plugin-svgr": "^4.2.0"
+    "vite-plugin-svgr": "^4.2.0",
+    "vitest": "^5.0.0"
   }
 }

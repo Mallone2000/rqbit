@@ -229,13 +229,45 @@ impl RqbitDesktopConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::{
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        path::PathBuf,
+        time::Duration,
+    };
 
-    use super::RqbitDesktopConfig;
+    use librqbit::{ListenerMode, limits::LimitsConfig};
+
+    use super::{
+        RqbitDesktopConfig, RqbitDesktopConfigConnections, RqbitDesktopConfigDht,
+        RqbitDesktopConfigHttpApi, RqbitDesktopConfigPersistence, RqbitDesktopConfigUpnp,
+    };
+
+    fn config() -> RqbitDesktopConfig {
+        RqbitDesktopConfig {
+            default_download_location: PathBuf::from("Downloads"),
+            dht: RqbitDesktopConfigDht {
+                disable: false,
+                disable_persistence: false,
+                persistence_filename: PathBuf::from("dht.json"),
+            },
+            connections: RqbitDesktopConfigConnections::default(),
+            upnp: RqbitDesktopConfigUpnp::default(),
+            persistence: RqbitDesktopConfigPersistence {
+                disable: false,
+                folder: PathBuf::from("session"),
+                fastresume: false,
+                filename: PathBuf::new(),
+            },
+            http_api: RqbitDesktopConfigHttpApi::default(),
+            ratelimits: LimitsConfig::default(),
+            #[cfg(feature = "disable-upload")]
+            disable_upload: false,
+        }
+    }
 
     #[test]
     fn writable_http_api_must_remain_on_loopback() {
-        let mut config = RqbitDesktopConfig::default();
+        let mut config = config();
         config.http_api.listen_addr =
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 3030));
 
@@ -243,5 +275,77 @@ mod tests {
 
         config.http_api.read_only = true;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn disabled_http_api_may_use_non_loopback_address() {
+        let mut config = config();
+        config.http_api.disable = true;
+        config.http_api.listen_addr = "0.0.0.0:3030".parse().unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn upnp_server_requires_enabled_non_loopback_http_api() {
+        let mut config = config();
+        config.upnp.enable_server = true;
+        assert!(config.validate().is_err());
+
+        config.http_api.listen_addr = "0.0.0.0:3030".parse().unwrap();
+        config.http_api.read_only = true;
+        assert!(config.validate().is_ok());
+
+        config.http_api.disable = true;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn connection_options_cover_listener_modes_and_proxy() {
+        let mut connections = RqbitDesktopConfigConnections {
+            enable_tcp_listen: true,
+            enable_tcp_outgoing: false,
+            enable_utp: true,
+            enable_upnp_port_forward: false,
+            socks_proxy: "socks5://127.0.0.1:1080".into(),
+            listen_port: 6881,
+            peer_connect_timeout: Duration::from_secs(3),
+            peer_read_write_timeout: Duration::from_secs(4),
+        };
+        let (listener, outgoing) = connections.as_listener_and_connect_opts();
+        let listener = listener.unwrap();
+        assert!(matches!(listener.mode, ListenerMode::TcpAndUtp));
+        assert_eq!(listener.listen_addr, "0.0.0.0:6881".parse().unwrap());
+        assert!(!listener.enable_upnp_port_forwarding);
+        assert!(!outgoing.enable_tcp);
+        assert_eq!(
+            outgoing.proxy_url.as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+        let peer = outgoing.peer_opts.unwrap();
+        assert_eq!(peer.connect_timeout, Some(Duration::from_secs(3)));
+        assert_eq!(peer.read_write_timeout, Some(Duration::from_secs(4)));
+
+        connections.enable_tcp_listen = false;
+        let (listener, _) = connections.as_listener_and_connect_opts();
+        assert!(matches!(listener.unwrap().mode, ListenerMode::UtpOnly));
+        connections.enable_utp = false;
+        assert!(connections.as_listener_and_connect_opts().0.is_none());
+    }
+
+    #[test]
+    fn persistence_migrates_legacy_filename_only_when_folder_is_empty() {
+        let mut persistence = RqbitDesktopConfigPersistence {
+            disable: false,
+            folder: PathBuf::new(),
+            fastresume: false,
+            filename: PathBuf::from("legacy/session.json"),
+        };
+        persistence.fix_backwards_compat();
+        assert_eq!(persistence.folder, PathBuf::from("legacy"));
+
+        persistence.folder = PathBuf::from("chosen");
+        persistence.filename = PathBuf::from("other/session.json");
+        persistence.fix_backwards_compat();
+        assert_eq!(persistence.folder, PathBuf::from("chosen"));
     }
 }

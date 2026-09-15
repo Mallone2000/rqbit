@@ -93,3 +93,58 @@ impl SpeedEstimator {
         self.bytes_per_second.store(bps as u64, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::SpeedEstimator;
+
+    #[test]
+    fn first_snapshot_has_no_rate_or_eta() {
+        let estimator = SpeedEstimator::new(3);
+        estimator.add_snapshot(100, Some(900), Instant::now());
+        assert_eq!(estimator.bps(), 0);
+        assert_eq!(estimator.time_remaining(), None);
+    }
+
+    #[test]
+    fn computes_rate_mbps_and_remaining_time() {
+        let estimator = SpeedEstimator::new(3);
+        let start = Instant::now();
+        estimator.add_snapshot(0, Some(2048), start);
+        estimator.add_snapshot(1024, Some(2048), start + Duration::from_secs(1));
+
+        assert_eq!(estimator.bps(), 1024);
+        assert_eq!(estimator.mbps(), 1.0 / 1024.0);
+        assert_eq!(estimator.time_remaining(), Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn sliding_window_discards_oldest_snapshot() {
+        let estimator = SpeedEstimator::new(2);
+        let start = Instant::now();
+        estimator.add_snapshot(0, None, start);
+        estimator.add_snapshot(10, None, start + Duration::from_secs(1));
+        estimator.add_snapshot(40, None, start + Duration::from_secs(2));
+        assert_eq!(estimator.bps(), 20);
+        estimator.add_snapshot(100, None, start + Duration::from_secs(3));
+        assert_eq!(estimator.bps(), 45);
+    }
+
+    #[test]
+    fn stalled_progress_clears_rate_and_eta() {
+        let estimator = SpeedEstimator::new(2);
+        let start = Instant::now();
+        estimator.add_snapshot(10, Some(100), start);
+        estimator.add_snapshot(10, Some(100), start + Duration::from_secs(1));
+        assert_eq!(estimator.bps(), 0);
+        assert_eq!(estimator.time_remaining(), None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn window_must_contain_at_least_two_snapshots() {
+        SpeedEstimator::new(1);
+    }
+}

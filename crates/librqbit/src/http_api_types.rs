@@ -110,3 +110,84 @@ impl TorrentAddQueryParams {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{net::SocketAddr, time::Duration};
+
+    use super::{InitialPeers, OnlyFiles, TorrentAddQueryParams};
+
+    #[test]
+    fn only_files_round_trips_as_comma_separated_ids() {
+        let encoded = serde_json::to_string(&OnlyFiles(vec![0, 2, 10])).unwrap();
+        assert_eq!(encoded, "\"0,2,10\"");
+        let decoded: OnlyFiles = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.0, vec![0, 2, 10]);
+    }
+
+    #[test]
+    fn only_files_rejects_empty_and_invalid_values() {
+        assert!(serde_json::from_str::<OnlyFiles>("\"\"").is_err());
+        assert!(serde_json::from_str::<OnlyFiles>("\"1,nope\"").is_err());
+    }
+
+    #[test]
+    fn initial_peers_round_trip_ipv4_and_ipv6() {
+        let peers = InitialPeers(vec![
+            "127.0.0.1:1".parse().unwrap(),
+            "[::1]:2".parse().unwrap(),
+        ]);
+        let encoded = serde_json::to_string(&peers).unwrap();
+        let decoded: InitialPeers = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.0, peers.0);
+    }
+
+    #[test]
+    fn initial_peers_accepts_empty_input_and_rejects_bad_addresses() {
+        let empty: InitialPeers = serde_json::from_str("\"\"").unwrap();
+        assert!(empty.0.is_empty());
+        assert!(serde_json::from_str::<InitialPeers>("\"localhost:1\"").is_err());
+    }
+
+    #[test]
+    fn query_params_convert_all_public_options() {
+        let peer: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let options = TorrentAddQueryParams {
+            overwrite: Some(true),
+            output_folder: Some("out".into()),
+            sub_folder: Some("sub".into()),
+            only_files_regex: Some("video".into()),
+            only_files: Some(OnlyFiles(vec![1, 3])),
+            peer_connect_timeout: Some(7),
+            peer_read_write_timeout: Some(11),
+            initial_peers: Some(InitialPeers(vec![peer])),
+            is_url: Some(true),
+            list_only: Some(true),
+        }
+        .into_add_torrent_options();
+
+        assert!(options.overwrite);
+        assert!(options.list_only);
+        assert_eq!(options.output_folder.as_deref(), Some("out"));
+        assert_eq!(options.sub_folder.as_deref(), Some("sub"));
+        assert_eq!(options.only_files_regex.as_deref(), Some("video"));
+        assert_eq!(options.only_files, Some(vec![1, 3]));
+        assert_eq!(options.initial_peers, Some(vec![peer]));
+        let peer_options = options.peer_opts.unwrap();
+        assert_eq!(peer_options.connect_timeout, Some(Duration::from_secs(7)));
+        assert_eq!(
+            peer_options.read_write_timeout,
+            Some(Duration::from_secs(11))
+        );
+    }
+
+    #[test]
+    fn query_defaults_match_add_torrent_defaults() {
+        let options = TorrentAddQueryParams::default().into_add_torrent_options();
+        assert!(!options.overwrite);
+        assert!(!options.list_only);
+        assert_eq!(options.only_files, None);
+        assert_eq!(options.initial_peers, None);
+        assert!(options.peer_opts.is_some());
+    }
+}
