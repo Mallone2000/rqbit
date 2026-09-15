@@ -288,7 +288,7 @@ pub async fn discover_services(location: Url) -> anyhow::Result<RootDesc> {
     let root_desc: RootDesc = quick_xml::de::from_str(response)
         .context("failed to parse response body as xml")
         .inspect_err(|e| {
-            debug!("failed to parse this XML: {response}. Error: {e:#}");
+            debug!(response_bytes = response.len(), error = ?e, "failed to parse UPnP device XML");
         })?;
     Ok(root_desc)
 }

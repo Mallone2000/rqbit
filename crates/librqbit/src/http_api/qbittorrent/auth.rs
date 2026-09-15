@@ -28,6 +28,7 @@ const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 const AUTH_BAN_DURATION: Duration = Duration::from_secs(60 * 60);
 const MAX_AUTH_FAILURES: u8 = 5;
 const MAX_TRACKED_CLIENTS: usize = 1024;
+const MAX_PUBLIC_IP_RESPONSE_SIZE: usize = 64;
 
 struct AuthFailures {
     count: u8,
@@ -216,19 +217,33 @@ pub(in crate::http_api) async fn web_public_ip(
             return (StatusCode::BAD_GATEWAY, "Unable to determine public IP").into_response();
         }
     };
-    let public_ip = match response.text().await {
-        Ok(body) => match body.trim().parse::<IpAddr>() {
-            Ok(public_ip) => public_ip,
-            Err(_) => {
-                return (StatusCode::BAD_GATEWAY, "Invalid public IP response").into_response();
-            }
-        },
-        Err(_) => {
-            return (StatusCode::BAD_GATEWAY, "Unable to read public IP response").into_response();
-        }
+    let public_ip = match parse_public_ip_response(response).await {
+        Ok(public_ip) => public_ip,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "Invalid public IP response").into_response(),
     };
 
     axum::Json(serde_json::json!({ "public_ip": public_ip })).into_response()
+}
+
+async fn parse_public_ip_response(mut response: reqwest::Response) -> Result<IpAddr, ()> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PUBLIC_IP_RESPONSE_SIZE as u64)
+    {
+        return Err(());
+    }
+    let mut body = Vec::with_capacity(MAX_PUBLIC_IP_RESPONSE_SIZE);
+    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+        if body.len().saturating_add(chunk.len()) > MAX_PUBLIC_IP_RESPONSE_SIZE {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    std::str::from_utf8(&body)
+        .map_err(|_| ())?
+        .trim()
+        .parse()
+        .map_err(|_| ())
 }
 
 pub(in crate::http_api) async fn web_login(
@@ -426,7 +441,10 @@ mod tests {
 
     use http::{HeaderMap, HeaderValue};
 
-    use super::{MAX_AUTH_FAILURES, Sessions, request_source_matches_host};
+    use super::{
+        MAX_AUTH_FAILURES, MAX_PUBLIC_IP_RESPONSE_SIZE, Sessions, parse_public_ip_response,
+        request_source_matches_host,
+    };
 
     #[test]
     fn repeated_authentication_failures_are_rate_limited() {
@@ -490,5 +508,30 @@ mod tests {
 
         sessions.revoke(&sid);
         assert!(!sessions.is_valid(&sid));
+    }
+
+    #[tokio::test]
+    async fn public_ip_response_body_is_bounded() {
+        let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+        let address = listener.bind_addr();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/",
+                    axum::routing::get(|| async { "x".repeat(MAX_PUBLIC_IP_RESPONSE_SIZE + 1) }),
+                ),
+            )
+            .await
+            .unwrap()
+        });
+
+        let response = reqwest::get(format!("http://{address}")).await.unwrap();
+        assert!(parse_public_ip_response(response).await.is_err());
+        task.abort();
     }
 }

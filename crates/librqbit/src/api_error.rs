@@ -131,6 +131,15 @@ impl Serialize for ApiError {
             #[serde(skip_serializing_if = "Option::is_none")]
             id: Option<TorrentIdOrHash>,
         }
+        let status = self.status();
+        let human_readable = match &self.kind {
+            ApiErrorKind::TorrentNotFound(_)
+            | ApiErrorKind::DhtDisabled
+            | ApiErrorKind::Unauthorized
+            | ApiErrorKind::Text(_) => format!("{self}"),
+            _ if status.is_client_error() => "request failed".to_owned(),
+            _ => "internal server error".to_owned(),
+        };
         let mut serr: SerializedError = SerializedError {
             error_kind: match self.kind {
                 ApiErrorKind::TorrentNotFound(_) => "torrent_not_found",
@@ -141,9 +150,9 @@ impl Serialize for ApiError {
                 ApiErrorKind::OtherCore(_) => "internal_error",
                 ApiErrorKind::Text(_) => "internal_error",
             },
-            human_readable: format!("{self}"),
-            status: self.status().as_u16(),
-            status_text: self.status().to_string(),
+            human_readable,
+            status: status.as_u16(),
+            status_text: status.to_string(),
             ..Default::default()
         };
         if let ApiErrorKind::TorrentNotFound(id) = &self.kind {
@@ -215,5 +224,42 @@ impl IntoResponse for ApiError {
         let mut response = axum::Json(&self).into_response();
         *response.status_mut() = self.status();
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::StatusCode;
+
+    use super::ApiError;
+
+    #[test]
+    fn serialization_hides_internal_error_details() {
+        let error = ApiError::from(anyhow::anyhow!("sensitive path: /private/downloads"));
+        let json = serde_json::to_value(&error).unwrap();
+
+        assert_eq!(json["human_readable"], "internal server error");
+        assert!(!json.to_string().contains("/private/downloads"));
+    }
+
+    #[test]
+    fn serialization_hides_wrapped_error_details_even_with_client_status() {
+        let inner = ApiError::from((
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("sensitive path: /private/downloads"),
+        ));
+        let error = ApiError::from(anyhow::Error::new(inner));
+        let json = serde_json::to_value(&error).unwrap();
+
+        assert_eq!(json["human_readable"], "request failed");
+        assert!(!json.to_string().contains("/private/downloads"));
+    }
+
+    #[test]
+    fn serialization_preserves_client_error_details() {
+        let error = ApiError::from((StatusCode::BAD_REQUEST, "invalid input"));
+        let json = serde_json::to_value(&error).unwrap();
+
+        assert_eq!(json["human_readable"], "invalid input");
     }
 }

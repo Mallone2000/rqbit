@@ -92,10 +92,21 @@ enum SupportedTracker {
 impl std::fmt::Debug for SupportedTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SupportedTracker::Udp(u) => std::fmt::Display::fmt(u, f),
-            SupportedTracker::Http(u) => std::fmt::Display::fmt(u, f),
+            SupportedTracker::Udp(u) | SupportedTracker::Http(u) => {
+                std::fmt::Display::fmt(&tracker_url_for_logging(u), f)
+            }
         }
     }
+}
+
+fn tracker_url_for_logging(url: &Url) -> String {
+    let mut redacted = url.clone();
+    let _ = redacted.set_password(None);
+    let _ = redacted.set_username("");
+    redacted.set_path("");
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -218,7 +229,7 @@ impl TrackerComms {
         let info_hash = self.info_hash;
         match url {
             SupportedTracker::Udp(url) => {
-                let span = debug_span!(parent: None, "udp_tracker", tracker = %url, info_hash = ?info_hash);
+                let span = debug_span!(parent: None, "udp_tracker", tracker = %tracker_url_for_logging(&url), info_hash = ?info_hash);
                 self.task_single_tracker_monitor_udp(url, client.clone())
                     .instrument(span)
                     .right_future()
@@ -227,7 +238,7 @@ impl TrackerComms {
                 let span = debug_span!(
                     parent: None,
                     "http_tracker",
-                    tracker = %url,
+                    tracker = %tracker_url_for_logging(&url),
                     info_hash = ?info_hash
                 );
                 self.task_single_tracker_monitor_http(url)
@@ -359,7 +370,7 @@ impl TrackerComms {
         client: UdpTrackerClient,
     ) -> anyhow::Result<()> {
         if url.scheme() != "udp" {
-            bail!("expected UDP scheme in {}", url);
+            bail!("expected UDP scheme in {}", tracker_url_for_logging(&url));
         }
         let (host, port) = (
             url.host().context("missing host")?,
@@ -468,6 +479,27 @@ impl TrackerComms {
                 debug!(?addr, "error reading announce response: {e:#}");
                 Err(e)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    use super::tracker_url_for_logging;
+
+    #[test]
+    fn tracker_log_url_removes_credentials_path_and_query() {
+        let url = Url::parse(
+            "https://private-user:private-pass@tracker.example/private-pass/announce?token=query-secret#fragment",
+        )
+        .unwrap();
+
+        let redacted = tracker_url_for_logging(&url);
+        assert!(redacted.contains("https://tracker.example"));
+        for secret in ["private-user", "private-pass", "query-secret", "fragment"] {
+            assert!(!redacted.contains(secret));
         }
     }
 }

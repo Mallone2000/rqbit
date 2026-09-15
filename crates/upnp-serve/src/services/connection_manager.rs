@@ -29,7 +29,7 @@ pub(crate) async fn http_handler(
 ) -> impl IntoResponse {
     let body = BStr::new(&body);
     let action = headers.get("soapaction").map(|v| BStr::new(v.as_bytes()));
-    trace!(?body, ?action, "received control request");
+    trace!(body_bytes = body.len(), ?action, "received control request");
     let action = match action {
         Some(action) => action,
         None => {

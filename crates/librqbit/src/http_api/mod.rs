@@ -107,6 +107,9 @@ async fn simple_basic_auth(
         Some(&(expected_user.to_owned(), expected_pass.to_owned())),
         &headers,
     ) {
+        if headers.contains_key(http::header::AUTHORIZATION) {
+            sessions.record_login_failure(client_ip);
+        }
         if headers.contains_key("x-rqbit-webui") {
             return Ok((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
         }
@@ -117,7 +120,6 @@ async fn simple_basic_auth(
             )
                 .into_response());
         }
-        sessions.record_login_failure(client_ip);
         return Err(ApiError::unauthorized());
     }
     sessions.clear_login_failures(client_ip);
@@ -204,7 +206,10 @@ impl HttpApi {
             api,
             opts: opts.unwrap_or_default(),
             qbittorrent_sessions: Default::default(),
-            public_ip_client: reqwest::Client::new(),
+            public_ip_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("building the public IP HTTP client should not fail"),
             public_ip_lookup_url: "https://api64.ipify.org".to_owned(),
         }
     }
@@ -716,13 +721,24 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+        for _ in 0..5 {
+            let response = client
+                .get(format!("{base}/stats"))
+                .basic_auth("servarr", Some("wrong"))
+                .header("X-Rqbit-WebUI", "1")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
+
         let response = client
             .get(format!("{base}/api/v2/app/version"))
             .basic_auth("servarr", Some("secret"))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
 
         task.abort();
         public_ip_task.abort();
