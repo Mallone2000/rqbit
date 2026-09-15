@@ -1,21 +1,31 @@
 import { JSX, useState } from "react";
-import { BsBodyText, BsMoon, BsSliders2, BsSun } from "react-icons/bs";
+import {
+  BsBodyText,
+  BsBoxArrowRight,
+  BsMoon,
+  BsSliders2,
+  BsSun,
+} from "react-icons/bs";
 import { IconButton } from "./buttons/IconButton";
 import { ViewModeToggle } from "./ViewModeToggle";
 import { DarkMode } from "../helper/darkMode";
 import { ConfigModal } from "./config/ConfigModal";
+import { LogoutModal } from "./modal/LogoutModal";
 
 interface SettingsButtonsProps {
   onLogsClick: () => void;
   menuButtons?: JSX.Element[];
+  onLogout?: () => Promise<void>;
 }
 
 export const SettingsButtons: React.FC<SettingsButtonsProps> = ({
   onLogsClick,
   menuButtons,
+  onLogout,
 }) => {
   const [isDark, setIsDark] = useState(DarkMode.isDark());
   const [configOpen, setConfigOpen] = useState(false);
+  const [logoutOpen, setLogoutOpen] = useState(false);
 
   const handleDarkModeToggle = () => {
     DarkMode.toggle();
@@ -48,6 +58,18 @@ export const SettingsButtons: React.FC<SettingsButtonsProps> = ({
       <IconButton onClick={handleDarkModeToggle} title="Toggle dark mode">
         {isDark ? <BsSun /> : <BsMoon />}
       </IconButton>
+      {onLogout && (
+        <>
+          <IconButton onClick={() => setLogoutOpen(true)} title="Log out">
+            <BsBoxArrowRight />
+          </IconButton>
+          <LogoutModal
+            show={logoutOpen}
+            onHide={() => setLogoutOpen(false)}
+            onLogout={onLogout}
+          />
+        </>
+      )}
       <ViewModeToggle />
     </div>
   );

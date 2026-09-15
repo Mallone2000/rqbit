@@ -32,6 +32,8 @@ pub struct HttpApi {
     api: Api,
     opts: HttpApiOptions,
     qbittorrent_sessions: qbittorrent::auth::Sessions,
+    public_ip_client: reqwest::Client,
+    public_ip_lookup_url: String,
 }
 
 #[derive(Default)]
@@ -105,6 +107,9 @@ async fn simple_basic_auth(
         Some(&(expected_user.to_owned(), expected_pass.to_owned())),
         &headers,
     ) {
+        if headers.contains_key("x-rqbit-webui") {
+            return Ok((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+        }
         if headers.get("Authorization").is_none() {
             return Ok((
                 StatusCode::UNAUTHORIZED,
@@ -199,6 +204,8 @@ impl HttpApi {
             api,
             opts: opts.unwrap_or_default(),
             qbittorrent_sessions: Default::default(),
+            public_ip_client: reqwest::Client::new(),
+            public_ip_lookup_url: "https://api64.ipify.org".to_owned(),
         }
     }
 
@@ -324,11 +331,13 @@ impl HttpApi {
 
             let webui_router = webui::make_webui_router::<Arc<HttpApi>>()
                 .route("/auth/status", get(qbittorrent::auth::web_status))
+                .route("/public-ip", get(qbittorrent::auth::web_public_ip))
                 .route(
                     "/auth/login",
                     post(qbittorrent::auth::web_login)
                         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
                 )
+                .route("/auth/logout", post(qbittorrent::auth::web_logout))
                 .route_layer(middleware::from_fn(qbittorrent::auth::require_same_origin))
                 .with_state(state.clone());
             main_router = main_router.nest("/web/", webui_router);
@@ -514,6 +523,21 @@ mod tests {
     #[cfg(feature = "webui")]
     #[tokio::test]
     async fn web_login_uses_a_session_and_keeps_basic_auth_compatible() {
+        let public_ip_listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+        let public_ip_address = public_ip_listener.bind_addr();
+        let public_ip_task = tokio::spawn(async move {
+            axum::serve(
+                public_ip_listener,
+                axum::Router::new().route("/", axum::routing::get(|| async { "203.0.113.10" })),
+            )
+            .await
+            .unwrap()
+        });
+
         let downloads = tempfile::tempdir().unwrap();
         let session = Session::new_with_opts(
             downloads.path().to_path_buf(),
@@ -532,15 +556,16 @@ mod tests {
         )
         .unwrap();
         let address = listener.bind_addr();
-        let server = HttpApi::new(
+        let mut http_api = HttpApi::new(
             Api::new(session, None, None),
             Some(HttpApiOptions {
                 basic_auth: Some(("servarr".to_owned(), "secret".to_owned())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
-        )
-        .make_http_api_and_run(listener, None);
+        );
+        http_api.public_ip_lookup_url = format!("http://{public_ip_address}");
+        let server = http_api.make_http_api_and_run(listener, None);
         let task = tokio::spawn(async move { server.await.unwrap() });
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -570,6 +595,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status["authenticated"], false);
+        assert_eq!(status["authentication_required"], true);
+        assert!(status.get("public_ip").is_none());
+
+        let response = client
+            .get(format!("{base}/web/public-ip"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
         let response = client
             .get(format!("{base}/"))
@@ -616,6 +650,72 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
 
+        let status: serde_json::Value = client
+            .get(format!("{base}/web/auth/status"))
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["authenticated"], true);
+        assert!(status.get("public_ip").is_none());
+
+        let public_ip: serde_json::Value = client
+            .get(format!("{base}/web/public-ip"))
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(public_ip["public_ip"], "203.0.113.10");
+
+        let response = client
+            .post(format!("{base}/web/auth/logout"))
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers().get("Set-Cookie").unwrap(),
+            "SID=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+        );
+        assert!(response.bytes().await.unwrap().is_empty());
+
+        let status: serde_json::Value = client
+            .get(format!("{base}/web/auth/status"))
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["authenticated"], false);
+        assert!(status.get("public_ip").is_none());
+
+        let response = client
+            .get(format!("{base}/stats"))
+            .header("Cookie", &cookie)
+            .header("X-Rqbit-WebUI", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get("WWW-Authenticate").is_none());
+
+        let response = client
+            .get(format!("{base}/"))
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
         let response = client
             .get(format!("{base}/api/v2/app/version"))
             .basic_auth("servarr", Some("secret"))
@@ -625,5 +725,6 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
 
         task.abort();
+        public_ip_task.abort();
     }
 }

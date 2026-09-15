@@ -187,12 +187,48 @@ pub(in crate::http_api) async fn web_status(
         state.opts.basic_auth.is_none() || state.qbittorrent_sessions.authenticates(&headers);
     let mut response = axum::Json(serde_json::json!({
         "authenticated": authenticated,
+        "authentication_required": state.opts.basic_auth.is_some(),
     }))
     .into_response();
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+pub(in crate::http_api) async fn web_public_ip(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if state.opts.basic_auth.is_some() && !state.qbittorrent_sessions.authenticates(&headers) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+
+    let response = match state
+        .public_ip_client
+        .get(&state.public_ip_lookup_url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        _ => {
+            return (StatusCode::BAD_GATEWAY, "Unable to determine public IP").into_response();
+        }
+    };
+    let public_ip = match response.text().await {
+        Ok(body) => match body.trim().parse::<IpAddr>() {
+            Ok(public_ip) => public_ip,
+            Err(_) => {
+                return (StatusCode::BAD_GATEWAY, "Invalid public IP response").into_response();
+            }
+        },
+        Err(_) => {
+            return (StatusCode::BAD_GATEWAY, "Unable to read public IP response").into_response();
+        }
+    };
+
+    axum::Json(serde_json::json!({ "public_ip": public_ip })).into_response()
 }
 
 pub(in crate::http_api) async fn web_login(
@@ -246,11 +282,24 @@ pub(in crate::http_api) async fn web_login(
     response
 }
 
-pub(super) async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    if let Some(sid) = sid_from_headers(&headers) {
+pub(in crate::http_api) async fn logout(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    logout_response(&state, &headers, (StatusCode::OK, "Ok.").into_response())
+}
+
+pub(in crate::http_api) async fn web_logout(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    logout_response(&state, &headers, StatusCode::NO_CONTENT.into_response())
+}
+
+fn logout_response(state: &ApiState, headers: &HeaderMap, mut response: Response) -> Response {
+    if let Some(sid) = sid_from_headers(headers) {
         state.qbittorrent_sessions.revoke(sid);
     }
-    let mut response = (StatusCode::OK, "Ok.").into_response();
     response.headers_mut().insert(
         SET_COOKIE,
         HeaderValue::from_static("SID=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),

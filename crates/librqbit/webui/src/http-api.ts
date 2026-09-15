@@ -12,6 +12,11 @@ import {
 
 export interface AuthStatus {
   authenticated: boolean;
+  authentication_required: boolean;
+}
+
+export interface PublicIp {
+  public_ip: string;
 }
 
 export const AUTHENTICATION_REQUIRED_EVENT = "rqbit-authentication-required";
@@ -49,6 +54,7 @@ const makeBinaryRequest = async (path: string): Promise<ArrayBuffer> => {
     credentials: "include",
     headers: {
       Accept: "application/octet-stream",
+      "X-Rqbit-WebUI": "1",
     },
   });
   notifyIfAuthenticationRequired(response);
@@ -73,12 +79,14 @@ const makeRequest = async (
     credentials: "include",
     headers: {
       Accept: "application/json",
+      "X-Rqbit-WebUI": "1",
     },
   };
   if (isJson) {
     options.headers = {
       Accept: "application/json",
       "Content-Type": "application/json",
+      "X-Rqbit-WebUI": "1",
     };
     options.body = JSON.stringify(data);
   } else {
@@ -124,10 +132,15 @@ const makeRequest = async (
 export const API: RqbitAPI & {
   getVersion: () => Promise<string>;
   getAuthStatus: () => Promise<AuthStatus>;
+  getPublicIp: () => Promise<PublicIp>;
   login: (username: string, password: string) => Promise<void>;
+  logout: () => Promise<void>;
 } = {
   getAuthStatus: (): Promise<AuthStatus> => {
     return makeRequest("GET", "/web/auth/status");
+  },
+  getPublicIp: (): Promise<PublicIp> => {
+    return makeRequest("GET", "/web/public-ip");
   },
   login: (username: string, password: string): Promise<void> => {
     return makeRequest(
@@ -135,6 +148,9 @@ export const API: RqbitAPI & {
       "/web/auth/login",
       new URLSearchParams({ username, password }),
     );
+  },
+  logout: (): Promise<void> => {
+    return makeRequest("POST", "/web/auth/logout");
   },
   getStreamLogsUrl: () => apiUrl + "/stream_logs",
   listTorrents: (opts?: {

@@ -13,7 +13,18 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $platformKey = $Platform.Replace("/", "-")
 
 if (-not $Archive) {
-    $Archive = Join-Path $repoRoot "target/rqbit-servarr-$platformKey.tar"
+    # Never reuse the default archive name: every invocation produces a separately
+    # deployable image archive. UTC keeps names sortable across build machines.
+    $buildVersion = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
+    $Archive = Join-Path $repoRoot "target/rqbit-servarr-$platformKey-$buildVersion.tar"
+
+    # A timestamp collision is unlikely, but do not overwrite a prior deployment
+    # artifact if two runs begin in the same millisecond.
+    $suffix = 1
+    while (Test-Path -LiteralPath $Archive) {
+        $Archive = Join-Path $repoRoot "target/rqbit-servarr-$platformKey-$buildVersion-$suffix.tar"
+        $suffix++
+    }
 } elseif (-not [IO.Path]::IsPathRooted($Archive)) {
     $Archive = Join-Path $repoRoot $Archive
 }

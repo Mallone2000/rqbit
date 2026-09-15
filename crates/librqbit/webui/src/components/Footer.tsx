@@ -6,7 +6,9 @@ const FooterPiece: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   return <div className="p-1">{children}</div>;
 };
 
-export const Footer: React.FC<{}> = () => {
+export const Footer: React.FC<{ publicIp?: string | null }> = ({
+  publicIp,
+}) => {
   let stats = useStatsStore((stats) => stats.stats);
   return (
     <div className="sticky bottom-0 bg-surface-raised/80 backdrop-blur text-nowrap text-sm font-medium text-secondary flex gap-x-1 lg:gap-x-5 justify-evenly flex-wrap">
@@ -19,6 +21,7 @@ export const Footer: React.FC<{}> = () => {
         {formatBytes(stats.counters.uploaded_bytes)})
       </FooterPiece>
       <FooterPiece>up {formatSecondsToTime(stats.uptime_seconds)}</FooterPiece>
+      {publicIp && <FooterPiece>Public IP: {publicIp}</FooterPiece>}
     </div>
   );
 };

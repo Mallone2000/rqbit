@@ -26,6 +26,8 @@ export const RqbitWebUI = (props: {
   title: string;
   version: string;
   menuButtons?: JSX.Element[];
+  onLogout?: () => Promise<void>;
+  publicIp?: string | null;
 }) => {
   let [logsOpened, setLogsOpened] = useState<boolean>(false);
   const setOtherError = useErrorStore((state) => state.setOtherError);
@@ -99,6 +101,7 @@ export const RqbitWebUI = (props: {
           <SettingsButtons
             onLogsClick={() => setLogsOpened(true)}
             menuButtons={props.menuButtons}
+            onLogout={props.onLogout}
           />
         }
       />
@@ -107,7 +110,7 @@ export const RqbitWebUI = (props: {
         <RootContent />
       </div>
 
-      <Footer />
+      <Footer publicIp={props.publicIp} />
 
       <LogStreamModal show={logsOpened} onClose={() => setLogsOpened(false)} />
       <AlertModal />
