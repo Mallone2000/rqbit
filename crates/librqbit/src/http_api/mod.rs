@@ -163,6 +163,13 @@ fn constant_time_eq(expected: &[u8; 32], actual: &[u8; 32]) -> bool {
     difference == 0
 }
 
+fn compile_cors_allow_regex(value: &str) -> std::result::Result<regex::bytes::Regex, regex::Error> {
+    // An Origin is one complete value. Implicitly anchor custom expressions so
+    // a rule for `trusted.example` cannot also authorize
+    // `trusted.example.attacker.invalid`.
+    regex::bytes::Regex::new(&format!(r"\A(?:{value})\z"))
+}
+
 async fn require_loopback_host(
     headers: HeaderMap,
     request: Request,
@@ -208,6 +215,12 @@ impl HttpApi {
             .basic_auth
             .as_ref()
             .is_some_and(|(user, pass)| !user.is_empty() && !pass.is_empty());
+        if self.opts.basic_auth.is_some() && !credentials_configured {
+            return async {
+                anyhow::bail!("basic authentication requires a non-empty username and password")
+            }
+            .boxed();
+        }
         let enforce_loopback_host = !self.opts.read_only
             && listener.bind_addr().ip().is_loopback()
             && !credentials_configured;
@@ -266,7 +279,7 @@ impl HttpApi {
 
             let allow_regex = std::env::var("CORS_ALLOW_REGEXP")
                 .ok()
-                .and_then(|value| regex::bytes::Regex::new(&value).ok());
+                .and_then(|value| compile_cors_allow_regex(&value).ok());
 
             tower_http::cors::CorsLayer::default()
                 .allow_origin(AllowOrigin::predicate(move |v, _| {
@@ -383,7 +396,7 @@ impl HttpApi {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use super::{HttpApi, HttpApiOptions};
+    use super::{HttpApi, HttpApiOptions, compile_cors_allow_regex};
     use crate::{Api, Session, SessionOptions};
 
     #[test]
@@ -397,6 +410,51 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("sensitive-user"));
         assert!(!debug.contains("sensitive-pass"));
+    }
+
+    #[test]
+    fn custom_cors_regex_must_match_the_entire_origin() {
+        let regex = compile_cors_allow_regex(r"https://trusted\.example").unwrap();
+        assert!(regex.is_match(b"https://trusted.example"));
+        assert!(!regex.is_match(b"https://trusted.example.attacker.invalid"));
+    }
+
+    #[tokio::test]
+    async fn configured_basic_auth_requires_non_empty_credentials() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+
+        let result = HttpApi::new(
+            Api::new(session, None, None),
+            Some(HttpApiOptions {
+                basic_auth: Some((String::new(), String::new())),
+                ..Default::default()
+            }),
+        )
+        .make_http_api_and_run(listener, None)
+        .await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires a non-empty username and password")
+        );
     }
 
     #[tokio::test]

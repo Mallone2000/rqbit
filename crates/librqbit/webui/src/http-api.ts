@@ -17,7 +17,9 @@ export interface AuthStatus {
 export const AUTHENTICATION_REQUIRED_EVENT = "rqbit-authentication-required";
 
 const notifyIfAuthenticationRequired = (response: Response) => {
-  if (response.status === 401) {
+  // The native API challenges with 401, while the qBittorrent-compatible
+  // endpoints use 403 for an expired or missing SID.
+  if (response.status === 401 || response.status === 403) {
     window.dispatchEvent(new Event(AUTHENTICATION_REQUIRED_EVENT));
   }
 };

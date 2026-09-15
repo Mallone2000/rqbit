@@ -327,13 +327,30 @@ fn request_source_matches_host(headers: &HeaderMap) -> bool {
         return true;
     }
 
-    // The development Web UI and Tauri use a different port from the API.
-    // Treat loopback names/addresses as one trusted local site while still
-    // rejecting arbitrary cross-site browser requests.
+    // The development Web UI and Tauri use a different origin from the API.
+    // Only trust those specific UI origins. Treating every loopback port as
+    // trusted would let an unrelated local web app submit authenticated
+    // requests because SameSite cookies do not isolate ports.
     let Ok(host_authority) = host.parse::<http::uri::Authority>() else {
         return false;
     };
-    is_loopback_host(source_authority.host()) && is_loopback_host(host_authority.host())
+    if !is_loopback_host(host_authority.host()) {
+        return false;
+    }
+
+    match source.scheme_str() {
+        Some(scheme) if scheme.eq_ignore_ascii_case("tauri") => {
+            source_authority.as_str().eq_ignore_ascii_case("localhost")
+        }
+        Some(scheme) if scheme.eq_ignore_ascii_case("http") => {
+            let source_host = source_authority.host();
+            let source_port = source_authority.port_u16();
+            (source_host.eq_ignore_ascii_case("localhost")
+                && matches!(source_port, Some(3031 | 1420)))
+                || (source_host == "127.0.0.1" && source_port == Some(3031))
+        }
+        _ => false,
+    }
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -399,6 +416,21 @@ mod tests {
             HeaderValue::from_static("http://localhost:3031"),
         );
         assert!(request_source_matches_host(&headers));
+
+        headers.insert(super::ORIGIN, HeaderValue::from_static("tauri://localhost"));
+        assert!(request_source_matches_host(&headers));
+
+        headers.insert(
+            super::ORIGIN,
+            HeaderValue::from_static("http://localhost:9999"),
+        );
+        assert!(!request_source_matches_host(&headers));
+
+        headers.insert(
+            super::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:9999"),
+        );
+        assert!(!request_source_matches_host(&headers));
     }
 
     #[test]
