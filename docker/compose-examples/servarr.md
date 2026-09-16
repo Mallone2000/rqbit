@@ -1,25 +1,23 @@
 # rqbit with Sonarr and Radarr behind Gluetun
 
-This example uses rqbit's opt-in qBittorrent Web API compatibility layer. Use
+This guide uses rqbit's opt-in qBittorrent Web API compatibility layer. Use
 an rqbit image built from a release that contains this feature; do not use an
 older image merely because its version matches the source tree.
 
-The ready-to-adapt configuration is
-[`servarr.yaml`](./servarr.yaml). All three applications share Gluetun's network namespace, so Sonarr and Radarr
-must connect to rqbit at `127.0.0.1:3030`. They also mount the same host data
-root at exactly `/data`. This is what lets Completed Download Handling hardlink
-files rather than copy them.
+When all three applications share Gluetun's network namespace, Sonarr and
+Radarr must connect to rqbit at `127.0.0.1:3030`. Mount the same host data root
+at exactly `/data` in each container so Completed Download Handling can
+hardlink files rather than copy them.
 
-The example publishes all three plaintext HTTP interfaces on the Docker host's
-loopback address only. Do not change these mappings to listen on every interface.
+Publish all three plaintext HTTP interfaces on the Docker host's loopback
+address only. Do not configure these mappings to listen on every interface.
 For remote access, keep the application ports private and place an authenticated
 HTTPS reverse proxy or another trusted encrypted access layer in front of them.
 rqbit refuses to start the qBittorrent compatibility API unless a non-empty
 `RQBIT_HTTP_BASIC_AUTH_USERPASS` value is configured.
 
-Set `GLUETUN_IMAGE`, `RQBIT_IMAGE`, `SONARR_IMAGE`, and `RADARR_IMAGE` to
-reviewed image references pinned by digest (`name@sha256:...`). The Compose
-example intentionally has no mutable `latest` fallback.
+Use reviewed container image references pinned by digest (`name@sha256:...`).
+Do not use a mutable `latest` fallback.
 
 On Windows, build and export a deployable Linux image from the repository root:
 
