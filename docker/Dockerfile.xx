@@ -4,7 +4,7 @@ FROM --platform=$BUILDPLATFORM tonistiigi/xx@sha256:c64defb9ed5a91eacb37f96ccc3d
 FROM --platform=$BUILDPLATFORM rust:alpine@sha256:1716b3aa042d735f4566d14dc54e8037de9d69556e2d5dd58131d93a613d173d AS builder
 COPY --from=xx / /
 
-RUN apk update && apk add ca-certificates clang lld npm pkgconf
+RUN apk update && apk add ca-certificates clang file lld npm pkgconf
 
 ARG TARGETPLATFORM
 RUN xx-apk add gcc musl-dev openssl-dev openssl-libs-static
