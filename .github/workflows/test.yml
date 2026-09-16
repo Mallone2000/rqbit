@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # AGENTS.md has symlink mode but contains inline documentation.
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: core.symlinks
+  GIT_CONFIG_VALUE_0: "false"
 
 permissions:
   contents: read
