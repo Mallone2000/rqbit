@@ -1078,8 +1078,9 @@ mod tests {
         torrent_state_name, unix_time_seconds,
     };
     use crate::{
-        AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, CreateTorrentOptions, Session,
-        SessionOptions, SessionPersistenceConfig, TorrentAutomationMetadata, TorrentStatsState,
+        AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, CreateTorrentOptions,
+        ManagedTorrentState, Session, SessionOptions, SessionPersistenceConfig,
+        TorrentAutomationMetadata, TorrentStatsState,
         api::TorrentIdOrHash,
         create_torrent,
         http_api::{HttpApi, HttpApiOptions},
@@ -1193,6 +1194,111 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn file_priority_is_queued_while_torrent_initializes() {
+        const FILE_LEN: usize = 16 * 1024;
+
+        let downloads = tempfile::tempdir().unwrap();
+        let fixtures = tempfile::tempdir().unwrap();
+        let source = fixtures.path().join("Initializing file priority");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("media.mkv"), vec![b'm'; FILE_LEN]).unwrap();
+        std::fs::write(source.join("payload.exe"), vec![b'x'; FILE_LEN]).unwrap();
+        let torrent = create_torrent(
+            &source,
+            CreateTorrentOptions {
+                piece_length: Some(u32::try_from(FILE_LEN).unwrap()),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let hash = torrent.info_hash().as_string();
+
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                concurrent_init_limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let initialize_permit = session
+            .concurrent_initialize_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let handle = session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(torrent.as_bytes().unwrap()),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        assert!(handle.with_state(|state| matches!(state, ManagedTorrentState::Initializing(_))));
+
+        let metadata = handle.metadata.load_full().unwrap();
+        let skipped_id = metadata
+            .file_infos
+            .iter()
+            .position(|file| file.relative_filename.ends_with("payload.exe"))
+            .unwrap();
+        let expected_selected = (0..metadata.file_infos.len())
+            .filter(|id| *id != skipped_id)
+            .collect::<HashSet<_>>();
+
+        let state = Arc::new(HttpApi::new(
+            Api::new(session.clone(), None, None),
+            Some(HttpApiOptions {
+                read_only: false,
+                basic_auth: Some(("cleanuparr".to_owned(), "secret".to_owned())),
+                enable_qbittorrent_api: true,
+                ..Default::default()
+            }),
+        ));
+        let (base, server) = start_server(make_api_router(state)).await;
+        let response = reqwest::Client::new()
+            .post(format!("{base}/torrents/filePrio"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!("hash={hash}&id={skipped_id}&priority=0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            handle
+                .only_files()
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            expected_selected
+        );
+
+        drop(initialize_permit);
+        handle.wait_until_initialized().await.unwrap();
+        handle.with_state(|state| match state {
+            ManagedTorrentState::Paused(paused) => {
+                assert_eq!(paused.hns().selected_bytes, FILE_LEN as u64);
+            }
+            state => panic!("expected paused torrent, got {}", state.name()),
+        });
+
+        server.abort();
     }
 
     #[tokio::test]

@@ -467,7 +467,7 @@ impl ManagedTorrent {
                             init.finish_check();
 
                             match check_result {
-                                Ok(paused) => {
+                                Ok(mut paused) => {
                                     let mut g = t.locked.write();
                                     if let ManagedTorrentState::Initializing(_) = &g.state {
                                     } else {
@@ -475,6 +475,20 @@ impl ManagedTorrent {
                                             "no need to start torrent anymore, as it switched state from initializing"
                                         );
                                         return Ok(());
+                                    }
+
+                                    if let Some(only_files) = &g.only_files {
+                                        let only_files = only_files.iter().copied().collect();
+                                        if let Err(error) = paused.update_only_files(&only_files) {
+                                            let result = anyhow::anyhow!(
+                                                "error applying queued file selection after initial check: {error:#}"
+                                            );
+                                            g.state = ManagedTorrentState::Error(error.context(
+                                                "error applying queued file selection after initial check",
+                                            ));
+                                            t.state_change_notify.notify_waiters();
+                                            return Err(result);
+                                        }
                                     }
 
                                     g.state = ManagedTorrentState::Paused(paused);
@@ -717,7 +731,9 @@ impl ManagedTorrent {
 
         let mut g = self.locked.write();
         match &mut g.state {
-            ManagedTorrentState::Initializing(_) => bail!("can't update initializing torrent"),
+            // The initializing state uses a startup snapshot. The latest selection is stored below
+            // and applied to its completed chunk tracker before the state can become paused/live.
+            ManagedTorrentState::Initializing(_) => {}
             ManagedTorrentState::Error(_) => {}
             ManagedTorrentState::None => {}
             ManagedTorrentState::Paused(p) => {
