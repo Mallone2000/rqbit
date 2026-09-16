@@ -41,7 +41,7 @@ RQBIT_HTTP_BASIC_AUTH_USERPASS='username:password' \
 
 Basic authentication protects access but does not encrypt traffic. Do not expose the HTTP listener directly to an untrusted network.
 
-The web UI supports authenticated login and logout. It provides torrent management, streaming, log viewing, settings, and category management.
+The web UI supports authenticated login and logout. It provides torrent management, streaming, log viewing, settings, category management, and the server's public IP address. After the UI is authenticated, rqbit obtains that address through an outbound HTTPS request to `api64.ipify.org`; if the lookup is unavailable, the UI continues without displaying it.
 
 ## qBittorrent Web API compatibility
 
