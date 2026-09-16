@@ -1180,7 +1180,7 @@ mod tests {
         filename: &str,
         torrent: &[u8],
     ) {
-        let boundary = "rqbit-servarr-contract-boundary";
+        let boundary = "rqbit-compatibility-contract-boundary";
         let response = client
             .post(format!("{base}/torrents/add"))
             .header("Cookie", cookie)
@@ -1188,7 +1188,7 @@ mod tests {
                 "Content-Type",
                 format!("multipart/form-data; boundary={boundary}"),
             )
-            .body(multipart_body(boundary, "sonarr", filename, torrent))
+            .body(multipart_body(boundary, "test-category", filename, torrent))
             .send()
             .await
             .unwrap();
@@ -1265,7 +1265,7 @@ mod tests {
             Api::new(session.clone(), None, None),
             Some(HttpApiOptions {
                 read_only: false,
-                basic_auth: Some(("cleanuparr".to_owned(), "secret".to_owned())),
+                basic_auth: Some(("test-user".to_owned(), "secret".to_owned())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
@@ -1273,7 +1273,7 @@ mod tests {
         let (base, server) = start_server(make_api_router(state)).await;
         let response = reqwest::Client::new()
             .post(format!("{base}/torrents/filePrio"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!("hash={hash}&id={skipped_id}&priority=0"))
             .send()
@@ -1302,10 +1302,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanuparr_lookup_and_file_priority_contract() {
+    async fn lookup_and_file_priority_contract() {
         let downloads = tempfile::tempdir().unwrap();
         let fixtures = tempfile::tempdir().unwrap();
-        let complete_source = fixtures.path().join("Cleanuparr Complete");
+        let complete_source = fixtures.path().join("Complete Fixture");
         std::fs::create_dir(&complete_source).unwrap();
         std::fs::write(complete_source.join("movie.mkv"), b"safe media").unwrap();
         std::fs::write(complete_source.join("payload.exe"), b"dangerous fixture").unwrap();
@@ -1314,10 +1314,7 @@ mod tests {
             b"dangerous fixture two",
         )
         .unwrap();
-        copy_dir_all(
-            &complete_source,
-            &downloads.path().join("Cleanuparr Complete"),
-        );
+        copy_dir_all(&complete_source, &downloads.path().join("Complete Fixture"));
         let tracker_url = "https://tracker.invalid/announce";
         let complete_torrent = create_torrent(
             &complete_source,
@@ -1331,7 +1328,7 @@ mod tests {
         .unwrap();
         let complete_hash = complete_torrent.info_hash().as_string();
 
-        let incomplete_source = fixtures.path().join("Cleanuparr Incomplete");
+        let incomplete_source = fixtures.path().join("Incomplete Fixture");
         std::fs::create_dir(&incomplete_source).unwrap();
         std::fs::write(incomplete_source.join("missing.mkv"), b"not downloaded").unwrap();
         let incomplete_torrent = create_torrent(
@@ -1358,7 +1355,7 @@ mod tests {
             paused: true,
             overwrite: true,
             automation: TorrentAutomationMetadata {
-                category: "sonarr".to_owned(),
+                category: "test-category".to_owned(),
                 ..Default::default()
             },
             ..Default::default()
@@ -1394,7 +1391,7 @@ mod tests {
             Api::new(session.clone(), None, None),
             Some(HttpApiOptions {
                 read_only: false,
-                basic_auth: Some(("cleanuparr".to_owned(), "secret".to_owned())),
+                basic_auth: Some(("test-user".to_owned(), "secret".to_owned())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
@@ -1411,7 +1408,7 @@ mod tests {
 
         let info: Value = client
             .get(format!("{base}/torrents/info?hashes={complete_hash}"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap()
@@ -1425,7 +1422,7 @@ mod tests {
             .get(format!(
                 "{base}/torrents/info?hashes={complete_hash}|{incomplete_hash}"
             ))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap()
@@ -1446,7 +1443,7 @@ mod tests {
         let unknown_hash = "0000000000000000000000000000000000000000";
         let info: Value = client
             .get(format!("{base}/torrents/info?hashes={unknown_hash}"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap()
@@ -1457,7 +1454,7 @@ mod tests {
 
         let completed: Value = client
             .get(format!("{base}/torrents/info?filter=completed"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap()
@@ -1471,7 +1468,7 @@ mod tests {
             .get(format!(
                 "{base}/torrents/info?filter=completed&hashes={incomplete_hash}"
             ))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap()
@@ -1485,7 +1482,7 @@ mod tests {
                 "{base}/torrents/trackers?hash={}",
                 complete_hash.to_ascii_uppercase()
             ))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap();
@@ -1503,7 +1500,7 @@ mod tests {
 
         let empty_trackers: Value = client
             .get(format!("{base}/torrents/trackers?hash={incomplete_hash}"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap()
@@ -1514,7 +1511,7 @@ mod tests {
 
         let missing_trackers = client
             .get(format!("{base}/torrents/trackers?hash={unknown_hash}"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap();
@@ -1522,7 +1519,7 @@ mod tests {
 
         let properties = client
             .get(format!("{base}/torrents/properties?hash={complete_hash}"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap();
@@ -1530,7 +1527,7 @@ mod tests {
 
         let files_response = client
             .get(format!("{base}/torrents/files?hash={complete_hash}"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap();
@@ -1572,7 +1569,7 @@ mod tests {
 
         let response = client
             .post(format!("{base}/torrents/filePrio"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!("hash={complete_hash}&id={ids}&priority=0"))
             .send()
@@ -1582,7 +1579,7 @@ mod tests {
 
         let files: Value = client
             .get(format!("{base}/torrents/files?hash={complete_hash}"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap()
@@ -1607,7 +1604,7 @@ mod tests {
 
         let response = client
             .post(format!("{base}/torrents/filePrio"))
-            .basic_auth("cleanuparr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!(
                 "hash={complete_hash}&id={}&priority=6",
@@ -1644,7 +1641,7 @@ mod tests {
         ] {
             let response = client
                 .post(format!("{base}/torrents/filePrio"))
-                .basic_auth("cleanuparr", Some("secret"))
+                .basic_auth("test-user", Some("secret"))
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(body)
                 .send()
@@ -1697,7 +1694,7 @@ mod tests {
             Api::new(session, None, None),
             Some(HttpApiOptions {
                 read_only: false,
-                basic_auth: Some(("servarr".to_owned(), "secret".to_owned())),
+                basic_auth: Some(("test-user".to_owned(), "secret".to_owned())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
@@ -1726,7 +1723,7 @@ mod tests {
 
         let response = client
             .get(format!("{base}/app/webapiVersion"))
-            .basic_auth("servarr", Some("wrong"))
+            .basic_auth("test-user", Some("wrong"))
             .send()
             .await
             .unwrap();
@@ -1734,7 +1731,7 @@ mod tests {
 
         let response = client
             .get(format!("{base}/app/webapiVersion"))
-            .basic_auth("servarr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap();
@@ -1743,7 +1740,7 @@ mod tests {
         let response = client
             .post(format!("{base}/auth/login"))
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body("username=servarr&password=wrong")
+            .body("username=test-user&password=wrong")
             .send()
             .await
             .unwrap();
@@ -1753,7 +1750,7 @@ mod tests {
         let response = client
             .post(format!("{base}/auth/login"))
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body("username=servarr&password=secret")
+            .body("username=test-user&password=secret")
             .send()
             .await
             .unwrap();
@@ -1808,7 +1805,7 @@ mod tests {
             .post(format!("{base}/torrents/createCategory"))
             .header("Cookie", &cookie)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body("category=sonarr")
+            .body("category=test-category")
             .send()
             .await
             .unwrap();
@@ -1823,14 +1820,14 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(categories["sonarr"]["name"], "sonarr");
-        assert_eq!(categories["sonarr"]["savePath"], "");
+        assert_eq!(categories["test-category"]["name"], "test-category");
+        assert_eq!(categories["test-category"]["savePath"], "");
 
         add_fixture(&client, &base, &cookie, "single.torrent", &single_torrent).await;
         add_fixture(&client, &base, &cookie, "multi.torrent", &multi_torrent).await;
 
         let torrents: Value = client
-            .get(format!("{base}/torrents/info?category=sonarr"))
+            .get(format!("{base}/torrents/info?category=test-category"))
             .header("Cookie", &cookie)
             .send()
             .await
@@ -1908,7 +1905,7 @@ mod tests {
         assert_eq!(std::fs::read(&kept_path).unwrap(), bytes_before);
 
         let remaining: Value = client
-            .get(format!("{base}/torrents/info?category=sonarr"))
+            .get(format!("{base}/torrents/info?category=test-category"))
             .header("Cookie", &cookie)
             .send()
             .await
@@ -1922,7 +1919,7 @@ mod tests {
             .post(format!("{base}/torrents/removeCategories"))
             .header("Cookie", &cookie)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body("categories=sonarr")
+            .body("categories=test-category")
             .send()
             .await
             .unwrap();
@@ -1937,7 +1934,7 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert!(categories.get("sonarr").is_none());
+        assert!(categories.get("test-category").is_none());
 
         let remaining: Value = client
             .get(format!("{base}/torrents/info"))
@@ -1974,7 +1971,7 @@ mod tests {
         assert_eq!(std::fs::read(&kept_path).unwrap(), bytes_before);
 
         let remaining: Value = client
-            .get(format!("{base}/torrents/info?category=sonarr"))
+            .get(format!("{base}/torrents/info?category=test-category"))
             .header("Cookie", &cookie)
             .send()
             .await
@@ -2236,7 +2233,7 @@ mod tests {
         let session = make_session().await.unwrap();
         assert!(
             session
-                .create_automation_category("sonarr".to_owned())
+                .create_automation_category("test-category".to_owned())
                 .await
                 .unwrap()
         );
@@ -2247,7 +2244,7 @@ mod tests {
                     paused: true,
                     overwrite: true,
                     automation: TorrentAutomationMetadata {
-                        category: "sonarr".to_owned(),
+                        category: "test-category".to_owned(),
                         ratio_limit: Some(1.5),
                         seeding_time_limit_seconds: Some(600),
                         uploaded_bytes: 200,
@@ -2263,14 +2260,14 @@ mod tests {
         drop(session);
 
         let restored = make_session().await.unwrap();
-        assert!(restored.has_automation_category("sonarr"));
+        assert!(restored.has_automation_category("test-category"));
         let metadata = restored.with_torrents(|torrents| {
             torrents
                 .map(|(_, torrent)| torrent.automation_metadata())
                 .collect::<Vec<_>>()
         });
         assert_eq!(metadata.len(), 1);
-        assert_eq!(metadata[0].category, "sonarr");
+        assert_eq!(metadata[0].category, "test-category");
         assert_eq!(metadata[0].ratio_limit, Some(1.5));
         assert_eq!(metadata[0].seeding_time_limit_seconds, Some(600));
         assert_eq!(metadata[0].uploaded_bytes, 200);
@@ -2284,7 +2281,7 @@ mod tests {
             }),
         ));
         let (base, server) = start_server(make_api_router(state)).await;
-        let torrents: Value = reqwest::get(format!("{base}/torrents/info?category=sonarr"))
+        let torrents: Value = reqwest::get(format!("{base}/torrents/info?category=test-category"))
             .await
             .unwrap()
             .json()
@@ -2296,8 +2293,13 @@ mod tests {
         );
         server.abort();
 
-        assert!(restored.delete_automation_category("sonarr").await.unwrap());
-        assert!(!restored.has_automation_category("sonarr"));
+        assert!(
+            restored
+                .delete_automation_category("test-category")
+                .await
+                .unwrap()
+        );
+        assert!(!restored.has_automation_category("test-category"));
         assert_eq!(
             restored.with_torrents(|torrents| {
                 torrents.next().unwrap().1.automation_metadata().category
@@ -2308,7 +2310,7 @@ mod tests {
         drop(restored);
 
         let after_category_delete = make_session().await.unwrap();
-        assert!(!after_category_delete.has_automation_category("sonarr"));
+        assert!(!after_category_delete.has_automation_category("test-category"));
         assert_eq!(
             after_category_delete.with_torrents(|torrents| {
                 torrents.next().unwrap().1.automation_metadata().category
@@ -2404,7 +2406,7 @@ mod tests {
         .await
         .unwrap();
         session
-            .create_automation_category("sonarr".to_owned())
+            .create_automation_category("test-category".to_owned())
             .await
             .unwrap();
         let state = Arc::new(HttpApi::new(
@@ -2418,7 +2420,7 @@ mod tests {
         let client = reqwest::Client::new();
         add_fixture(&client, &base, "", "controls.torrent", &torrent_bytes).await;
         let listed: Value = client
-            .get(format!("{base}/torrents/info?category=sonarr"))
+            .get(format!("{base}/torrents/info?category=test-category"))
             .send()
             .await
             .unwrap()
@@ -2447,7 +2449,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let listed: Value = client
-            .get(format!("{base}/torrents/info?category=sonarr"))
+            .get(format!("{base}/torrents/info?category=test-category"))
             .send()
             .await
             .unwrap()
@@ -2507,7 +2509,7 @@ mod tests {
         .await
         .unwrap();
         session
-            .create_automation_category("sonarr".to_owned())
+            .create_automation_category("test-category".to_owned())
             .await
             .unwrap();
         let state = Arc::new(HttpApi::new(
@@ -2523,7 +2525,7 @@ mod tests {
         let magnet =
             format!("magnet:?xt=urn:btih:{info_hash}&dn=Pending%20Fixture&tr={tracker_url}");
         let add_body =
-            serde_urlencoded::to_string([("urls", magnet.as_str()), ("category", "sonarr")])
+            serde_urlencoded::to_string([("urls", magnet.as_str()), ("category", "test-category")])
                 .unwrap();
 
         let response = tokio::time::timeout(
@@ -2541,7 +2543,7 @@ mod tests {
         assert_eq!(response.text().await.unwrap(), "");
 
         let torrents: Value = client
-            .get(format!("{base}/torrents/info?category=sonarr"))
+            .get(format!("{base}/torrents/info?category=test-category"))
             .send()
             .await
             .unwrap()
@@ -2590,7 +2592,7 @@ mod tests {
         .await
         .unwrap();
         session
-            .create_automation_category("radarr".to_owned())
+            .create_automation_category("alternate-category".to_owned())
             .await
             .unwrap();
         let state = Arc::new(HttpApi::new(
@@ -2604,7 +2606,7 @@ mod tests {
         let info_hash = "0202020202020202020202020202020202020202";
         let magnet =
             format!("magnet:?xt=urn:btih:{info_hash}&dn=Multipart%20Fixture&tr={tracker_url}");
-        let boundary = "rqbit-radarr-magnet-boundary";
+        let boundary = "rqbit-multipart-magnet-boundary";
         let client = reqwest::Client::new();
 
         let response = client
@@ -2613,7 +2615,7 @@ mod tests {
                 "Content-Type",
                 format!("multipart/form-data; boundary={boundary}"),
             )
-            .body(multipart_url_body(boundary, "radarr", &magnet))
+            .body(multipart_url_body(boundary, "alternate-category", &magnet))
             .send()
             .await
             .unwrap();
@@ -2621,7 +2623,7 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "");
         let torrents: Value = client
-            .get(format!("{base}/torrents/info?category=radarr"))
+            .get(format!("{base}/torrents/info?category=alternate-category"))
             .send()
             .await
             .unwrap()
@@ -2662,7 +2664,7 @@ mod tests {
         .await
         .unwrap();
         session
-            .create_automation_category("sonarr".to_owned())
+            .create_automation_category("test-category".to_owned())
             .await
             .unwrap();
         let state = Arc::new(HttpApi::new(
@@ -2677,7 +2679,7 @@ mod tests {
         add_fixture(&client, &base, "", filename, &torrent_bytes).await;
 
         let torrents: Value = client
-            .get(format!("{base}/torrents/info?category=sonarr"))
+            .get(format!("{base}/torrents/info?category=test-category"))
             .send()
             .await
             .unwrap()
@@ -2730,7 +2732,7 @@ mod tests {
             .unwrap();
         assert!(!response.status().is_success());
         let still_managed: Value = client
-            .get(format!("{base}/torrents/info?category=sonarr"))
+            .get(format!("{base}/torrents/info?category=test-category"))
             .send()
             .await
             .unwrap()
@@ -2772,7 +2774,7 @@ mod tests {
         };
         let session = make_session().await.unwrap();
         session
-            .create_automation_category("radarr".to_owned())
+            .create_automation_category("alternate-category".to_owned())
             .await
             .unwrap();
         let torrent = session
@@ -2782,7 +2784,7 @@ mod tests {
                     paused: true,
                     overwrite: true,
                     automation: TorrentAutomationMetadata {
-                        category: "radarr".to_owned(),
+                        category: "alternate-category".to_owned(),
                         ..Default::default()
                     },
                     ..Default::default()

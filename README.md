@@ -2,9 +2,9 @@
 
 This is an actively developed fork of [ikatson/rqbit](https://github.com/ikatson/rqbit): a Rust BitTorrent client with a CLI, native HTTP API, web UI, and Tauri desktop app. `librqbit` can also be embedded as a library.
 
-The fork focuses on automated media-stack use. Alongside the upstream client capabilities, it adds:
+Alongside the upstream client capabilities, this fork adds:
 
-- an opt-in, authenticated qBittorrent Web API compatibility layer for Sonarr and Radarr;
+- an opt-in, authenticated qBittorrent Web API compatibility layer;
 - persistent download categories and automation-oriented torrent metadata;
 - web UI login/logout and category management;
 - JSON or PostgreSQL session persistence; and
@@ -43,22 +43,22 @@ Basic authentication protects access but does not encrypt traffic. Do not expose
 
 The web UI supports authenticated login and logout. It provides torrent management, streaming, log viewing, settings, and category management.
 
-## Servarr / qBittorrent Web API compatibility
+## qBittorrent Web API compatibility
 
-Enable this fork's Servarr-focused qBittorrent compatibility routes with credentials:
+Enable the compatibility routes with credentials:
 
 ```sh
-RQBIT_HTTP_BASIC_AUTH_USERPASS='servarr:change-me' \
+RQBIT_HTTP_BASIC_AUTH_USERPASS='client:change-me' \
 RQBIT_QBITTORRENT_API_ENABLE=true \
 RQBIT_HTTP_API_LISTEN_ADDR=0.0.0.0:3030 \
   rqbit server start /srv/torrents
 ```
 
-Add rqbit as a **qBittorrent** download client in Sonarr or Radarr, using the same host, port, and credentials. Create and assign categories such as `sonarr` and `radarr`; categories retain rqbit's global download directory rather than moving content.
+Connect clients using the qBittorrent Web API with the same host, port, and credentials. Categories retain rqbit's global download directory rather than moving content.
 
-This is a compatibility layer for Servarr, not a full qBittorrent replacement. Queue ordering, sequential downloading, first/last-piece priority, and inactive-seeding-time limits are intentionally unsupported and fail explicitly.
+This is not a full qBittorrent replacement. Queue ordering, sequential downloading, first/last-piece priority, and inactive-seeding-time limits are intentionally unsupported and fail explicitly.
 
-For a production-oriented Gluetun, Sonarr, and Radarr configuration with shared `/data` paths and hardlinks, use the [Servarr Compose guide](docker/compose-examples/servarr.md).
+For a production-oriented Gluetun, Sonarr, and Radarr configuration with shared `/data` paths and hardlinks, use the [automation stack deployment guide](docker/compose-examples/automation-stack.md).
 
 ## Persistence
 
@@ -133,7 +133,7 @@ cargo tauri build
 
 ## Docker
 
-The repository contains Docker build files and Compose examples. The [Servarr Compose guide](docker/compose-examples/servarr.md) includes a script to build a local Linux image and a Gluetun topology that keeps application ports loopback-only on the Docker host.
+The repository contains Docker build files and deployment guidance. The [automation stack deployment guide](docker/compose-examples/automation-stack.md) includes a script to build a local Linux image and a Gluetun topology that keeps application ports loopback-only on the Docker host.
 
 Pin deployed images by digest and verify that the selected image was built from a revision that contains the qBittorrent compatibility layer. Do not assume an upstream rqbit image includes fork features.
 

@@ -1,6 +1,6 @@
 # rqbit with Sonarr and Radarr behind Gluetun
 
-This guide uses rqbit's opt-in qBittorrent Web API compatibility layer. Use
+This deployment uses rqbit's opt-in qBittorrent Web API compatibility layer. Use
 an rqbit image built from a release that contains this feature; do not use an
 older image merely because its version matches the source tree.
 
@@ -22,11 +22,11 @@ Do not use a mutable `latest` fallback.
 On Windows, build and export a deployable Linux image from the repository root:
 
 ```powershell
-.\scripts\build-servarr-image.ps1
+.\scripts\build-docker-image.ps1
 ```
 
-The default output is `rqbit-servarr:test` plus
-`target/rqbit-servarr-linux-amd64.tar`. Use `-Platform linux/arm64` for an
+The default output is `rqbit:test` plus a timestamped
+`target/rqbit-linux-amd64-*.tar` archive. Use `-Platform linux/arm64` for an
 ARM64 server, or `-Image` and `-Archive` to override the defaults.
 
 The rqbit scratch image defines `/home/rqbit/db` and `/home/rqbit/cache` as its

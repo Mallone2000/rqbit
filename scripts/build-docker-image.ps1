@@ -3,7 +3,7 @@ param(
     [ValidateSet("linux/amd64", "linux/arm64", "linux/arm/v7")]
     [string]$Platform = "linux/amd64",
 
-    [string]$Image = "rqbit-servarr:test",
+    [string]$Image = "rqbit:test",
 
     [string]$Archive
 )
@@ -16,13 +16,13 @@ if (-not $Archive) {
     # Never reuse the default archive name: every invocation produces a separately
     # deployable image archive. UTC keeps names sortable across build machines.
     $buildVersion = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
-    $Archive = Join-Path $repoRoot "target/rqbit-servarr-$platformKey-$buildVersion.tar"
+    $Archive = Join-Path $repoRoot "target/rqbit-$platformKey-$buildVersion.tar"
 
     # A timestamp collision is unlikely, but do not overwrite a prior deployment
     # artifact if two runs begin in the same millisecond.
     $suffix = 1
     while (Test-Path -LiteralPath $Archive) {
-        $Archive = Join-Path $repoRoot "target/rqbit-servarr-$platformKey-$buildVersion-$suffix.tar"
+        $Archive = Join-Path $repoRoot "target/rqbit-$platformKey-$buildVersion-$suffix.tar"
         $suffix++
     }
 } elseif (-not [IO.Path]::IsPathRooted($Archive)) {

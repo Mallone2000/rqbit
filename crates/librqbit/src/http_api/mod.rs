@@ -44,7 +44,7 @@ pub struct HttpApiOptions {
     pub allow_create: bool,
     /// Maximum upload body size.
     pub max_upload_body_size: Option<usize>,
-    /// Expose the Servarr-focused qBittorrent Web API compatibility routes.
+    /// Expose the qBittorrent Web API compatibility routes.
     pub enable_qbittorrent_api: bool,
     #[cfg(feature = "prometheus")]
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
@@ -564,7 +564,7 @@ mod tests {
         let mut http_api = HttpApi::new(
             Api::new(session, None, None),
             Some(HttpApiOptions {
-                basic_auth: Some(("servarr".to_owned(), "secret".to_owned())),
+                basic_auth: Some(("test-user".to_owned(), "secret".to_owned())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
@@ -621,7 +621,7 @@ mod tests {
         let response = client
             .post(format!("{base}/web/auth/login"))
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body("username=servarr&password=wrong")
+            .body("username=test-user&password=wrong")
             .send()
             .await
             .unwrap();
@@ -631,7 +631,7 @@ mod tests {
         let response = client
             .post(format!("{base}/web/auth/login"))
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body("username=servarr&password=secret")
+            .body("username=test-user&password=secret")
             .send()
             .await
             .unwrap();
@@ -724,7 +724,7 @@ mod tests {
         for _ in 0..5 {
             let response = client
                 .get(format!("{base}/stats"))
-                .basic_auth("servarr", Some("wrong"))
+                .basic_auth("test-user", Some("wrong"))
                 .header("X-Rqbit-WebUI", "1")
                 .send()
                 .await
@@ -734,7 +734,7 @@ mod tests {
 
         let response = client
             .get(format!("{base}/api/v2/app/version"))
-            .basic_auth("servarr", Some("secret"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap();

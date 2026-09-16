@@ -114,7 +114,7 @@ struct Opts {
     )]
     http_api_max_upload_size: Option<usize>,
 
-    /// Expose the Servarr-focused qBittorrent Web API compatibility routes.
+    /// Expose the qBittorrent Web API compatibility routes.
     /// Requires a non-empty RQBIT_HTTP_BASIC_AUTH_USERPASS value.
     #[arg(long = "qbittorrent-api-enable", env = "RQBIT_QBITTORRENT_API_ENABLE")]
     qbittorrent_api_enable: bool,
