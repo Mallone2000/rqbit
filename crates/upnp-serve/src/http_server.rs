@@ -32,11 +32,11 @@ pub struct RootDescriptionInputs<'a> {
 pub fn render_root_description_xml(input: &RootDescriptionInputs<'_>) -> String {
     format!(
         include_str!("resources/templates/root_desc.tmpl.xml"),
-        friendly_name = input.friendly_name,
-        manufacturer = input.manufacturer,
-        model_name = input.model_name,
-        unique_id = input.unique_id,
-        http_prefix = input.http_prefix
+        friendly_name = quick_xml::escape::escape(input.friendly_name),
+        manufacturer = quick_xml::escape::escape(input.manufacturer),
+        model_name = quick_xml::escape::escape(input.model_name),
+        unique_id = quick_xml::escape::escape(input.unique_id),
+        http_prefix = quick_xml::escape::escape(input.http_prefix)
     )
 }
 
@@ -109,4 +109,24 @@ pub fn make_router(
         .with_state(state);
 
     Ok(app)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RootDescriptionInputs, render_root_description_xml};
+
+    #[test]
+    fn root_description_escapes_dynamic_xml_fields() {
+        let rendered = render_root_description_xml(&RootDescriptionInputs {
+            friendly_name: "rqbit </friendlyName><evil>",
+            manufacturer: "A & B",
+            model_name: "model",
+            unique_id: "uuid:test",
+            http_prefix: "/upnp",
+        });
+
+        assert!(rendered.contains("rqbit &lt;/friendlyName&gt;&lt;evil&gt;"));
+        assert!(rendered.contains("A &amp; B"));
+        assert!(!rendered.contains("<evil>"));
+    }
 }

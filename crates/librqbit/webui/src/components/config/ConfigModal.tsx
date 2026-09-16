@@ -7,6 +7,7 @@ import { ErrorWithLabel } from "../../rqbit-web";
 import { Spinner } from "../Spinner";
 import { Modal } from "../modal/Modal";
 import { ModalBody } from "../modal/ModalBody";
+import { CategoriesTab } from "./CategoriesTab";
 
 export interface ConfigModalProps {
   isOpen: boolean;
@@ -67,6 +68,15 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
     );
   }
 
+  const categoryApi =
+    API.listCategories && API.createCategory && API.removeCategories
+      ? {
+          listCategories: API.listCategories,
+          createCategory: API.createCategory,
+          removeCategories: API.removeCategories,
+        }
+      : null;
+
   return (
     <TabbedConfigModal
       isOpen={isOpen}
@@ -89,6 +99,15 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
             />
           ),
         },
+        ...(categoryApi
+          ? [
+              {
+                id: "categories",
+                label: "Categories",
+                content: <CategoriesTab api={categoryApi} />,
+              },
+            ]
+          : []),
         {
           id: "other",
           label: "Other",

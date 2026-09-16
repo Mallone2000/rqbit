@@ -15,6 +15,8 @@ use tracing::{Instrument, Span, debug, debug_span, trace, warn};
 use url::Url;
 
 const SERVICE_TYPE_WAN_IP_CONNECTION: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
+const MAX_DEVICE_DESCRIPTION_SIZE: usize = 1024 * 1024;
+const MAX_PORT_MAPPING_RESPONSE_SIZE: usize = 64 * 1024;
 const SSDP_MULTICAST_IP: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900));
 pub const SSDP_SEARCH_WAN_IPCONNECTION_ST: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
@@ -106,7 +108,9 @@ async fn forward_port(
 
     let url = control_url;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
     let response = client
         .post(url.clone())
         .header("Content-Type", "text/xml")
@@ -121,12 +125,11 @@ async fn forward_port(
 
     let status = response.status();
 
-    let response_text = response
-        .text()
+    let response_body = response_bytes_limited(response, MAX_PORT_MAPPING_RESPONSE_SIZE)
         .await
-        .context("error reading response text")?;
+        .context("error reading response body")?;
 
-    trace!(status = %status, text=response_text, "AddPortMapping response");
+    trace!(status = %status, response_bytes=response_body.len(), "AddPortMapping response");
     if !status.is_success() {
         bail!("failed port forwarding: {}", status);
     } else {
@@ -245,11 +248,16 @@ impl UpnpEndpoint {
     }
 
     fn get_wan_ip_control_urls(&self) -> impl Iterator<Item = (tracing::Span, Url)> + '_ {
+        let expected_ip = self.discover_response.received_from.ip();
         self.iter_services()
             .filter(|(_, s)| s.service_type == SERVICE_TYPE_WAN_IP_CONNECTION)
             .map(|(span, s)| (span, self.discover_response.location.join(&s.control_url)))
-            .filter_map(|(span, url)| match url {
-                Ok(url) => Some((span, url)),
+            .filter_map(move |(span, url)| match url {
+                Ok(url) if url_targets_ip(&url, expected_ip) => Some((span, url)),
+                Ok(url) => {
+                    warn!(%url, %expected_ip, "ignoring UPnP control URL targeting another host");
+                    None
+                }
                 Err(e) => {
                     debug!("bad control url: {e:#}");
                     None
@@ -265,19 +273,22 @@ pub struct UpnpDiscoverResponse {
 }
 
 pub async fn discover_services(location: Url) -> anyhow::Result<RootDesc> {
-    let response = Client::new()
+    let response = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
         .get(location.clone())
         .send()
         .await
-        .context("failed to send GET request")?
-        .text()
+        .context("failed to send GET request")?;
+    let response = response_bytes_limited(response, MAX_DEVICE_DESCRIPTION_SIZE)
         .await
         .context("failed to read response body")?;
-    trace!("received from {location}: {response}");
-    let root_desc: RootDesc = quick_xml::de::from_str(&response)
+    let response = std::str::from_utf8(&response).context("device description is not UTF-8")?;
+    trace!(%location, response_bytes=response.len(), "received UPnP device description");
+    let root_desc: RootDesc = quick_xml::de::from_str(response)
         .context("failed to parse response body as xml")
         .inspect_err(|e| {
-            debug!("failed to parse this XML: {response}. Error: {e:#}");
+            debug!(response_bytes = response.len(), error = ?e, "failed to parse UPnP device XML");
         })?;
     Ok(root_desc)
 }
@@ -309,10 +320,65 @@ pub fn parse_upnp_discover_response(
     let location = location.context("missing location header")?;
     let location =
         Url::parse(location).with_context(|| format!("failed parsing location {location}"))?;
+    if !url_targets_ip(&location, received_from.ip()) {
+        bail!("UPnP location must target the SSDP responder's IP address")
+    }
     Ok(UpnpDiscoverResponse {
         location,
         received_from,
     })
+}
+
+fn url_targets_ip(url: &Url, expected_ip: IpAddr) -> bool {
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let target_ip = match url.host() {
+        Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip),
+        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip),
+        _ => return false,
+    };
+    canonical_ip(target_ip) == canonical_ip(expected_ip)
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
+    }
+}
+
+async fn response_bytes_limited(
+    mut response: reqwest::Response,
+    max_size: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_size as u64)
+    {
+        bail!("HTTP response exceeds {max_size} bytes")
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(max_size),
+    );
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > max_size {
+            bail!("HTTP response exceeds {max_size} bytes")
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 pub async fn discover_once(
@@ -526,7 +592,7 @@ impl UpnpPortForwarder {
 mod tests {
     use quick_xml::de::from_str;
 
-    use crate::{Device, DeviceList, RootDesc, Service, ServiceList};
+    use crate::{Device, DeviceList, RootDesc, Service, ServiceList, parse_upnp_discover_response};
 
     #[test]
     fn test_parse_root_desc() {
@@ -578,5 +644,18 @@ mod tests {
             }],
         };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn discovery_location_must_target_ssdp_sender() {
+        let sender = "192.0.2.10:1900".parse().unwrap();
+        let valid = b"HTTP/1.1 200 OK\r\nLOCATION: http://192.0.2.10:5000/root.xml\r\n\r\n";
+        assert!(parse_upnp_discover_response(valid, sender).is_ok());
+
+        let ssrf = b"HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:5000/admin\r\n\r\n";
+        assert!(parse_upnp_discover_response(ssrf, sender).is_err());
+
+        let hostname = b"HTTP/1.1 200 OK\r\nLOCATION: http://internal.example/root.xml\r\n\r\n";
+        assert!(parse_upnp_discover_response(hostname, sender).is_err());
     }
 }

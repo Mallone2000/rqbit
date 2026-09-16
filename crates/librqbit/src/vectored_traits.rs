@@ -106,3 +106,52 @@ impl<T: AsyncRead + Unpin + Sized> AsyncReadVectoredIntoCompat for T {
         AsyncReadToVectoredCompat(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::IoSliceMut;
+
+    use tokio::io::AsyncReadExt;
+
+    use super::{AsyncReadVectoredExt, AsyncReadVectoredIntoCompat};
+
+    #[tokio::test]
+    async fn compatibility_reader_fills_first_non_empty_slice() {
+        let source = std::io::Cursor::new(b"abcdef".to_vec());
+        let mut reader = source.into_vectored_compat();
+        let mut empty = [];
+        let mut first = [0; 3];
+        let mut second = [0; 3];
+        let mut slices = [
+            IoSliceMut::new(&mut empty),
+            IoSliceMut::new(&mut first),
+            IoSliceMut::new(&mut second),
+        ];
+
+        let read = AsyncReadVectoredExt::read_vectored(&mut reader, &mut slices)
+            .await
+            .unwrap();
+        assert_eq!(read, 3);
+        assert_eq!(&first, b"abc");
+        assert_eq!(&second, &[0; 3]);
+    }
+
+    #[tokio::test]
+    async fn compatibility_reader_returns_zero_for_empty_slices() {
+        let source = std::io::Cursor::new(b"abc".to_vec());
+        let mut reader = source.into_vectored_compat();
+        let mut a = [];
+        let mut b = [];
+        let mut slices = [IoSliceMut::new(&mut a), IoSliceMut::new(&mut b)];
+        assert_eq!(reader.read_vectored(&mut slices).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn compatibility_type_still_implements_async_read() {
+        let source = std::io::Cursor::new(b"abc".to_vec());
+        let mut reader = source.into_vectored_compat();
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"abc");
+    }
+}

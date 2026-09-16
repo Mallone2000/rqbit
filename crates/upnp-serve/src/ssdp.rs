@@ -303,3 +303,76 @@ fn addr_no_scope(addr: &SocketAddr) -> SocketAddr {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use crate::constants::UPNP_DEVICE_MEDIASERVER;
+
+    use super::{SsdpMessage, addr_no_scope, try_parse_ssdp};
+
+    #[test]
+    fn parses_media_server_search_case_insensitively() {
+        let mut headers = [httparse::EMPTY_HEADER; 8];
+        let message = format!(
+            "M-SEARCH * HTTP/1.1\r\nhost: 239.255.255.250:1900\r\nman: \"ssdp:discover\"\r\nst: {UPNP_DEVICE_MEDIASERVER}\r\n\r\n"
+        );
+        let parsed = try_parse_ssdp(message.as_bytes(), &mut headers).unwrap();
+        let SsdpMessage::MSearch(search) = parsed else {
+            panic!("expected M-SEARCH")
+        };
+        assert!(search.matches_media_server());
+    }
+
+    #[test]
+    fn rejects_incomplete_search_and_classifies_other_messages() {
+        let mut headers = [httparse::EMPTY_HEADER; 8];
+        assert!(
+            try_parse_ssdp(
+                b"M-SEARCH * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\n\r\n",
+                &mut headers
+            )
+            .is_err()
+        );
+
+        let mut headers = [httparse::EMPTY_HEADER; 8];
+        assert!(matches!(
+            try_parse_ssdp(b"NOTIFY * HTTP/1.1\r\n\r\n", &mut headers).unwrap(),
+            SsdpMessage::OtherRequest(_)
+        ));
+
+        let mut headers = [httparse::EMPTY_HEADER; 8];
+        assert!(matches!(
+            try_parse_ssdp(b"HTTP/1.1 200 OK\r\n\r\n", &mut headers).unwrap(),
+            SsdpMessage::Response(_)
+        ));
+    }
+
+    #[test]
+    fn non_discovery_or_unrelated_search_does_not_match() {
+        for (man, st) in [
+            ("\"not-discovery\"", UPNP_DEVICE_MEDIASERVER),
+            ("\"ssdp:discover\"", "urn:unrelated"),
+        ] {
+            let mut headers = [httparse::EMPTY_HEADER; 8];
+            let message = format!(
+                "M-SEARCH * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\nMAN: {man}\r\nST: {st}\r\n\r\n"
+            );
+            let SsdpMessage::MSearch(search) =
+                try_parse_ssdp(message.as_bytes(), &mut headers).unwrap()
+            else {
+                panic!("expected M-SEARCH")
+            };
+            assert!(!search.matches_media_server());
+        }
+    }
+
+    #[test]
+    fn removes_ipv6_scope_without_changing_address() {
+        let scoped: SocketAddr = "[fe80::1%12]:1900".parse().unwrap();
+        assert_eq!(addr_no_scope(&scoped), "[fe80::1]:1900".parse().unwrap());
+        let ipv4: SocketAddr = "127.0.0.1:1900".parse().unwrap();
+        assert_eq!(addr_no_scope(&ipv4), ipv4);
+    }
+}

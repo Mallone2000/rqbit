@@ -1,11 +1,12 @@
 use crate::state::UpnpServerStateInner;
 use anyhow::Context;
-use axum::response::IntoResponse;
+use axum::{extract::ConnectInfo, response::IntoResponse};
 use http::{HeaderName, StatusCode};
 use librqbit_core::spawn_utils::spawn_with_cancel;
 use parking_lot::RwLock;
 use std::{
     collections::HashMap,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -25,11 +26,17 @@ pub struct Subscriptions {
     subs: RwLock<HashMap<String, Subscription>>,
 }
 
+const MAX_SUBSCRIPTIONS: usize = 256;
+
 impl Subscriptions {
-    pub fn add(&self, url: url::Url, timeout: Duration) -> (String, Arc<Notify>) {
+    pub fn add(&self, url: url::Url, timeout: Duration) -> anyhow::Result<(String, Arc<Notify>)> {
         let sid = format!("uuid:{}", uuid::Uuid::new_v4());
         let notify = Arc::new(Notify::default());
-        self.subs.write().insert(
+        let mut subs = self.subs.write();
+        if subs.len() >= MAX_SUBSCRIPTIONS {
+            anyhow::bail!("too many active subscriptions")
+        }
+        subs.insert(
             sid.clone(),
             Subscription {
                 url,
@@ -38,7 +45,7 @@ impl Subscriptions {
                 refresh_notify: notify.clone(),
             },
         );
-        (sid, notify)
+        Ok((sid, notify))
     }
 
     pub fn update_timeout(&self, sid: &str, timeout: Duration) -> anyhow::Result<()> {
@@ -113,6 +120,16 @@ impl SubscribeRequest {
             return Err(StatusCode::METHOD_NOT_ALLOWED.into_response());
         }
 
+        let client_ip = request
+            .extensions()
+            .get::<ConnectInfo<librqbit_dualstack_sockets::WrappedSocketAddr>>()
+            .map(|ConnectInfo(address)| address.0.ip())
+            .or_else(|| {
+                request
+                    .extensions()
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .map(|ConnectInfo(address)| address.ip())
+            });
         let (parts, _body) = request.into_parts();
         let is_event = parts
             .headers
@@ -125,7 +142,8 @@ impl SubscribeRequest {
             .get(HeaderName::from_static("callback"))
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim_matches(|c| c == '>' || c == '<'))
-            .and_then(|u| url::Url::parse(u).ok());
+            .and_then(|u| url::Url::parse(u).ok())
+            .filter(|url| callback_matches_client(url, client_ip));
         let subscription_id = parts
             .headers
             .get(HeaderName::from_static("sid"))
@@ -151,6 +169,32 @@ impl SubscribeRequest {
             }),
             _ => Err(StatusCode::BAD_REQUEST.into_response()),
         }
+    }
+}
+
+fn callback_matches_client(callback: &url::Url, client_ip: Option<IpAddr>) -> bool {
+    if !matches!(callback.scheme(), "http" | "https")
+        || !callback.username().is_empty()
+        || callback.password().is_some()
+        || callback.fragment().is_some()
+    {
+        return false;
+    }
+    let callback_ip = match callback.host() {
+        Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip),
+        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip),
+        _ => return false,
+    };
+    client_ip.is_some_and(|client_ip| canonical_ip(client_ip) == canonical_ip(callback_ip))
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
     }
 }
 
@@ -235,7 +279,7 @@ impl UpnpServerStateInner {
     ) -> anyhow::Result<String> {
         let (sid, refresh_notify) = self
             .content_directory_subscriptions
-            .add(url.clone(), timeout);
+            .add(url.clone(), timeout)?;
         let token = self.cancel_token.child_token();
 
         // Spawn a task that will notify it of system id changes.
@@ -323,7 +367,7 @@ impl UpnpServerStateInner {
     ) -> anyhow::Result<String> {
         let (sid, refresh_notify) = self
             .connection_manager_subscriptions
-            .add(url.clone(), timeout);
+            .add(url.clone(), timeout)?;
         let token = self.cancel_token.clone();
 
         // Spawn a task that will notify it of system id changes.
@@ -363,5 +407,70 @@ impl UpnpServerStateInner {
         );
 
         Ok(sid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::SocketAddr, time::Duration};
+
+    use axum::{body::Body, extract::ConnectInfo};
+    use http::{Request, StatusCode};
+
+    use super::{MAX_SUBSCRIPTIONS, SubscribeRequest, Subscriptions};
+
+    fn subscribe_request(client: &str, callback: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("SUBSCRIBE")
+            .header("NT", "upnp:event")
+            .header("CALLBACK", format!("<{callback}>"))
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(client.parse::<SocketAddr>().unwrap()));
+        request
+    }
+
+    #[test]
+    fn subscription_callback_must_target_requesting_client() {
+        let valid = subscribe_request("192.0.2.10:1234", "http://192.0.2.10:8000/events");
+        assert!(matches!(
+            SubscribeRequest::parse(valid),
+            Ok(SubscribeRequest::Create { .. })
+        ));
+
+        let ssrf = subscribe_request("192.0.2.10:1234", "http://127.0.0.1:8000/admin");
+        assert_eq!(
+            SubscribeRequest::parse(ssrf).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let hostname = subscribe_request("192.0.2.10:1234", "http://internal.example/events");
+        assert_eq!(
+            SubscribeRequest::parse(hostname).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn active_subscriptions_are_bounded() {
+        let subscriptions = Subscriptions::default();
+        for port in 1..=MAX_SUBSCRIPTIONS {
+            subscriptions
+                .add(
+                    format!("http://192.0.2.10:{port}/events").parse().unwrap(),
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+        }
+        assert!(
+            subscriptions
+                .add(
+                    "http://192.0.2.10:9999/events".parse().unwrap(),
+                    Duration::from_secs(60),
+                )
+                .is_err()
+        );
     }
 }

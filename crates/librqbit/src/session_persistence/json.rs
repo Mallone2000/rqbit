@@ -1,6 +1,11 @@
-use std::{any::TypeId, collections::HashMap, path::PathBuf};
+use std::{
+    any::TypeId,
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
 use crate::{
+    AutomationCategory,
     api::TorrentIdOrHash,
     bitv::{BitV, DiskBackedBitV},
     bitv_factory::BitVFactory,
@@ -24,6 +29,8 @@ use super::{SerializedTorrent, SessionPersistenceStore};
 #[derive(Serialize, Deserialize, Default)]
 struct SerializedSessionDatabase {
     torrents: HashMap<usize, SerializedTorrent>,
+    #[serde(default)]
+    automation_categories: BTreeMap<String, AutomationCategory>,
 }
 
 pub struct JsonSessionPersistenceStore {
@@ -148,6 +155,7 @@ impl JsonSessionPersistenceStore {
             only_files: torrent.only_files().clone(),
             is_paused: torrent.is_paused(),
             output_folder: torrent.shared().options.output_folder.clone(),
+            automation: torrent.automation_metadata(),
         };
 
         let torrent_bytes = torrent
@@ -177,8 +185,16 @@ impl JsonSessionPersistenceStore {
             }
         }
 
-        self.db_content.write().await.torrents.insert(id, st);
-        self.flush().await?;
+        let previous = self.db_content.write().await.torrents.insert(id, st);
+        if let Err(error) = self.flush().await {
+            let mut db = self.db_content.write().await;
+            if let Some(previous) = previous {
+                db.torrents.insert(id, previous);
+            } else {
+                db.torrents.remove(&id);
+            }
+            return Err(error);
+        }
 
         Ok(())
     }
@@ -261,7 +277,10 @@ impl SessionPersistenceStore for JsonSessionPersistenceStore {
         let removed = self.db_content.write().await.torrents.remove(&id);
         if let Some(t) = removed {
             debug!(?id, "deleted from in-memory db, flushing");
-            self.flush().await?;
+            if let Err(error) = self.flush().await {
+                self.db_content.write().await.torrents.insert(id, t);
+                return Err(error);
+            }
             for tf in [
                 self.torrent_bytes_filename(&t.info_hash),
                 self.bitv_filename(&t.info_hash),
@@ -331,5 +350,67 @@ impl SessionPersistenceStore for JsonSessionPersistenceStore {
         torrent: &ManagedTorrentHandle,
     ) -> anyhow::Result<()> {
         self.update_db(id, torrent, false).await
+    }
+
+    async fn load_automation_categories(&self) -> anyhow::Result<Vec<AutomationCategory>> {
+        Ok(self
+            .db_content
+            .read()
+            .await
+            .automation_categories
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn store_automation_category(&self, category: &AutomationCategory) -> anyhow::Result<()> {
+        let previous = self
+            .db_content
+            .write()
+            .await
+            .automation_categories
+            .insert(category.name.clone(), category.clone());
+        if let Err(error) = self.flush().await {
+            let mut db = self.db_content.write().await;
+            if let Some(previous) = previous {
+                db.automation_categories
+                    .insert(previous.name.clone(), previous);
+            } else {
+                db.automation_categories.remove(&category.name);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn delete_automation_category(&self, name: &str) -> anyhow::Result<()> {
+        let removed = self
+            .db_content
+            .write()
+            .await
+            .automation_categories
+            .remove(name);
+        if let Err(error) = self.flush().await {
+            if let Some(category) = removed {
+                self.db_content
+                    .write()
+                    .await
+                    .automation_categories
+                    .insert(category.name.clone(), category);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SerializedSessionDatabase;
+
+    #[test]
+    fn old_session_json_defaults_automation_categories() {
+        let db: SerializedSessionDatabase = serde_json::from_str(r#"{"torrents":{}}"#).unwrap();
+        assert!(db.automation_categories.is_empty());
     }
 }

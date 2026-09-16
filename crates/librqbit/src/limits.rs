@@ -97,3 +97,56 @@ impl Limits {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroU32, time::Duration};
+
+    use super::{Limits, LimitsConfig};
+
+    fn nz(value: u32) -> NonZeroU32 {
+        NonZeroU32::new(value).unwrap()
+    }
+
+    #[test]
+    fn exposes_initial_configuration() {
+        let config = LimitsConfig {
+            upload_bps: Some(nz(100)),
+            download_bps: Some(nz(200)),
+        };
+        let limits = Limits::new(config);
+        assert_eq!(limits.get_config(), config);
+    }
+
+    #[test]
+    fn limits_can_be_changed_and_disabled_independently() {
+        let limits = Limits::new(LimitsConfig::default());
+        limits.set_upload_bps(Some(nz(10)));
+        limits.set_download_bps(Some(nz(20)));
+        assert_eq!(limits.get_upload_bps(), Some(nz(10)));
+        assert_eq!(limits.get_download_bps(), Some(nz(20)));
+
+        limits.set_upload_bps(None);
+        assert_eq!(limits.get_upload_bps(), None);
+        assert_eq!(limits.get_download_bps(), Some(nz(20)));
+    }
+
+    #[tokio::test]
+    async fn disabled_limits_never_block() {
+        let limits = Limits::new(LimitsConfig::default());
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            limits.prepare_for_upload(nz(u32::MAX)),
+        )
+        .await
+        .expect("disabled upload limiter blocked")
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            limits.prepare_for_download(nz(u32::MAX)),
+        )
+        .await
+        .expect("disabled download limiter blocked")
+        .unwrap();
+    }
+}

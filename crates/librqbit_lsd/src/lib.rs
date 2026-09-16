@@ -347,3 +347,64 @@ fn try_parse_bt_search<'a: 'h, 'h>(
         _ => anyhow::bail!("expecting BT-SEARCH"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use librqbit_core::Id20;
+
+    use super::{RateLimiter, try_parse_bt_search};
+
+    fn parse(message: &[u8]) -> anyhow::Result<super::BtSearchAnnounceMessage> {
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        try_parse_bt_search(message, &mut headers)
+    }
+
+    #[test]
+    fn parses_valid_announce_case_insensitively() {
+        let parsed = parse(
+            b"BT-SEARCH * HTTP/1.1\r\nhOsT: 239.192.152.143:6771\r\nPoRt: 4240\r\nInfoHash: 0123456789abcdef0123456789abcdef01234567\r\nCookie: 42\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.hash, Id20::new(hex_literal()));
+        assert_eq!(
+            parsed.host,
+            SocketAddr::from((Ipv4Addr::new(239, 192, 152, 143), 6771))
+        );
+        assert_eq!(parsed.port, 4240);
+        assert_eq!(parsed.our_cookie, Some(42));
+    }
+
+    const fn hex_literal() -> [u8; 20] {
+        [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+        ]
+    }
+
+    #[test]
+    fn cookie_is_optional() {
+        let parsed = parse(
+            b"BT-SEARCH * HTTP/1.1\r\nHost: 239.192.152.143:6771\r\nPort: 1\r\nInfohash: 0123456789abcdef0123456789abcdef01234567\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.our_cookie, None);
+    }
+
+    #[test]
+    fn rejects_wrong_method_missing_headers_and_invalid_values() {
+        assert!(parse(b"GET * HTTP/1.1\r\n\r\n").is_err());
+        assert!(parse(b"BT-SEARCH * HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n").is_err());
+        assert!(parse(b"BT-SEARCH * HTTP/1.1\r\nHost: nope\r\nPort: 1\r\nInfohash: 0123456789abcdef0123456789abcdef01234567\r\n\r\n").is_err());
+        assert!(parse(b"BT-SEARCH * HTTP/1.1\r\nHost: 127.0.0.1:1\r\nPort: nope\r\nInfohash: 0123456789abcdef0123456789abcdef01234567\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn rate_limiter_allows_once_per_period() {
+        let limiter = RateLimiter::default();
+        assert_eq!(limiter.check(), Some(()));
+        assert_eq!(limiter.check(), None);
+    }
+}

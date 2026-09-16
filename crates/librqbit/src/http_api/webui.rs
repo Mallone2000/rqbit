@@ -1,6 +1,9 @@
 use axum::{Router, routing::get};
 
-pub fn make_webui_router() -> Router {
+pub fn make_webui_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::new()
         .route(
             "/",

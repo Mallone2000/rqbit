@@ -307,6 +307,7 @@ impl TestHarness {
                 allow_create: true,
                 max_upload_body_size: None,
                 prometheus_handle: None,
+                enable_qbittorrent_api: false,
             }),
         );
         let sock = TcpListener::bind_tcp(

@@ -13,8 +13,8 @@ use librqbit_core::magnet::Magnet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    AddTorrent, AddTorrentOptions, bitv_factory::BitVFactory, session::TorrentId,
-    torrent_state::ManagedTorrentHandle,
+    AddTorrent, AddTorrentOptions, AutomationCategory, TorrentAutomationMetadata,
+    bitv_factory::BitVFactory, session::TorrentId, torrent_state::ManagedTorrentHandle,
 };
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -30,6 +30,8 @@ pub struct SerializedTorrent {
     output_folder: PathBuf,
     only_files: Option<Vec<usize>>,
     is_paused: bool,
+    #[serde(default)]
+    automation: TorrentAutomationMetadata,
 }
 
 impl SerializedTorrent {
@@ -59,6 +61,7 @@ impl SerializedTorrent {
             ),
             only_files: self.only_files,
             overwrite: true,
+            automation: self.automation,
             ..Default::default()
         };
 
@@ -78,6 +81,9 @@ pub trait SessionPersistenceStore: core::fmt::Debug + Send + Sync + BitVFactory 
         id: TorrentId,
         torrent: &ManagedTorrentHandle,
     ) -> anyhow::Result<()>;
+    async fn load_automation_categories(&self) -> anyhow::Result<Vec<AutomationCategory>>;
+    async fn store_automation_category(&self, category: &AutomationCategory) -> anyhow::Result<()>;
+    async fn delete_automation_category(&self, name: &str) -> anyhow::Result<()>;
     async fn stream_all(
         &self,
     ) -> anyhow::Result<BoxStream<'_, anyhow::Result<(TorrentId, SerializedTorrent)>>>;

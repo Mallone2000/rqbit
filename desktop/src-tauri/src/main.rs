@@ -433,7 +433,6 @@ async fn start() {
     let state = State::new(init_logging_result).await;
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             config_change,

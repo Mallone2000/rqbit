@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use crate::{
-    api::TorrentIdOrHash, bitv::BitV, bitv_factory::BitVFactory, session::TorrentId,
-    torrent_state::ManagedTorrentHandle, type_aliases::BF,
+    AutomationCategory, api::TorrentIdOrHash, bitv::BitV, bitv_factory::BitVFactory,
+    session::TorrentId, torrent_state::ManagedTorrentHandle, type_aliases::BF,
 };
 use anyhow::Context;
 use futures::{StreamExt, stream::BoxStream};
@@ -26,6 +26,7 @@ struct TorrentsTableRecord {
     output_folder: String,
     only_files: Option<Vec<i32>>,
     is_paused: bool,
+    automation_metadata: String,
 }
 
 impl TorrentsTableRecord {
@@ -41,6 +42,7 @@ impl TorrentsTableRecord {
                     .only_files
                     .map(|v| v.into_iter().map(|v| v as usize).collect()),
                 is_paused: self.is_paused,
+                automation: serde_json::from_str(&self.automation_metadata).unwrap_or_default(),
             },
         ))
     }
@@ -80,6 +82,10 @@ impl PostgresSessionStorage {
         );
 
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS have_bitfield BYTEA");
+        exec!(
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS automation_metadata TEXT NOT NULL DEFAULT '{}'"
+        );
+        exec!("CREATE TABLE IF NOT EXISTS automation_categories (name TEXT PRIMARY KEY)");
 
         Ok(Self { pool })
     }
@@ -102,8 +108,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused)
-        VALUES($1, $2, $3, $4, $5, $6, $7)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, automation_metadata)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT(id) DO NOTHING";
         sqlx::query(q)
             .bind::<i32>(id.try_into()?)
@@ -132,6 +138,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
                     .collect::<Vec<i32>>()
             }))
             .bind(torrent.is_paused())
+            .bind(serde_json::to_string(&torrent.automation_metadata())?)
             .execute(&self.pool)
             .await
             .context("error executing INSERT INTO torrents")?;
@@ -148,7 +155,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
     }
 
     async fn get(&self, id: TorrentId) -> anyhow::Result<SerializedTorrent> {
-        let row = sqlx::query_as::<_, TorrentsTableRecord>("SELECT * FROM torrents WHERE id = ?")
+        let row = sqlx::query_as::<_, TorrentsTableRecord>("SELECT * FROM torrents WHERE id = $1")
             .bind::<i32>(id.try_into()?)
             .fetch_one(&self.pool)
             .await
@@ -163,17 +170,50 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         id: TorrentId,
         torrent: &ManagedTorrentHandle,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE torrents SET only_files = $1, is_paused = $2 WHERE id = $3")
+        sqlx::query(
+            "UPDATE torrents SET only_files = $1, is_paused = $2, automation_metadata = $3 WHERE id = $4",
+        )
             .bind(torrent.only_files().map(|v| {
                 v.into_iter()
                     .filter_map(|f| f.try_into().ok())
                     .collect::<Vec<i32>>()
             }))
             .bind(torrent.is_paused())
+            .bind(serde_json::to_string(&torrent.automation_metadata())?)
             .bind::<i32>(id.try_into()?)
             .execute(&self.pool)
             .await
             .context("error executing UPDATE torrents")?;
+        Ok(())
+    }
+
+    async fn load_automation_categories(&self) -> anyhow::Result<Vec<AutomationCategory>> {
+        let names: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM automation_categories ORDER BY name")
+                .fetch_all(&self.pool)
+                .await
+                .context("error loading automation categories")?;
+        Ok(names
+            .into_iter()
+            .map(|(name,)| AutomationCategory { name })
+            .collect())
+    }
+
+    async fn store_automation_category(&self, category: &AutomationCategory) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO automation_categories (name) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&category.name)
+            .execute(&self.pool)
+            .await
+            .context("error storing automation category")?;
+        Ok(())
+    }
+
+    async fn delete_automation_category(&self, name: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM automation_categories WHERE name = $1")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .context("error deleting automation category")?;
         Ok(())
     }
 

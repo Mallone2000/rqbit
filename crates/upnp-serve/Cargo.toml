@@ -30,7 +30,7 @@ reqwest.workspace = true
 quick-xml = { workspace = true, features = ["serialize"] }
 network-interface.workspace = true
 futures.workspace = true
-librqbit-dualstack-sockets.workspace = true
+librqbit-dualstack-sockets = { workspace = true, features = ["axum"] }
 rand.workspace = true
 
 [dev-dependencies]

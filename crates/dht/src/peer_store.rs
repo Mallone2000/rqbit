@@ -206,3 +206,108 @@ impl PeerStore {
         todo!()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use bencode::ByteBufOwned;
+    use librqbit_core::Id20;
+
+    use crate::bprotocol::{AnnouncePeer, Want};
+
+    use super::PeerStore;
+
+    fn id(byte: u8) -> Id20 {
+        Id20::new([byte; 20])
+    }
+
+    fn announce(
+        node_id: Id20,
+        info_hash: Id20,
+        token: [u8; 4],
+        port: u16,
+        implied_port: u8,
+    ) -> AnnouncePeer<ByteBufOwned> {
+        AnnouncePeer {
+            id: node_id,
+            implied_port,
+            info_hash,
+            port,
+            token: token.to_vec().into(),
+        }
+    }
+
+    #[test]
+    fn valid_token_stores_peer_and_filters_by_address_family() {
+        let store = PeerStore::new(Id20::default());
+        let node = id(1);
+        let hash = Id20::default();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let token = store.gen_token_for(node, source);
+
+        assert!(store.store_peer(&announce(node, hash, token, 6881, 0), source));
+        assert_eq!(store.get_for_info_hash(hash, Want::V4).len(), 1);
+        assert_eq!(store.get_for_info_hash(hash, Want::Both).len(), 1);
+        assert!(store.get_for_info_hash(hash, Want::V6).is_empty());
+        assert!(store.get_for_info_hash(hash, Want::None).is_empty());
+    }
+
+    #[test]
+    fn implied_port_uses_source_port() {
+        let store = PeerStore::new(Id20::default());
+        let node = id(2);
+        let hash = Id20::default();
+        let source: SocketAddr = "[::1]:5000".parse().unwrap();
+        let token = store.gen_token_for(node, source);
+        assert!(store.store_peer(&announce(node, hash, token, 6881, 1), source));
+
+        let peers = store.get_for_info_hash(hash, Want::V6);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].0, source);
+    }
+
+    #[test]
+    fn rejects_unknown_token_wrong_source_and_wrong_node() {
+        let store = PeerStore::new(Id20::default());
+        let node = id(3);
+        let hash = Id20::default();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let token = store.gen_token_for(node, source);
+
+        assert!(!store.store_peer(&announce(node, hash, [0; 4], 1, 0), source));
+        assert!(!store.store_peer(
+            &announce(node, hash, token, 1, 0),
+            "127.0.0.1:5001".parse().unwrap()
+        ));
+        assert!(!store.store_peer(&announce(id(4), hash, token, 1, 0), source));
+        assert!(store.get_for_info_hash(hash, Want::Both).is_empty());
+    }
+
+    #[test]
+    fn duplicate_announce_refreshes_without_duplicate_peer() {
+        let store = PeerStore::new(Id20::default());
+        let node = id(5);
+        let hash = Id20::default();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let token = store.gen_token_for(node, source);
+        let announce = announce(node, hash, token, 6881, 0);
+        assert!(store.store_peer(&announce, source));
+        assert!(store.store_peer(&announce, source));
+        assert_eq!(store.get_for_info_hash(hash, Want::Both).len(), 1);
+    }
+
+    #[test]
+    fn serialization_round_trip_preserves_peers() {
+        let store = PeerStore::new(Id20::default());
+        let node = id(6);
+        let hash = Id20::default();
+        let source: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let token = store.gen_token_for(node, source);
+        assert!(store.store_peer(&announce(node, hash, token, 6881, 0), source));
+
+        let encoded = serde_json::to_string(&store).unwrap();
+        let decoded: PeerStore = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.get_for_info_hash(hash, Want::Both).len(), 1);
+    }
+}

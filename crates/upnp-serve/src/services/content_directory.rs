@@ -94,6 +94,8 @@ pub mod browse {
                         _ => return None,
                     };
                     let mime = mime.to_string();
+                    let title = quick_xml::escape::escape(&item.title);
+                    let url = quick_xml::escape::escape(&item.url);
 
                     Some(format!(
                         include_str!(
@@ -102,9 +104,9 @@ pub mod browse {
                         id = item.id,
                         parent_id = item.parent_id,
                         mime_type = mime,
-                        url = item.url,
+                        url = url,
                         upnp_class = upnp_class,
-                        title = item.title,
+                        title = title,
                         size = item.size
                     ))
                 }
@@ -114,13 +116,14 @@ pub mod browse {
                         Some(cc) => format!("childCount=\"{cc}\""),
                         None => String::new(),
                     };
+                    let title = quick_xml::escape::escape(&item.title);
                     format!(
                         include_str!(
                             "../resources/templates/content_directory/control/browse/container.tmpl.xml"
                         ),
                         id = item.id,
                         parent_id = item.parent_id.map(|p| p as isize).unwrap_or(-1),
-                        title = item.title,
+                        title = title,
                         childCountTag = child_count_tag
                     )
                 }
@@ -241,6 +244,7 @@ pub mod subscription {
         let body = super::get_system_update_id::render_notify(system_update_id);
 
         let resp = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()?
             .request(Method::from_bytes(b"NOTIFY")?, url.clone())
             .header("Content-Type", r#"text/xml; charset="utf-8""#)
@@ -264,9 +268,9 @@ pub(crate) async fn http_handler(
     State(state): State<UnpnServerState>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let body = BStr::new(&body);
     let action = headers.get("soapaction").map(|v| BStr::new(v.as_bytes()));
-    trace!(?body, ?action, "received control request");
+    trace!(body_bytes = body.len(), ?action, "received control request");
+    let body = BStr::new(&body);
     let action = match action {
         Some(action) => action,
         None => {
@@ -351,5 +355,23 @@ mod tests {
         let req = ContentDirectoryControlRequest::parse(s).unwrap();
         assert_eq!(req.object_id, 5);
         assert_eq!(req.browse_flag, BrowseFlag::BrowseDirectChildren)
+    }
+
+    #[test]
+    fn browse_response_escapes_untrusted_didl_fields() {
+        use super::browse::response::{Item, ItemOrContainer};
+
+        let response = super::browse::response::render([ItemOrContainer::Item(Item {
+            id: 1,
+            parent_id: 0,
+            title: "</dc:title><evil>injected</evil>".to_owned(),
+            mime_type: Some("video/mp4".parse().unwrap()),
+            url: "http://example.invalid/a?x=1&y=<evil>".to_owned(),
+            size: 1,
+        })]);
+
+        assert!(response.contains("&amp;lt;evil&amp;gt;injected&amp;lt;/evil&amp;gt;"));
+        assert!(response.contains("x=1&amp;amp;y=&amp;lt;evil&amp;gt;"));
+        assert!(!response.contains("&lt;evil&gt;injected&lt;/evil&gt;"));
     }
 }

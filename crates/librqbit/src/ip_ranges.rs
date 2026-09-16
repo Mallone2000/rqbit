@@ -7,11 +7,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::path::Path;
 use std::str::FromStr;
-use tokio::io::{AsyncBufRead, AsyncRead};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt};
 use tokio::{io::AsyncBufReadExt, io::BufReader};
 use tokio_util::io::StreamReader;
 use tracing::trace;
 use url::Url;
+
+const MAX_IP_LIST_DECODED_SIZE: u64 = 128 * 1024 * 1024;
+const MAX_IP_LIST_LINE_SIZE: u64 = 64 * 1024;
+const MAX_IP_RANGES: usize = 1_000_000;
 
 struct IntervalTreeWithSize<T> {
     t: IntervalTree<T, ()>,
@@ -71,12 +75,23 @@ impl IpRanges {
 
         let response = reqwest::get(parsed_url)
             .await
+            .map_err(reqwest::Error::without_url)
             .context("error fetching list")?;
         if !response.status().is_success() {
             anyhow::bail!("error fetching list: HTTP {}", response.status());
         }
 
-        let mut reader = StreamReader::new(response.bytes_stream().map_err(std::io::Error::other));
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_IP_LIST_DECODED_SIZE)
+        {
+            anyhow::bail!("IP list download is too large")
+        }
+        let mut reader = StreamReader::new(
+            response
+                .bytes_stream()
+                .map_err(|error| std::io::Error::other(error.without_url())),
+        );
         let bl = Self::create_from_stream(&mut reader).await?;
         Ok(bl)
     }
@@ -117,8 +132,23 @@ impl IpRanges {
         let mut v6 = Vec::new();
 
         let mut line = String::new();
+        let mut decoded_size = 0_u64;
 
-        while reader.read_line(&mut line).await? > 0 {
+        loop {
+            let read = (&mut *reader)
+                .take(MAX_IP_LIST_LINE_SIZE + 1)
+                .read_line(&mut line)
+                .await?;
+            if read == 0 {
+                break;
+            }
+            if read as u64 > MAX_IP_LIST_LINE_SIZE {
+                anyhow::bail!("IP list line is too long")
+            }
+            decoded_size = decoded_size.saturating_add(read as u64);
+            if decoded_size > MAX_IP_LIST_DECODED_SIZE {
+                anyhow::bail!("decoded IP list is too large")
+            }
             match parse_ip_range(&line) {
                 Some(IpRange::V4(r)) => {
                     v4.push(r);
@@ -127,8 +157,11 @@ impl IpRanges {
                     v6.push(r);
                 }
                 None => {
-                    tracing::debug!(line, "couldn't parse line");
+                    tracing::debug!(line_bytes = line.len(), "couldn't parse IP list line");
                 }
+            }
+            if v4.len().saturating_add(v6.len()) > MAX_IP_RANGES {
+                anyhow::bail!("IP list contains too many ranges")
             }
             line.clear();
         }
@@ -216,6 +249,16 @@ mod tests {
         assert!(!list.has("8.8.8.8".parse().unwrap()));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_ip_list_line_is_rejected() {
+        let line = vec![b'x'; usize::try_from(MAX_IP_LIST_LINE_SIZE + 1).unwrap()];
+        assert!(
+            IpRanges::create_from_stream(&mut Cursor::new(line))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

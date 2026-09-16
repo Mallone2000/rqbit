@@ -7,8 +7,13 @@ on:
     tags:
       - "v*.*.*"
 
+permissions:
+  contents: read
+
 jobs:
   release-linux:
+    permissions:
+      contents: write
     runs-on: ${{ matrix.os }}
     if: github.ref_type == 'tag'
     strategy:
@@ -20,26 +25,23 @@ jobs:
           - os: ubuntu-24.04-arm
             arch: arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install tauri dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Install Binstall
-        uses: cargo-bins/cargo-binstall@main
-
       - name: install Tauri
-        run: cargo binstall tauri-cli --no-confirm
+        run: cargo install tauri-cli --locked --version 2.8.4
 
       - name: npm install (desktop)
         working-directory: desktop
-        run: npm install
+        run: npm ci
 
       - name: npm install (librqbit/webui)
         working-directory: crates/librqbit/webui
-        run: npm install
+        run: npm ci
 
       - name: cargo tauri build
         working-directory: desktop
@@ -55,7 +57,7 @@ jobs:
           done
           mv target/release/rqbit-desktop ${{ github.workspace }}/builds/rqbit-desktop-linux-${{ matrix.arch }}
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           generate_release_notes: true
           draft: true
@@ -63,20 +65,22 @@ jobs:
             ${{ github.workspace }}/builds/*
 
   build-docker-cross:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     strategy:
       fail-fast: true
       matrix:
         platform: [linux/arm/v7, linux/amd64, linux/arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         id: builder1
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: cache
         with:
           path: |
@@ -88,7 +92,7 @@ jobs:
           save-always: true
 
       - name: inject cache into docker
-        uses: reproducible-containers/buildkit-cache-dance@v3.1.0
+        uses: reproducible-containers/buildkit-cache-dance@63c59a3e6c6bd7fe55abecb23afd8e1121451230 # v3.1.0
         with:
           cache-map: |
             {
@@ -125,7 +129,7 @@ jobs:
           cd target/cross
           cp -l ${{ matrix.platform }}/rqbit rqbit-${{ steps.gen_artifact_key.outputs.key }}
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         if: ${{ github.ref_type == 'tag' }}
         with:
           generate_release_notes: true
@@ -134,20 +138,20 @@ jobs:
             target/cross/rqbit-${{ steps.gen_artifact_key.outputs.key }}
 
       - name: Archive target/cross/
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.gen_artifact_key.outputs.key }}
-          path: target/cross/${{ matrix.platform }}/rqbit
+          path: target/cross/${{ matrix.platform }}/
 
   build-push-docker-multiarch:
     runs-on: ubuntu-latest
     needs: build-docker-cross
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
             ${{ vars.DOCKERHUB_USERNAME }}/rqbit, enable=${{ vars.DOCKERHUB_USERNAME != '' }}
@@ -156,34 +160,34 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: linux-arm-v7
           path: target/cross/linux/arm/v7/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: linux-arm64
           path: target/cross/linux/arm64/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: linux-amd64
           path: target/cross/linux/amd64/
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to Docker Hub
         if: "${{ vars.DOCKERHUB_USERNAME != '' }}"
         id: docker_login
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           push: ${{ steps.docker_login.outcome == 'success' }}
           tags: ${{ steps.meta.outputs.tags }}

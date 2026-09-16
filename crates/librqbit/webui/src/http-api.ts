@@ -10,6 +10,25 @@ import {
   TorrentStats,
 } from "./api-types";
 
+export interface AuthStatus {
+  authenticated: boolean;
+  authentication_required: boolean;
+}
+
+export interface PublicIp {
+  public_ip: string;
+}
+
+export const AUTHENTICATION_REQUIRED_EVENT = "rqbit-authentication-required";
+
+const notifyIfAuthenticationRequired = (response: Response) => {
+  // The native API challenges with 401, while the qBittorrent-compatible
+  // endpoints use 403 for an expired or missing SID.
+  if (response.status === 401 || response.status === 403) {
+    window.dispatchEvent(new Event(AUTHENTICATION_REQUIRED_EVENT));
+  }
+};
+
 // Define API URL and base path
 const apiUrl = (() => {
   if (window.origin === "null") {
@@ -32,10 +51,13 @@ const makeBinaryRequest = async (path: string): Promise<ArrayBuffer> => {
   const url = apiUrl + path;
   const response = await fetch(url, {
     method: "GET",
+    credentials: "include",
     headers: {
       Accept: "application/octet-stream",
+      "X-Rqbit-WebUI": "1",
     },
   });
+  notifyIfAuthenticationRequired(response);
 
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -54,14 +76,17 @@ const makeRequest = async (
   const url = apiUrl + path;
   let options: RequestInit = {
     method,
+    credentials: "include",
     headers: {
       Accept: "application/json",
+      "X-Rqbit-WebUI": "1",
     },
   };
   if (isJson) {
     options.headers = {
       Accept: "application/json",
       "Content-Type": "application/json",
+      "X-Rqbit-WebUI": "1",
     };
     options.body = JSON.stringify(data);
   } else {
@@ -82,6 +107,7 @@ const makeRequest = async (
     error.text = "network error";
     return Promise.reject(error);
   }
+  notifyIfAuthenticationRequired(response);
 
   error.status = response.status;
   error.statusText = `${response.status} ${response.statusText}`;
@@ -99,11 +125,33 @@ const makeRequest = async (
     }
     return Promise.reject(error);
   }
-  const result = await response.json();
-  return result;
+  const responseBody = await response.text();
+  return responseBody ? JSON.parse(responseBody) : undefined;
 };
 
-export const API: RqbitAPI & { getVersion: () => Promise<string> } = {
+export const API: RqbitAPI & {
+  getVersion: () => Promise<string>;
+  getAuthStatus: () => Promise<AuthStatus>;
+  getPublicIp: () => Promise<PublicIp>;
+  login: (username: string, password: string) => Promise<void>;
+  logout: () => Promise<void>;
+} = {
+  getAuthStatus: (): Promise<AuthStatus> => {
+    return makeRequest("GET", "/web/auth/status");
+  },
+  getPublicIp: (): Promise<PublicIp> => {
+    return makeRequest("GET", "/web/public-ip");
+  },
+  login: (username: string, password: string): Promise<void> => {
+    return makeRequest(
+      "POST",
+      "/web/auth/login",
+      new URLSearchParams({ username, password }),
+    );
+  },
+  logout: (): Promise<void> => {
+    return makeRequest("POST", "/web/auth/logout");
+  },
   getStreamLogsUrl: () => apiUrl + "/stream_logs",
   listTorrents: (opts?: {
     withStats?: boolean;
@@ -203,5 +251,26 @@ export const API: RqbitAPI & { getVersion: () => Promise<string> } = {
   },
   setLimits: (limits: LimitsConfig): Promise<void> => {
     return makeRequest("POST", "/torrents/limits", limits, true);
+  },
+  listCategories: async (): Promise<string[]> => {
+    const categories = (await makeRequest(
+      "GET",
+      "/api/v2/torrents/categories",
+    )) as Record<string, unknown>;
+    return Object.keys(categories).sort((a, b) => a.localeCompare(b));
+  },
+  createCategory: (name: string): Promise<void> => {
+    return makeRequest(
+      "POST",
+      "/api/v2/torrents/createCategory",
+      new URLSearchParams({ category: name }),
+    );
+  },
+  removeCategories: (names: string[]): Promise<void> => {
+    return makeRequest(
+      "POST",
+      "/api/v2/torrents/removeCategories",
+      new URLSearchParams({ categories: names.join("\n") }),
+    );
   },
 };

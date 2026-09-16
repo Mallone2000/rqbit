@@ -8,25 +8,27 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   release-macos:
+    permissions:
+      contents: write
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Binstall
-        uses: cargo-bins/cargo-binstall@main
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: install Tauri
-        run: cargo binstall tauri-cli --no-confirm
+        run: cargo install tauri-cli --locked --version 2.8.4
 
       - name: npm install (desktop)
         working-directory: desktop
-        run: npm install
+        run: npm ci
 
       - name: npm install (librqbit/webui)
         working-directory: crates/librqbit/webui
-        run: npm install
+        run: npm ci
 
       - name: cargo tauri build
         working-directory: desktop
@@ -34,7 +36,7 @@ jobs:
           rustup target add aarch64-apple-darwin && rustup target add x86_64-apple-darwin &&
           cargo tauri build --target universal-apple-darwin --ci
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           generate_release_notes: true
           draft: true
@@ -50,7 +52,7 @@ jobs:
           cargo build --profile release-github --target aarch64-apple-darwin &&
           lipo ./target/x86_64-apple-darwin/release-github/rqbit ./target/aarch64-apple-darwin/release-github/rqbit -create -output ./target/artifacts/rqbit-osx-universal
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           generate_release_notes: true
           draft: true

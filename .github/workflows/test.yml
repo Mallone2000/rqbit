@@ -8,8 +8,36 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # AGENTS.md has symlink mode but contains inline documentation.
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: core.symlinks
+  GIT_CONFIG_VALUE_0: "false"
+
+permissions:
+  contents: read
 
 jobs:
+  test-webui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Check frontend formatting
+        run: npm run format:check
+
+      - name: Check Web UI types
+        run: npm exec --workspace rqbit-webui -- tsc --noEmit
+
+      - name: Run Web UI tests
+        run: npm test --workspace rqbit-webui
+
   check-rust-compat:
     runs-on: ubuntu-latest
     strategy:
@@ -20,7 +48,7 @@ jobs:
         run: |
           rustup toolchain install ${{ matrix.rust_version }}
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - run: rustup override set ${{ matrix.rust_version }}
 
@@ -41,22 +69,22 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - run: rustup toolchain install stable --profile minimal
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           prefix-key: v1
 
       - name: Run tests
         if: ${{ matrix.os == 'windows-latest' }}
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
 
       - name: Run tests
         if: ${{ matrix.os == 'macos-latest' }}
-        run: ulimit -n unlimited && cargo test --workspace
+        run: ulimit -n unlimited && cargo test --workspace -- --test-threads=1
 
       - name: Run tests
         if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: cargo test
+        run: cargo test -- --test-threads=1

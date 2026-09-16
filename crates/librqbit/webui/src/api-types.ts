@@ -277,4 +277,7 @@ export interface RqbitAPI {
   stats: () => Promise<SessionStats>;
   getLimits: () => Promise<LimitsConfig>;
   setLimits: (limits: LimitsConfig) => Promise<void>;
+  listCategories?: () => Promise<string[]>;
+  createCategory?: (name: string) => Promise<void>;
+  removeCategories?: (names: string[]) => Promise<void>;
 }

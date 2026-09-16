@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use postgres::{Client, Config, CopyInWriter, NoTls};
+#[cfg(unix)]
+use postgres::Config;
+use postgres::{Client, CopyInWriter, NoTls};
 use serde_json::Value;
 
 #[derive(Debug, Parser)]
@@ -86,6 +88,7 @@ fn run() -> Result<()> {
 }
 
 fn connect(database_url: &str) -> Result<Client> {
+    #[cfg(unix)]
     if let Some(dbname) = database_url.strip_prefix("postgresql:///") {
         return Config::new()
             .host_path("/tmp")
@@ -94,8 +97,7 @@ fn connect(database_url: &str) -> Result<Client> {
             .with_context(|| format!("failed to connect to database {dbname:?} via local socket"));
     }
 
-    Client::connect(database_url, NoTls)
-        .with_context(|| format!("failed to connect to {database_url:?}"))
+    Client::connect(database_url, NoTls).context("failed to connect to PostgreSQL")
 }
 
 fn recreate_table(client: &mut Client, table: &SqlTableName) -> Result<()> {

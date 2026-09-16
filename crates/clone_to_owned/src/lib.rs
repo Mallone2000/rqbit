@@ -94,3 +94,47 @@ where
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use bytes::Bytes;
+
+    use super::CloneToOwned;
+
+    #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    struct Borrowed(&'static str);
+
+    impl CloneToOwned for Borrowed {
+        type Target = String;
+
+        fn clone_to_owned(&self, _within_buffer: Option<&Bytes>) -> Self::Target {
+            self.0.to_owned()
+        }
+    }
+
+    #[test]
+    fn clones_nested_optional_vectors() {
+        let value = Some(vec![1u8, 2, 3]);
+        assert_eq!(value.clone_to_owned(None), value);
+        assert_eq!(Option::<u32>::None.clone_to_owned(None), None);
+    }
+
+    #[test]
+    fn clones_hash_map_keys_and_values_to_new_types() {
+        let value = HashMap::from([(Borrowed("key"), vec![7u32, 8])]);
+        let owned = value.clone_to_owned(None);
+        assert_eq!(owned.get("key"), Some(&vec![7, 8]));
+    }
+
+    #[test]
+    fn clones_btree_map_and_preserves_order() {
+        let value = BTreeMap::from([(Borrowed("z"), 1u8), (Borrowed("a"), 2)]);
+        let owned = value.clone_to_owned(None);
+        assert_eq!(
+            owned.into_iter().collect::<Vec<_>>(),
+            [("a".into(), 2), ("z".into(), 1)]
+        );
+    }
+}

@@ -43,6 +43,7 @@ mod stat_gen;
 
 pub mod api;
 mod api_error;
+mod automation;
 mod bitv;
 mod bitv_factory;
 mod chunk_tracker;
@@ -86,6 +87,7 @@ pub use error::{Error, Result};
 
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};
+pub use automation::{AutomationCategory, TorrentAutomationMetadata};
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
 pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
@@ -114,6 +116,18 @@ mod tests;
 /// The cargo version of librqbit.
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+pub(crate) fn redact_url_for_logging(value: &str) -> String {
+    let Ok(url) = url::Url::parse(value) else {
+        return "<invalid URL>".to_owned();
+    };
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        format!("{}:<redacted>", url.scheme())
+    } else {
+        origin
+    }
 }
 
 pub const fn client_name_and_version() -> &'static str {

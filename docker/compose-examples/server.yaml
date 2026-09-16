@@ -1,6 +1,6 @@
 services:
   rqbit:
-    image: ikatson/rqbit:v7.0.0-beta.3
+    image: ${RQBIT_IMAGE:?set this to ikatson/rqbit@sha256:<trusted digest>}
     # Host network required for several things to work:
     # - upnp discovery for port forwarding to your router
     # - upnp UDP multicast announce MediaServer
@@ -16,6 +16,10 @@ services:
 
       # Replace this if you want to change the HTTP/Web UI port
       # RQBIT_HTTP_API_LISTEN_ADDR: 0.0.0.0:3030
+
+      # Required because host networking exposes the writable API beyond loopback.
+      # Use an authenticated HTTPS reverse proxy for access outside a trusted LAN.
+      RQBIT_HTTP_BASIC_AUTH_USERPASS: "${RQBIT_USER:?}:${RQBIT_PASSWORD:?}"
     volumes:
       - db:/home/rqbit/db
       - cache:/home/rqbit/cache
