@@ -61,6 +61,18 @@ pub(super) struct TorrentProperties {
 }
 
 #[derive(Serialize)]
+pub(super) struct TorrentTracker {
+    pub url: String,
+    pub status: u8,
+    pub tier: usize,
+    pub num_peers: i64,
+    pub num_seeds: i64,
+    pub num_leeches: i64,
+    pub num_downloaded: i64,
+    pub msg: String,
+}
+
+#[derive(Serialize)]
 pub(super) struct TorrentFile {
     pub index: usize,
     pub name: String,

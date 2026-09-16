@@ -1,7 +1,10 @@
 pub(super) mod auth;
 mod dto;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use axum::{
@@ -16,7 +19,9 @@ use http::{StatusCode, header::CONTENT_TYPE};
 use serde::Deserialize;
 use tracing::warn;
 
-use self::dto::{Category, Preferences, TorrentFile, TorrentInfo, TorrentProperties};
+use self::dto::{
+    Category, Preferences, TorrentFile, TorrentInfo, TorrentProperties, TorrentTracker,
+};
 use super::HttpApi;
 use crate::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, TorrentAutomationMetadata,
@@ -88,6 +93,7 @@ pub(super) fn make_api_router(state: ApiState) -> Router {
         .route("/app/preferences", get(preferences))
         .route("/torrents/info", get(torrents_info))
         .route("/torrents/properties", get(torrent_properties))
+        .route("/torrents/trackers", get(torrent_trackers))
         .route("/torrents/files", get(torrent_files))
         .route("/torrents/categories", get(categories));
 
@@ -101,6 +107,7 @@ pub(super) fn make_api_router(state: ApiState) -> Router {
             .route("/torrents/setShareLimits", post(set_share_limits))
             .route("/torrents/pause", post(pause_torrents))
             .route("/torrents/resume", post(resume_torrents))
+            .route("/torrents/filePrio", post(set_file_priority))
             .route("/torrents/topPrio", post(top_priority))
             .route("/torrents/setForceStart", post(set_force_start));
     }
@@ -155,6 +162,8 @@ async fn preferences(State(state): State<ApiState>) -> Json<Preferences> {
 struct InfoQuery {
     #[serde(default)]
     category: String,
+    filter: Option<String>,
+    hashes: Option<String>,
 }
 
 async fn torrents_info(
@@ -163,11 +172,28 @@ async fn torrents_info(
 ) -> Json<Vec<TorrentInfo>> {
     let session = state.api.session();
     let save_path = session.output_folder().to_string_lossy().into_owned();
+    let requested_hashes = query.hashes.as_ref().map(|hashes| {
+        hashes
+            .split('|')
+            .map(str::to_ascii_lowercase)
+            .collect::<HashSet<_>>()
+    });
+    let completed_only = query.filter.as_deref() == Some("completed");
     let mut torrents: Vec<TorrentInfo> = session.with_torrents(|torrents| {
         torrents
             .filter_map(|(_, torrent)| {
                 let (stats, automation, _) = torrent.refresh_automation_stats(unix_time_seconds());
                 if !query.category.is_empty() && automation.category != query.category {
+                    return None;
+                }
+                if completed_only && !stats.finished {
+                    return None;
+                }
+                let hash = torrent.info_hash().as_string();
+                if requested_hashes
+                    .as_ref()
+                    .is_some_and(|hashes| !hashes.contains(&hash.to_ascii_lowercase()))
+                {
                     return None;
                 }
 
@@ -202,7 +228,7 @@ async fn torrents_info(
                 let category = automation.category;
 
                 Some(TorrentInfo {
-                    hash: torrent.info_hash().as_string(),
+                    hash,
                     name: torrent
                         .name()
                         .unwrap_or_else(|| torrent.info_hash().as_string()),
@@ -231,12 +257,20 @@ async fn torrents_info(
             .collect()
     });
     for pending in session.pending_automation_torrents() {
+        let hash = pending.info_hash.as_string();
         if !query.category.is_empty() && pending.automation.category != query.category {
+            continue;
+        }
+        if completed_only
+            || requested_hashes
+                .as_ref()
+                .is_some_and(|hashes| !hashes.contains(&hash.to_ascii_lowercase()))
+        {
             continue;
         }
         let category = pending.automation.category;
         torrents.push(TorrentInfo {
-            hash: pending.info_hash.as_string(),
+            hash,
             name: pending
                 .name
                 .unwrap_or_else(|| pending.info_hash.as_string()),
@@ -343,6 +377,80 @@ async fn torrent_properties(
     }))
 }
 
+async fn torrent_trackers(
+    State(state): State<ApiState>,
+    Query(query): Query<HashQuery>,
+) -> QbitResult<Json<Vec<TorrentTracker>>> {
+    let torrent = state
+        .api
+        .session()
+        .get(parse_hash(&query.hash)?)
+        .ok_or_else(|| QbitError::not_found("torrent not found"))?;
+    let mut seen = HashSet::new();
+    let mut trackers = Vec::new();
+
+    if let Some(metadata) = torrent.metadata.load().as_ref()
+        && let Ok(metainfo) =
+            librqbit_core::torrent_metainfo::torrent_from_bytes(&metadata.torrent_bytes)
+    {
+        if metainfo.announce_list.is_empty() {
+            if let Some(url) = metainfo.announce.as_ref()
+                && let Ok(url) = std::str::from_utf8(url.as_ref())
+            {
+                push_tracker(&mut trackers, &mut seen, url, 0);
+            }
+        } else {
+            for (tier, urls) in metainfo.announce_list.iter().enumerate() {
+                for url in urls {
+                    if let Ok(url) = std::str::from_utf8(url.as_ref()) {
+                        push_tracker(&mut trackers, &mut seen, url, tier);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut remaining = torrent
+        .shared()
+        .trackers
+        .iter()
+        .map(url::Url::as_str)
+        .filter(|url| !seen.contains(*url))
+        .collect::<Vec<_>>();
+    remaining.sort_unstable();
+    for url in remaining {
+        push_tracker(&mut trackers, &mut seen, url, 0);
+    }
+
+    Ok(Json(trackers))
+}
+
+fn push_tracker(
+    trackers: &mut Vec<TorrentTracker>,
+    seen: &mut HashSet<String>,
+    url: &str,
+    tier: usize,
+) {
+    let Ok(url) = url::Url::parse(url) else {
+        return;
+    };
+    let url = url.to_string();
+    if !seen.insert(url.clone()) {
+        return;
+    }
+    trackers.push(TorrentTracker {
+        url,
+        // rqbit does not currently expose per-tracker contact state or swarm statistics.
+        status: 1,
+        tier,
+        num_peers: -1,
+        num_seeds: -1,
+        num_leeches: -1,
+        num_downloaded: -1,
+        msg: String::new(),
+    });
+}
+
 async fn torrent_files(
     State(state): State<ApiState>,
     Query(query): Query<HashQuery>,
@@ -383,6 +491,75 @@ async fn torrent_files(
         })
         .collect();
     Ok(Json(files))
+}
+
+#[derive(Deserialize)]
+struct FilePriorityForm {
+    hash: String,
+    id: String,
+    priority: String,
+}
+
+async fn set_file_priority(
+    State(state): State<ApiState>,
+    Form(form): Form<FilePriorityForm>,
+) -> QbitResult<StatusCode> {
+    let priority = form
+        .priority
+        .parse::<u8>()
+        .map_err(|_| QbitError::bad_request("invalid priority"))?;
+    if !matches!(priority, 0 | 1 | 6 | 7) {
+        return Err(QbitError::bad_request("invalid priority"));
+    }
+    let file_ids = form
+        .id
+        .split('|')
+        .map(|id| {
+            id.parse::<usize>()
+                .map_err(|_| QbitError::bad_request("invalid file id"))
+        })
+        .collect::<QbitResult<HashSet<_>>>()?;
+    if file_ids.is_empty() {
+        return Err(QbitError::bad_request("invalid file id"));
+    }
+
+    let hash = parse_hash(&form.hash)?;
+    let torrent = state
+        .api
+        .session()
+        .get(hash)
+        .ok_or_else(|| QbitError::not_found("torrent not found"))?;
+    let metadata = torrent
+        .metadata
+        .load_full()
+        .ok_or_else(|| QbitError::conflict("torrent metadata is not available"))?;
+    let file_count = metadata.file_infos.len();
+    if file_ids.iter().any(|id| *id >= file_count) {
+        return Err(QbitError::conflict("file id not found"));
+    }
+
+    let mut selected = torrent
+        .only_files()
+        .map(|files| files.into_iter().collect::<HashSet<_>>())
+        .unwrap_or_else(|| (0..file_count).collect());
+    if priority == 0 {
+        selected.retain(|id| !file_ids.contains(id));
+    } else {
+        selected.extend(file_ids);
+    }
+    state
+        .api
+        .session()
+        .update_only_files(&torrent, &selected)
+        .await
+        .map_err(|error| {
+            QbitError::internal(
+                StatusCode::CONFLICT,
+                "failed to update file priority",
+                error,
+            )
+        })?;
+    Ok(StatusCode::OK)
 }
 
 #[derive(Default, Deserialize)]
@@ -886,6 +1063,7 @@ fn validate_category(category: &str) -> QbitResult<()> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         net::{Ipv4Addr, SocketAddr},
         path::Path,
         sync::Arc,
@@ -900,8 +1078,8 @@ mod tests {
         torrent_state_name, unix_time_seconds,
     };
     use crate::{
-        AddTorrent, AddTorrentOptions, Api, CreateTorrentOptions, Session, SessionOptions,
-        SessionPersistenceConfig, TorrentAutomationMetadata, TorrentStatsState,
+        AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, CreateTorrentOptions, Session,
+        SessionOptions, SessionPersistenceConfig, TorrentAutomationMetadata, TorrentStatsState,
         api::TorrentIdOrHash,
         create_torrent,
         http_api::{HttpApi, HttpApiOptions},
@@ -1015,6 +1193,361 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn cleanuparr_lookup_and_file_priority_contract() {
+        let downloads = tempfile::tempdir().unwrap();
+        let fixtures = tempfile::tempdir().unwrap();
+        let complete_source = fixtures.path().join("Cleanuparr Complete");
+        std::fs::create_dir(&complete_source).unwrap();
+        std::fs::write(complete_source.join("movie.mkv"), b"safe media").unwrap();
+        std::fs::write(complete_source.join("payload.exe"), b"dangerous fixture").unwrap();
+        std::fs::write(
+            complete_source.join("payload.scr"),
+            b"dangerous fixture two",
+        )
+        .unwrap();
+        copy_dir_all(
+            &complete_source,
+            &downloads.path().join("Cleanuparr Complete"),
+        );
+        let tracker_url = "https://tracker.invalid/announce";
+        let complete_torrent = create_torrent(
+            &complete_source,
+            CreateTorrentOptions {
+                trackers: vec![tracker_url.to_owned()],
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let complete_hash = complete_torrent.info_hash().as_string();
+
+        let incomplete_source = fixtures.path().join("Cleanuparr Incomplete");
+        std::fs::create_dir(&incomplete_source).unwrap();
+        std::fs::write(incomplete_source.join("missing.mkv"), b"not downloaded").unwrap();
+        let incomplete_torrent = create_torrent(
+            &incomplete_source,
+            CreateTorrentOptions::default(),
+            &BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let incomplete_hash = incomplete_torrent.info_hash().as_string();
+
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let options = || AddTorrentOptions {
+            paused: true,
+            overwrite: true,
+            automation: TorrentAutomationMetadata {
+                category: "sonarr".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let complete_handle = match session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(complete_torrent.as_bytes().unwrap()),
+                Some(options()),
+            )
+            .await
+            .unwrap()
+        {
+            AddTorrentResponse::Added(_, handle) => handle,
+            _ => panic!("complete fixture was not added"),
+        };
+        let incomplete_handle = match session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(incomplete_torrent.as_bytes().unwrap()),
+                Some(options()),
+            )
+            .await
+            .unwrap()
+        {
+            AddTorrentResponse::Added(_, handle) => handle,
+            _ => panic!("incomplete fixture was not added"),
+        };
+        complete_handle.wait_until_initialized().await.unwrap();
+        incomplete_handle.wait_until_initialized().await.unwrap();
+        assert!(complete_handle.stats().finished);
+        assert!(!incomplete_handle.stats().finished);
+
+        let state = Arc::new(HttpApi::new(
+            Api::new(session.clone(), None, None),
+            Some(HttpApiOptions {
+                read_only: false,
+                basic_auth: Some(("cleanuparr".to_owned(), "secret".to_owned())),
+                enable_qbittorrent_api: true,
+                ..Default::default()
+            }),
+        ));
+        let (base, server) = start_server(make_api_router(state)).await;
+        let client = reqwest::Client::new();
+
+        let unauthorized = client
+            .get(format!("{base}/torrents/trackers?hash={complete_hash}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let info: Value = client
+            .get(format!("{base}/torrents/info?hashes={complete_hash}"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(info.as_array().unwrap().len(), 1);
+        assert_eq!(info[0]["hash"], complete_hash);
+
+        let info: Value = client
+            .get(format!(
+                "{base}/torrents/info?hashes={complete_hash}|{incomplete_hash}"
+            ))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let returned_hashes = info
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|torrent| torrent["hash"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            returned_hashes,
+            HashSet::from([complete_hash.as_str(), incomplete_hash.as_str()])
+        );
+
+        let unknown_hash = "0000000000000000000000000000000000000000";
+        let info: Value = client
+            .get(format!("{base}/torrents/info?hashes={unknown_hash}"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(info.as_array().unwrap().is_empty());
+
+        let completed: Value = client
+            .get(format!("{base}/torrents/info?filter=completed"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(completed.as_array().unwrap().len(), 1);
+        assert_eq!(completed[0]["hash"], complete_hash);
+
+        let completed_incomplete_hash: Value = client
+            .get(format!(
+                "{base}/torrents/info?filter=completed&hashes={incomplete_hash}"
+            ))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(completed_incomplete_hash.as_array().unwrap().is_empty());
+
+        let trackers_response = client
+            .get(format!(
+                "{base}/torrents/trackers?hash={}",
+                complete_hash.to_ascii_uppercase()
+            ))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(trackers_response.status(), reqwest::StatusCode::OK);
+        let trackers: Value = trackers_response.json().await.unwrap();
+        assert_eq!(trackers.as_array().unwrap().len(), 1);
+        assert_eq!(trackers[0]["url"], tracker_url);
+        assert_eq!(trackers[0]["status"], 1);
+        assert_eq!(trackers[0]["tier"], 0);
+        assert_eq!(trackers[0]["num_peers"], -1);
+        assert_eq!(trackers[0]["num_seeds"], -1);
+        assert_eq!(trackers[0]["num_leeches"], -1);
+        assert_eq!(trackers[0]["num_downloaded"], -1);
+        assert_eq!(trackers[0]["msg"], "");
+
+        let empty_trackers: Value = client
+            .get(format!("{base}/torrents/trackers?hash={incomplete_hash}"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(empty_trackers.as_array().unwrap().is_empty());
+
+        let missing_trackers = client
+            .get(format!("{base}/torrents/trackers?hash={unknown_hash}"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_trackers.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let properties = client
+            .get(format!("{base}/torrents/properties?hash={complete_hash}"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(properties.status(), reqwest::StatusCode::OK);
+
+        let files_response = client
+            .get(format!("{base}/torrents/files?hash={complete_hash}"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(files_response.status(), reqwest::StatusCode::OK);
+        let files: Value = files_response.json().await.unwrap();
+        let dangerous_ids = files
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|file| {
+                file["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".exe") || name.ends_with(".scr"))
+            })
+            .map(|file| usize::try_from(file["index"].as_u64().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(dangerous_ids.len(), 2);
+        assert!(
+            files
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|file| file["priority"] == 1)
+        );
+
+        let ids = dangerous_ids
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+        let unauthorized = client
+            .post(format!("{base}/torrents/filePrio"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!("hash={complete_hash}&id={ids}&priority=0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let response = client
+            .post(format!("{base}/torrents/filePrio"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!("hash={complete_hash}&id={ids}&priority=0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let files: Value = client
+            .get(format!("{base}/torrents/files?hash={complete_hash}"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        for dangerous_id in &dangerous_ids {
+            let file = files
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|file| file["index"].as_u64() == Some(*dangerous_id as u64))
+                .unwrap();
+            assert_eq!(file["priority"], 0);
+        }
+        let selected = complete_handle
+            .only_files()
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        assert!(dangerous_ids.iter().all(|id| !selected.contains(id)));
+
+        let response = client
+            .post(format!("{base}/torrents/filePrio"))
+            .basic_auth("cleanuparr", Some("secret"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!(
+                "hash={complete_hash}&id={}&priority=6",
+                dangerous_ids[0]
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            complete_handle
+                .only_files()
+                .unwrap()
+                .contains(&dangerous_ids[0])
+        );
+
+        for (body, expected) in [
+            (
+                format!("hash={complete_hash}&id=not-a-number&priority=0"),
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("hash={complete_hash}&id=999&priority=0"),
+                reqwest::StatusCode::CONFLICT,
+            ),
+            (
+                format!("hash={complete_hash}&id=0&priority=2"),
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("hash={unknown_hash}&id=0&priority=0"),
+                reqwest::StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = client
+                .post(format!("{base}/torrents/filePrio"))
+                .basic_auth("cleanuparr", Some("secret"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+
+        server.abort();
     }
 
     #[tokio::test]
