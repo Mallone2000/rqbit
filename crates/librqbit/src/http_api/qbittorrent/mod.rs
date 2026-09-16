@@ -20,7 +20,8 @@ use serde::Deserialize;
 use tracing::warn;
 
 use self::dto::{
-    Category, Preferences, TorrentFile, TorrentInfo, TorrentProperties, TorrentTracker,
+    Category, Preferences, SyncMainData, TorrentFile, TorrentInfo, TorrentProperties,
+    TorrentTracker, TransferInfo,
 };
 use super::HttpApi;
 use crate::{
@@ -91,6 +92,8 @@ pub(super) fn make_api_router(state: ApiState) -> Router {
         .route("/app/webapiVersion", get(web_api_version))
         .route("/app/version", get(app_version))
         .route("/app/preferences", get(preferences))
+        .route("/sync/maindata", get(sync_main_data).post(sync_main_data))
+        .route("/transfer/speedLimitsMode", get(speed_limits_mode))
         .route("/torrents/info", get(torrents_info))
         .route("/torrents/properties", get(torrent_properties))
         .route("/torrents/trackers", get(torrent_trackers))
@@ -170,6 +173,10 @@ async fn torrents_info(
     State(state): State<ApiState>,
     Query(query): Query<InfoQuery>,
 ) -> Json<Vec<TorrentInfo>> {
+    Json(collect_torrent_info(&state, query))
+}
+
+fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> {
     let session = state.api.session();
     let save_path = session.output_folder().to_string_lossy().into_owned();
     let requested_hashes = query.hashes.as_ref().map(|hashes| {
@@ -293,7 +300,45 @@ async fn torrents_info(
             last_activity: 0,
         });
     }
-    Json(torrents)
+    torrents
+}
+
+async fn sync_main_data(State(state): State<ApiState>) -> Json<SyncMainData> {
+    let session = state.api.session();
+    let stats = session.stats_snapshot();
+    let dl_info_data = stats.counters.fetched_bytes;
+    let up_info_data = stats.counters.uploaded_bytes;
+    let limits = session.ratelimits.get_config();
+    let torrents = collect_torrent_info(&state, InfoQuery::default())
+        .into_iter()
+        .map(|torrent| (torrent.hash.clone(), torrent))
+        .collect();
+
+    Json(SyncMainData {
+        // Home Assistant requests a full snapshot with rid=0 on every refresh.
+        // rqbit does not currently retain per-client sync deltas.
+        rid: 1,
+        full_update: true,
+        torrents,
+        categories: collect_categories(&state),
+        server_state: TransferInfo {
+            connection_status: "connected",
+            dl_info_data,
+            dl_info_speed: stats.download_speed.as_bytes(),
+            dl_rate_limit: limits.download_bps.map_or(0, |limit| limit.get()),
+            up_info_data,
+            up_info_speed: stats.upload_speed.as_bytes(),
+            up_rate_limit: limits.upload_bps.map_or(0, |limit| limit.get()),
+            alltime_dl: dl_info_data,
+            alltime_ul: up_info_data,
+            global_ratio: share_ratio(up_info_data, dl_info_data),
+        },
+    })
+}
+
+async fn speed_limits_mode() -> &'static str {
+    // rqbit has one set of session limits, not qBittorrent's alternate-limit profile.
+    "0"
 }
 
 fn share_ratio(uploaded_bytes: u64, downloaded_bytes: u64) -> f64 {
@@ -778,24 +823,26 @@ struct CategoryForm {
 }
 
 async fn categories(State(state): State<ApiState>) -> Json<BTreeMap<String, Category>> {
-    Json(
-        state
-            .api
-            .session()
-            .automation_categories()
-            .into_iter()
-            .map(|category| {
-                let name = category.name;
-                (
-                    name.clone(),
-                    Category {
-                        name,
-                        save_path: String::new(),
-                    },
-                )
-            })
-            .collect(),
-    )
+    Json(collect_categories(&state))
+}
+
+fn collect_categories(state: &ApiState) -> BTreeMap<String, Category> {
+    state
+        .api
+        .session()
+        .automation_categories()
+        .into_iter()
+        .map(|category| {
+            let name = category.name;
+            (
+                name.clone(),
+                Category {
+                    name,
+                    save_path: String::new(),
+                },
+            )
+        })
+        .collect()
 }
 
 async fn create_category(
@@ -1194,6 +1241,67 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn home_assistant_monitoring_endpoints_are_available_and_protected() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (base, server) = start_full_http_api(session, true).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("{base}/sync/maindata"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("rid=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let response = client
+            .post(format!("{base}/sync/maindata"))
+            .basic_auth("test", Some("secret"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("rid=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let main_data: Value = response.json().await.unwrap();
+        assert_eq!(main_data["rid"], 1);
+        assert_eq!(main_data["full_update"], true);
+        assert!(main_data["torrents"].is_object());
+        assert!(main_data["categories"].is_object());
+        assert_eq!(main_data["server_state"]["connection_status"], "connected");
+        assert_eq!(main_data["server_state"]["dl_info_speed"], 0);
+        assert_eq!(main_data["server_state"]["up_info_speed"], 0);
+        assert_eq!(main_data["server_state"]["dl_rate_limit"], 0);
+        assert_eq!(main_data["server_state"]["up_rate_limit"], 0);
+        assert_eq!(main_data["server_state"]["alltime_dl"], 0);
+        assert_eq!(main_data["server_state"]["alltime_ul"], 0);
+        assert_eq!(main_data["server_state"]["global_ratio"], 0.0);
+
+        let response = client
+            .get(format!("{base}/transfer/speedLimitsMode"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "0");
+
+        server.abort();
     }
 
     #[tokio::test]

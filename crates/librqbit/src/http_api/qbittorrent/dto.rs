@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -39,6 +41,29 @@ pub(super) struct TorrentInfo {
     pub seeding_time_limit: i64,
     pub inactive_seeding_time_limit: i64,
     pub last_activity: u64,
+}
+
+#[derive(Serialize)]
+pub(super) struct SyncMainData {
+    pub rid: u32,
+    pub full_update: bool,
+    pub torrents: BTreeMap<String, TorrentInfo>,
+    pub categories: BTreeMap<String, Category>,
+    pub server_state: TransferInfo,
+}
+
+#[derive(Serialize)]
+pub(super) struct TransferInfo {
+    pub connection_status: &'static str,
+    pub dl_info_data: u64,
+    pub dl_info_speed: u64,
+    pub dl_rate_limit: u32,
+    pub up_info_data: u64,
+    pub up_info_speed: u64,
+    pub up_rate_limit: u32,
+    pub alltime_dl: u64,
+    pub alltime_ul: u64,
+    pub global_ratio: f64,
 }
 
 #[derive(Serialize)]
