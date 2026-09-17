@@ -1,6 +1,7 @@
 services:
   rqbit:
-    image: ${RQBIT_IMAGE:?set this to ikatson/rqbit@sha256:<trusted digest>}
+    image: ghcr.io/mallone2000/rqbit:latest
+    pull_policy: always
     # Host network required for several things to work:
     # - upnp discovery for port forwarding to your router
     # - upnp UDP multicast announce MediaServer

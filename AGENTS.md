@@ -2,6 +2,8 @@
 
 Instructions for coding agents working in this repository.
 
+Keep this document as a regular tracked file, not a symbolic link, so CI can check out the repository on Linux runners.
+
 This repository is a fork of `ikatson/rqbit` with additional support for automated media stacks, including Servarr-compatible qBittorrent API behavior, automation metadata, authentication, and additional persistence behavior.
 
 Read the existing implementation before making assumptions based on upstream rqbit or qBittorrent.

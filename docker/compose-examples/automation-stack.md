@@ -16,16 +16,29 @@ HTTPS reverse proxy or another trusted encrypted access layer in front of them.
 rqbit refuses to start the qBittorrent compatibility API unless a non-empty
 `RQBIT_HTTP_BASIC_AUTH_USERPASS` value is configured.
 
-Use reviewed container image references pinned by digest (`name@sha256:...`).
-Do not use a mutable `latest` fallback.
+The Compose example uses `ghcr.io/mallone2000/rqbit:latest`. A successful build
+of the `main` branch publishes that rolling multi-architecture image. Update an
+existing deployment without building or transferring an archive:
 
-On Windows, build and export a deployable Linux image from the repository root:
+```sh
+docker compose pull rqbit
+docker compose up -d rqbit
+```
+
+After the first workflow publish, set the GHCR package visibility to **Public**
+once so the deployment can pull it without registry credentials.
+
+The `latest` tag intentionally follows `main`. Pin the image by digest instead
+when deployments must not change until explicitly updated.
+
+For local development or an unpublished revision, Windows users can still build
+and export a Linux image from the repository root:
 
 ```powershell
 .\scripts\build-docker-image.ps1
 ```
 
-The default output is `rqbit:test` plus a timestamped
+The local build's default output is `rqbit:test` plus a timestamped
 `target/rqbit-linux-amd64-*.tar` archive. Use `-Platform linux/arm64` for an
 ARM64 server, or `-Image` and `-Archive` to override the defaults.
 
@@ -39,17 +52,17 @@ numeric UID/GID first.
 
 Add the built-in **qBittorrent** download client in each application:
 
-| Setting | Sonarr | Radarr |
-| --- | --- | --- |
-| Host | `127.0.0.1` | `127.0.0.1` |
-| Port | `3030` | `3030` |
-| Use SSL | off | off |
-| Username/password | `RQBIT_USER` / `RQBIT_PASSWORD` | same |
-| Category | `sonarr` | `radarr` |
-| Initial state | Start | Start |
-| Content layout | Original | Original |
-| Sequential order | off | off |
-| First and last pieces first | off | off |
+| Setting                     | Sonarr                          | Radarr      |
+| --------------------------- | ------------------------------- | ----------- |
+| Host                        | `127.0.0.1`                     | `127.0.0.1` |
+| Port                        | `3030`                          | `3030`      |
+| Use SSL                     | off                             | off         |
+| Username/password           | `RQBIT_USER` / `RQBIT_PASSWORD` | same        |
+| Category                    | `sonarr`                        | `radarr`    |
+| Initial state               | Start                           | Start       |
+| Content layout              | Original                        | Original    |
+| Sequential order            | off                             | off         |
+| First and last pieces first | off                             | off         |
 
 Create the `sonarr` and `radarr` categories through each client's **Test** flow.
 Categories inherit rqbit's global download directory; they do not move content.

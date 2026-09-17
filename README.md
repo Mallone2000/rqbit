@@ -133,9 +133,27 @@ cargo tauri build
 
 ## Docker
 
-The repository contains Docker build files and deployment guidance. The [automation stack deployment guide](docker/compose-examples/automation-stack.md) includes a script to build a local Linux image and a Gluetun topology that keeps application ports loopback-only on the Docker host.
+The repository publishes `ghcr.io/mallone2000/rqbit:latest` from successful
+builds of `main`. The image supports `linux/amd64`, `linux/arm64`, and
+`linux/arm/v7`. Start the included example with:
 
-Pin deployed images by digest and verify that the selected image was built from a revision that contains the qBittorrent compatibility layer. Do not assume an upstream rqbit image includes fork features.
+```sh
+docker compose -f docker/compose-examples/server.yaml pull
+RQBIT_USER=admin RQBIT_PASSWORD='change-me' \
+  docker compose -f docker/compose-examples/server.yaml up -d
+```
+
+After the first workflow publish, set the GHCR package visibility to **Public**
+once so Docker hosts can pull it without registry credentials. Subsequent
+successful `main` builds update the same tag automatically, and the example's
+`pull_policy: always` checks for that update whenever it starts.
+
+The rolling `latest` tag is convenient for tracking `main`; pin a reviewed
+digest when deployments require controlled updates. The [automation stack
+deployment guide](docker/compose-examples/automation-stack.md) documents the
+Gluetun topology and local-build fallback. Do not substitute the upstream
+`ikatson/rqbit` image because it may not contain this fork's compatibility
+features.
 
 ## Native HTTP API
 
