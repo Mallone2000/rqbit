@@ -62,7 +62,7 @@ impl IpRanges {
         self.v4.len + self.v6.len
     }
 
-    pub async fn load_from_url(url: &str) -> Result<Self> {
+    pub async fn load_from_url(client: &reqwest::Client, url: &str) -> Result<Self> {
         let parsed_url = Url::parse(url).context("failed to parse URL")?;
 
         if parsed_url.scheme() == "file" {
@@ -73,7 +73,9 @@ impl IpRanges {
             return Self::load_from_file(path).await;
         }
 
-        let response = reqwest::get(parsed_url)
+        let response = client
+            .get(parsed_url)
+            .send()
             .await
             .map_err(reqwest::Error::without_url)
             .context("error fetching list")?;
@@ -218,7 +220,7 @@ mod tests {
 
     use super::*;
     use async_compression::tokio::write::GzipEncoder;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     const LIST: &[u8] = br#"
     # test
@@ -312,11 +314,54 @@ mod tests {
         assert!(!list.has("2001:db9::1".parse().unwrap()));
     }
 
+    #[tokio::test]
+    async fn load_from_url_uses_supplied_proxy() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let proxy_url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut request = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if request.read_line(&mut line).await? == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut stream = request.into_inner();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        LIST.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            stream.write_all(LIST).await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(&proxy_url)?)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let list = IpRanges::load_from_url(&client, "http://example.invalid/blocklist").await?;
+        server.await??;
+
+        assert!(list.has("192.168.1.1".parse()?));
+        Ok(())
+    }
+
     #[ignore]
     #[tokio::test]
     async fn test_list_real_url() {
         setup_test_logging();
-        let _ = IpRanges::load_from_url("https://raw.githubusercontent.com/Naunter/BT_BlockLists/refs/heads/master/bt_blocklists.gz")
+        let client = reqwest::Client::new();
+        let _ = IpRanges::load_from_url(&client, "https://raw.githubusercontent.com/Naunter/BT_BlockLists/refs/heads/master/bt_blocklists.gz")
             .await
             .unwrap();
     }
