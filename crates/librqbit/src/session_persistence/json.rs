@@ -1,7 +1,8 @@
 use std::{
     any::TypeId,
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    io::ErrorKind,
+    path::{Path, PathBuf},
 };
 
 use crate::{
@@ -47,6 +48,14 @@ impl std::fmt::Debug for JsonSessionPersistenceStore {
 }
 
 impl JsonSessionPersistenceStore {
+    async fn remove_file_if_present(filename: &Path) -> std::io::Result<()> {
+        match tokio::fs::remove_file(filename).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn new(output_folder: PathBuf, spawner: BlockingSpawner) -> anyhow::Result<Self> {
         let db_filename = output_folder.join("session.json");
         tokio::fs::create_dir_all(&output_folder)
@@ -221,7 +230,7 @@ impl BitVFactory for JsonSessionPersistenceStore {
     async fn clear(&self, id: TorrentIdOrHash) -> anyhow::Result<()> {
         let h = self.to_hash(id).await?;
         let filename = self.bitv_filename(&h);
-        tokio::fs::remove_file(&filename)
+        Self::remove_file_if_present(&filename)
             .await
             .with_context(|| format!("error removing {filename:?}"))
     }
@@ -285,10 +294,10 @@ impl SessionPersistenceStore for JsonSessionPersistenceStore {
                 self.torrent_bytes_filename(&t.info_hash),
                 self.bitv_filename(&t.info_hash),
             ] {
-                if let Err(e) = tokio::fs::remove_file(&tf).await {
+                if let Err(e) = Self::remove_file_if_present(&tf).await {
                     warn!(error=?e, filename=?tf, "error removing");
                 } else {
-                    debug!(filename=?tf, "removed");
+                    debug!(filename=?tf, "persistence file cleaned up");
                 }
             }
         } else {
@@ -406,11 +415,47 @@ impl SessionPersistenceStore for JsonSessionPersistenceStore {
 
 #[cfg(test)]
 mod tests {
-    use super::SerializedSessionDatabase;
+    use super::{JsonSessionPersistenceStore, SerializedSessionDatabase};
+    use crate::{
+        api::TorrentIdOrHash, bitv_factory::BitVFactory,
+        session_persistence::SessionPersistenceStore, spawn_utils::BlockingSpawner,
+    };
 
     #[test]
     fn old_session_json_defaults_automation_categories() {
         let db: SerializedSessionDatabase = serde_json::from_str(r#"{"torrents":{}}"#).unwrap();
         assert!(db.automation_categories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_torrent_without_optional_files_persists_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonSessionPersistenceStore::new(
+            directory.path().to_path_buf(),
+            BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let torrent = serde_json::from_str(
+            r#"{"info_hash":"0000000000000000000000000000000000000000","trackers":[],"output_folder":".","only_files":null,"is_paused":false}"#,
+        )
+        .unwrap();
+        store.db_content.write().await.torrents.insert(0, torrent);
+        store.flush().await.unwrap();
+
+        store
+            .clear(TorrentIdOrHash::Id(0))
+            .await
+            .expect("a missing bitfield can be cleared");
+        store.delete(0).await.unwrap();
+        assert!(store.get(0).await.is_err());
+
+        let restored = JsonSessionPersistenceStore::new(
+            directory.path().to_path_buf(),
+            BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        assert!(restored.get(0).await.is_err());
     }
 }

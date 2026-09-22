@@ -1074,12 +1074,13 @@ async fn start_http_api(
                 let upnp_fut = srv.run_ssdp_forever();
 
                 tokio::select! {
+                    _ = cancel.cancelled() => Ok(()),
                     r = http_api_fut => r,
                     r = upnp_fut => r
                 }
             }
             None => tokio::select! {
-                _ = cancel.cancelled() => bail!("cancelled"),
+                _ = cancel.cancelled() => Ok(()),
                 r = http_api_fut => r,
             },
         };
