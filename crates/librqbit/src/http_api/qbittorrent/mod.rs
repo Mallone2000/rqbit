@@ -612,9 +612,12 @@ async fn set_file_priority(
 struct AddForm {
     urls: Option<String>,
     category: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_form_bool")]
     paused: Option<bool>,
     content_layout: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_form_bool")]
     sequential_download: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_form_bool")]
     first_last_piece_prio: Option<bool>,
     ratio_limit: Option<f64>,
     seeding_time_limit: Option<i64>,
@@ -777,6 +780,17 @@ fn parse_bool(value: &str) -> QbitResult<bool> {
         "false" | "0" => Ok(false),
         _ => Err(QbitError::bad_request("invalid boolean")),
     }
+}
+
+fn deserialize_form_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Servarr sends capitalized booleans; match the multipart parser for URL-encoded forms.
+    let value = String::deserialize(deserializer)?;
+    parse_bool(&value)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(error.message))
 }
 
 fn validate_add_form(form: &AddForm) -> QbitResult<()> {
@@ -2599,6 +2613,107 @@ mod tests {
 
         session.stop().await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn add_form_booleans_match_across_encodings() {
+        let downloads = tempfile::tempdir().unwrap();
+        let (tracker_url, tracker) = start_empty_tracker().await;
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (base, server) = start_full_http_api(session.clone(), true).await;
+        let client = reqwest::Client::new();
+        let info_hash = "0303030303030303030303030303030303030303";
+        let magnet =
+            format!("magnet:?xt=urn:btih:{info_hash}&dn=Boolean%20Fixture&tr={tracker_url}");
+
+        for multipart in [false, true] {
+            for field in ["paused", "sequentialDownload", "firstLastPiecePrio"] {
+                for (value, parsed) in [
+                    ("false", Some(false)),
+                    ("False", Some(false)),
+                    ("FALSE", Some(false)),
+                    ("0", Some(false)),
+                    ("true", Some(true)),
+                    ("True", Some(true)),
+                    ("TRUE", Some(true)),
+                    ("1", Some(true)),
+                    ("", None),
+                    ("yes", None),
+                    ("2", None),
+                ] {
+                    let fields = [("urls", magnet.as_str()), (field, value)];
+                    let boundary = "rqbit-boolean-boundary";
+                    let (content_type, body) = if multipart {
+                        let mut body = String::new();
+                        for (name, value) in fields {
+                            body.push_str(&format!(
+                                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                            ));
+                        }
+                        body.push_str(&format!("--{boundary}--\r\n"));
+                        (format!("multipart/form-data; boundary={boundary}"), body)
+                    } else {
+                        (
+                            "application/x-www-form-urlencoded".to_owned(),
+                            serde_urlencoded::to_string(fields).unwrap(),
+                        )
+                    };
+                    let request = client
+                        .post(format!("{base}/torrents/add"))
+                        .header("Content-Type", content_type)
+                        .body(body);
+                    let unauthorized = request.try_clone().unwrap().send().await.unwrap();
+                    assert_eq!(unauthorized.status(), reqwest::StatusCode::FORBIDDEN);
+                    let response = request
+                        .basic_auth("test", Some("secret"))
+                        .send()
+                        .await
+                        .unwrap();
+                    let expected = match parsed {
+                        None => reqwest::StatusCode::BAD_REQUEST,
+                        Some(true) if field != "paused" => reqwest::StatusCode::CONFLICT,
+                        _ => reqwest::StatusCode::OK,
+                    };
+                    assert_eq!(
+                        response.status(),
+                        expected,
+                        "multipart={multipart}, {field}={value}"
+                    );
+                    if expected == reqwest::StatusCode::OK {
+                        assert_eq!(response.text().await.unwrap(), "");
+                        let torrents: Value = client
+                            .get(format!("{base}/torrents/info"))
+                            .basic_auth("test", Some("secret"))
+                            .send()
+                            .await
+                            .unwrap()
+                            .json()
+                            .await
+                            .unwrap();
+                        assert_eq!(torrents[0]["hash"], info_hash);
+                        assert_eq!(torrents[0]["state"], "metaDL");
+                        assert!(
+                            session.forget_pending_automation_torrent(info_hash.parse().unwrap())
+                        );
+                    } else {
+                        assert!(session.pending_automation_torrents().is_empty());
+                    }
+                }
+            }
+        }
+        session.stop().await;
+        server.abort();
+        tracker.abort();
     }
 
     #[tokio::test]

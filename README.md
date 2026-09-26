@@ -56,6 +56,8 @@ RQBIT_HTTP_API_LISTEN_ADDR=0.0.0.0:3030 \
 
 Connect clients using the qBittorrent Web API with the same host, port, and credentials. Categories retain rqbit's global download directory rather than moving content.
 
+Torrent-add boolean fields (`paused`, `sequentialDownload`, and `firstLastPiecePrio`) accept case-insensitive `true`/`false` and `1`/`0` in both URL-encoded and multipart forms, including Radarr's `True`/`False` values. Invalid boolean values are rejected.
+
 This is not a full qBittorrent replacement. Queue ordering, sequential downloading, first/last-piece priority, and inactive-seeding-time limits are intentionally unsupported and fail explicitly.
 
 For a production-oriented Gluetun, Sonarr, and Radarr configuration with shared `/data` paths and hardlinks, use the [automation stack deployment guide](docker/compose-examples/automation-stack.md).
