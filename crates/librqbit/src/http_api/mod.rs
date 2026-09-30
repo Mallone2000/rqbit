@@ -233,9 +233,8 @@ impl HttpApi {
             }
             .boxed();
         }
-        let enforce_loopback_host = !self.opts.read_only
-            && listener.bind_addr().ip().is_loopback()
-            && !credentials_configured;
+        let enforce_loopback_host =
+            listener.bind_addr().ip().is_loopback() && !credentials_configured;
         if self.opts.enable_qbittorrent_api && !credentials_configured {
             return async {
                 anyhow::bail!(
@@ -358,9 +357,8 @@ impl HttpApi {
             main_router = main_router.nest("/upnp", upnp_router);
         }
 
-        // An unauthenticated loopback API otherwise remains reachable through
-        // DNS rebinding, where an attacker-controlled hostname resolves to
-        // 127.0.0.1 and makes Origin and Host appear to match.
+        // An unauthenticated loopback API, including a read-only one, remains
+        // reachable through DNS rebinding without a Host check.
         if enforce_loopback_host {
             main_router = main_router.layer(axum::middleware::from_fn(require_loopback_host));
         }
@@ -522,6 +520,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn read_only_loopback_api_rejects_dns_rebinding_and_log_changes() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+        let address = listener.bind_addr();
+        let server = HttpApi::new(
+            Api::new(session, None, None),
+            Some(HttpApiOptions {
+                read_only: true,
+                ..Default::default()
+            }),
+        )
+        .make_http_api_and_run(listener, None);
+        let task = tokio::spawn(async move { server.await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!("http://{address}/torrents"))
+            .header("Host", "attacker.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let response = client
+            .get(format!("http://{address}/torrents"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let response = client
+            .post(format!("http://{address}/rust_log"))
+            .body("trace")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
         task.abort();
     }
 

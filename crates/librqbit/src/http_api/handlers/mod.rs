@@ -66,7 +66,7 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
             "POST /torrents/{id_or_infohash}/delete": "Forget about the torrent, remove the files",
             "POST /torrents/{id_or_infohash}/add_peers": "Add peers (newline-delimited)",
             "POST /torrents/{id_or_infohash}/update_only_files": "Change the selection of files to download. You need to POST json of the following form {\"only_files\": [0, 1, 2]}",
-            "POST /rust_log": "Set RUST_LOG to this post launch (for debugging)",
+            "POST /rust_log": "Set RUST_LOG on a writable server (for debugging)",
         },
         "server": "rqbit",
         "version": env!("CARGO_PKG_VERSION"),
@@ -106,7 +106,6 @@ pub fn make_api_router(state: ApiState) -> Router {
         .route("/torrents/limits", get(configure::h_get_session_ratelimits));
 
     let utility_post_router = Router::new()
-        .route("/rust_log", post(logging::h_set_rust_log))
         .route("/torrents/resolve_magnet", post(other::h_resolve_magnet))
         .route_layer(middleware::from_fn(
             super::qbittorrent::auth::require_same_origin,
@@ -115,6 +114,7 @@ pub fn make_api_router(state: ApiState) -> Router {
 
     if !state.opts.read_only {
         let write_router = Router::new()
+            .route("/rust_log", post(logging::h_set_rust_log))
             .route("/torrents", post(torrents::h_torrents_post))
             .route(
                 "/torrents/limits",

@@ -41,6 +41,8 @@ RQBIT_HTTP_BASIC_AUTH_USERPASS='username:password' \
 
 Basic authentication protects access but does not encrypt traffic. Do not expose the HTTP listener directly to an untrusted network.
 
+Unauthenticated loopback listeners accept only local Host names, including in read-only mode, to prevent browser DNS rebinding from reading API data. The `/rust_log` endpoint is available only on writable servers. Torrent downloads reject symlinks beneath their output directory so an existing link cannot redirect writes outside it; choose a separate output directory if you need to keep linked files there.
+
 The web UI supports authenticated login and logout. It provides torrent management, streaming, log viewing, settings, category management, and the server's public IP address. After the UI is authenticated, rqbit obtains that address through an outbound HTTPS request to `api64.ipify.org`; if the lookup is unavailable, the UI continues without displaying it.
 
 ## qBittorrent Web API compatibility
