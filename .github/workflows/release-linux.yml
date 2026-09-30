@@ -189,6 +189,34 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      - name: Smoke test image as a non-root user
+        run: |
+          docker build --platform linux/amd64 -f docker/Dockerfile -t rqbit:nonroot-smoke target/cross/
+          test_dir=$(mktemp -d)
+          trap 'sudo rm -rf "$test_dir"' EXIT
+          mkdir -p "$test_dir/db" "$test_dir/cache" "$test_dir/downloads"
+          sudo chown -R 1001:1000 "$test_dir"
+          container=$(docker run --rm -d --user 1001:1000 \
+            -e RQBIT_HTTP_BASIC_AUTH_USERPASS=smoke:test \
+            -p 127.0.0.1::3030 \
+            -v "$test_dir/db:/home/rqbit/db" \
+            -v "$test_dir/cache:/home/rqbit/cache" \
+            -v "$test_dir/downloads:/data" \
+            rqbit:nonroot-smoke server start /data)
+          trap 'docker logs "$container" || true; docker rm -f "$container" || true; sudo rm -rf "$test_dir"' EXIT
+          port=$(docker port "$container" 3030/tcp | awk -F: 'END { print $NF }')
+          for attempt in {1..30}; do
+            if curl --silent --show-error --fail --output /dev/null \
+              --user smoke:test "http://127.0.0.1:$port/torrents"; then
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "$container")" != true ]; then
+              exit 1
+            fi
+            sleep 1
+          done
+          exit 1
+
       - name: Login to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
