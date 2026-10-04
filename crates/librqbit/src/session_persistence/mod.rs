@@ -69,9 +69,51 @@ impl SerializedTorrent {
     }
 }
 
+/// Durable submission for an automation magnet whose metadata is not available yet.
+/// The payload can contain private tracker credentials and must never be logged.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SerializedPendingTorrent {
+    #[serde(
+        serialize_with = "serialize_info_hash",
+        deserialize_with = "deserialize_info_hash"
+    )]
+    pub(crate) info_hash: Id20,
+    pub(crate) magnet_url: String,
+    pub(crate) options: serde_json::Value,
+    #[serde(default)]
+    pub(crate) paused: bool,
+    #[serde(default)]
+    pub(crate) state: crate::session::PendingAutomationTorrentState,
+    #[serde(default)]
+    pub(crate) metadata_attempts: u32,
+    #[serde(default)]
+    pub(crate) last_error: Option<crate::session::PendingAutomationError>,
+    #[serde(default)]
+    pub(crate) next_retry_at_unix_seconds: Option<u64>,
+}
+
+impl SerializedPendingTorrent {
+    pub fn info_hash(&self) -> &Id20 {
+        &self.info_hash
+    }
+}
+
+impl std::fmt::Debug for SerializedPendingTorrent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SerializedPendingTorrent")
+            .field("info_hash", &self.info_hash)
+            .field("paused", &self.paused)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
 // TODO: make this info_hash first, ID-second.
 #[async_trait]
 pub trait SessionPersistenceStore: core::fmt::Debug + Send + Sync + BitVFactory {
+    async fn load_pending(&self) -> anyhow::Result<Vec<SerializedPendingTorrent>>;
+    async fn store_pending(&self, torrent: &SerializedPendingTorrent) -> anyhow::Result<()>;
+    async fn delete_pending(&self, info_hash: Id20) -> anyhow::Result<()>;
     async fn next_id(&self) -> anyhow::Result<TorrentId>;
     async fn store(&self, id: TorrentId, torrent: &ManagedTorrentHandle) -> anyhow::Result<()>;
     async fn delete(&self, id: TorrentId) -> anyhow::Result<()>;

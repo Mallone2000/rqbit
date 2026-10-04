@@ -10,7 +10,7 @@ use librqbit_core::{Id20, spawn_utils::spawn};
 use sqlx::{Pool, Postgres};
 use tracing::debug_span;
 
-use super::{SerializedTorrent, SessionPersistenceStore};
+use super::{SerializedPendingTorrent, SerializedTorrent, SessionPersistenceStore};
 
 #[derive(Debug)]
 pub struct PostgresSessionStorage {
@@ -87,12 +87,50 @@ impl PostgresSessionStorage {
         );
         exec!("CREATE TABLE IF NOT EXISTS automation_categories (name TEXT PRIMARY KEY)");
 
+        exec!(
+            "CREATE TABLE IF NOT EXISTS pending_torrents (info_hash BYTEA PRIMARY KEY, submission TEXT NOT NULL)"
+        );
         Ok(Self { pool })
     }
 }
 
 #[async_trait::async_trait]
 impl SessionPersistenceStore for PostgresSessionStorage {
+    async fn load_pending(&self) -> anyhow::Result<Vec<SerializedPendingTorrent>> {
+        let rows: Vec<(Vec<u8>, String)> =
+            sqlx::query_as("SELECT info_hash, submission FROM pending_torrents")
+                .fetch_all(&self.pool)
+                .await
+                .context("error loading pending torrents")?;
+        rows.into_iter()
+            .map(|(hash, payload)| {
+                let record: SerializedPendingTorrent =
+                    serde_json::from_str(&payload).context("invalid pending torrent record")?;
+                anyhow::ensure!(
+                    record.info_hash.0.as_slice() == hash.as_slice(),
+                    "pending torrent identity mismatch"
+                );
+                Ok(record)
+            })
+            .collect()
+    }
+
+    async fn store_pending(&self, torrent: &SerializedPendingTorrent) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO pending_torrents (info_hash, submission) VALUES ($1, $2) ON CONFLICT (info_hash) DO UPDATE SET submission = EXCLUDED.submission")
+            .bind(&torrent.info_hash.0[..]).bind(serde_json::to_string(torrent)?)
+            .execute(&self.pool).await.context("error storing pending torrent")?;
+        Ok(())
+    }
+
+    async fn delete_pending(&self, info_hash: Id20) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM pending_torrents WHERE info_hash = $1")
+            .bind(&info_hash.0[..])
+            .execute(&self.pool)
+            .await
+            .context("error deleting pending torrent")?;
+        Ok(())
+    }
+
     async fn next_id(&self) -> anyhow::Result<TorrentId> {
         let (id,): (i32,) = sqlx::query_as("SELECT nextval('torrents_id')::int")
             .fetch_one(&self.pool)
@@ -108,10 +146,11 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
+        let mut transaction = self.pool.begin().await?;
         let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, automation_metadata)
         VALUES($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT(id) DO NOTHING";
-        sqlx::query(q)
+        ON CONFLICT(id) DO UPDATE SET id = EXCLUDED.id WHERE torrents.info_hash = EXCLUDED.info_hash";
+        let inserted = sqlx::query(q)
             .bind::<i32>(id.try_into()?)
             .bind(&torrent.info_hash().0[..])
             .bind(torrent_bytes.as_ref())
@@ -139,9 +178,21 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             }))
             .bind(torrent.is_paused())
             .bind(serde_json::to_string(&torrent.automation_metadata())?)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .context("error executing INSERT INTO torrents")?;
+        anyhow::ensure!(
+            inserted.rows_affected() == 1,
+            "torrent ID is already in use"
+        );
+        sqlx::query("DELETE FROM pending_torrents WHERE info_hash = $1")
+            .bind(&torrent.info_hash().0[..])
+            .execute(&mut *transaction)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .context("error committing torrent registration")?;
         Ok(())
     }
 

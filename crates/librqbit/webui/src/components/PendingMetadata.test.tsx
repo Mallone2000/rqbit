@@ -1,3 +1,5 @@
+import { useContext, type ReactNode } from "react";
+import { APIContext } from "../context";
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { PendingTorrent } from "../api-types";
@@ -14,6 +16,15 @@ const fixture: PendingTorrent = {
     "Metadata discovery timed out; retrying. This does not establish corruption.",
   next_retry_at_unix_seconds: 12345,
 };
+
+function WithActions({ children }: { children: ReactNode }) {
+  const API = useContext(APIContext);
+  return (
+    <APIContext.Provider value={{ ...API, pendingAction: async () => {} }}>
+      {children}
+    </APIContext.Provider>
+  );
+}
 
 describe("pending metadata diagnostics", () => {
   it("does not show an empty panel", () => {
@@ -50,5 +61,44 @@ describe("pending metadata diagnostics", () => {
     expect(html).toContain("Could not add torrent");
     expect(html).toContain("Check free space and permissions");
     expect(html).not.toContain("Next retry:");
+  });
+  it("offers pause and file-preserving removal while discovery is active", () => {
+    const html = renderToStaticMarkup(
+      <WithActions>
+        <PendingMetadata torrents={[fixture]} />
+      </WithActions>,
+    );
+    expect(html).toContain(">Pause</button>");
+    expect(html).toContain("Remove, keep files");
+  });
+
+  it("shows paused discovery as stopped and offers resume", () => {
+    const html = renderToStaticMarkup(
+      <WithActions>
+        <PendingMetadata
+          torrents={[
+            { ...fixture, state: "paused", next_retry_at_unix_seconds: null },
+          ]}
+        />
+      </WithActions>,
+    );
+    expect(html).toContain("Paused while waiting for metadata");
+    expect(html).toContain("stopped until you resume");
+    expect(html).toContain(">Resume</button>");
+    expect(html).not.toContain("retrying");
+    expect(html).not.toContain("Next retry:");
+  });
+
+  it("allows retrying a fatal pending submission", () => {
+    const html = renderToStaticMarkup(
+      <WithActions>
+        <PendingMetadata
+          torrents={[
+            { ...fixture, state: "error", next_retry_at_unix_seconds: null },
+          ]}
+        />
+      </WithActions>,
+    );
+    expect(html).toContain(">Retry</button>");
   });
 });

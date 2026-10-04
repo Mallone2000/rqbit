@@ -50,7 +50,7 @@ export interface PendingTorrent {
   info_hash: string;
   name: string | null;
   category: string;
-  state: "resolving_metadata" | "error";
+  state: "resolving_metadata" | "paused" | "error";
   metadata_attempts: number;
   error_code:
     | "metadata_timeout"
@@ -290,6 +290,10 @@ export interface RqbitAPI {
     opts?: AddTorrentOptions,
   ) => Promise<AddTorrentResponse>;
 
+  pendingAction?: (
+    hash: string,
+    action: "pause" | "start" | "forget",
+  ) => Promise<void>;
   pause: (index: number) => Promise<void>;
   updateOnlyFiles: (index: number, files: number[]) => Promise<void>;
   start: (index: number) => Promise<void>;

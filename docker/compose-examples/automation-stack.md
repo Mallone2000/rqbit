@@ -92,9 +92,19 @@ torrent by pausing it. Inactive-seeding-time limits, sequential downloading,
 first/last-piece priority, and queue reordering are intentionally unsupported;
 requests for those behaviors fail explicitly.
 
-Unresolved magnets are visible immediately as `metaDL`, but unresolved pending
-entries are currently in-memory only. A daemon restart during metadata lookup
-requires the sender to submit the magnet again.
+Unresolved magnets are visible immediately as `metaDL`; paused metadata jobs
+report `pausedDL`. Pending submissions, pause state, settings, and retry
+diagnostics survive daemon restarts when JSON/file or PostgreSQL session
+persistence is enabled. The mounted state directory/database must remain
+available. The Web UI and hash-based API routes can pause, resume/retry, or
+remove pending jobs while keeping existing files.
+
+Back up rqbit state before upgrading. The new pending collection/table is
+additive, but do not share writable state between different versions. Protect
+state and backups because saved magnets can contain private tracker credentials.
+Before downgrading, preserve pending submissions: an older JSON writer discards
+the new collection; an older PostgreSQL build retains the table but cannot
+manage those jobs. See the [pending persistence and rollback notes](../../README.md#qbittorrent-web-api-compatibility).
 
 NordVPN's ordinary servers do not provide inbound port forwarding. rqbit still
 uses trackers, DHT, and outbound peer connections through Gluetun, but peer

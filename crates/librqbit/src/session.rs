@@ -26,7 +26,9 @@ use crate::{
     merge_streams::merge_streams,
     peer_connection::PeerConnectionOptions,
     read_buf::ReadBuf,
-    session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
+    session_persistence::{
+        SerializedPendingTorrent, SessionPersistenceStore, json::JsonSessionPersistenceStore,
+    },
     session_stats::SessionStats,
     spawn_utils::BlockingSpawner,
     storage::{
@@ -123,14 +125,15 @@ pub struct SessionDatabase {
     pending_automation_torrents: HashMap<Id20, PendingAutomationTorrent>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PendingAutomationTorrentState {
+    #[default]
     ResolvingMetadata,
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PendingAutomationError {
     #[error(
@@ -172,6 +175,8 @@ impl PendingAutomationError {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PendingAutomationTorrent {
+    submission: Arc<SerializedPendingTorrent>,
+    pub paused: bool,
     pub info_hash: Id20,
     pub name: Option<String>,
     pub automation: TorrentAutomationMetadata,
@@ -181,6 +186,20 @@ pub(crate) struct PendingAutomationTorrent {
     pub next_retry_at_unix_seconds: Option<u64>,
     generation: Arc<()>,
     cancellation_token: CancellationToken,
+}
+
+impl PendingAutomationTorrent {
+    fn serialized(&self) -> anyhow::Result<SerializedPendingTorrent> {
+        let mut record = (*self.submission).clone();
+        record.options["paused"] = self.paused.into();
+        record.options["automation"] = serde_json::to_value(&self.automation)?;
+        record.paused = self.paused;
+        record.state = self.state.clone();
+        record.metadata_attempts = self.metadata_attempts;
+        record.last_error = self.last_error;
+        record.next_retry_at_unix_seconds = self.next_retry_at_unix_seconds;
+        Ok(record)
+    }
 }
 
 impl SessionDatabase {
@@ -222,6 +241,7 @@ pub struct Session {
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pending_automation_resolution_semaphore: Arc<tokio::sync::Semaphore>,
+    pending_automation_mutations: tokio::sync::Mutex<()>,
     pub ratelimits: Limits,
 
     pub blocklist: IpRanges,
@@ -742,12 +762,18 @@ impl Session {
                 .await?;
         }
 
-        {
-            let mut db = self.db.write();
-            for pending in db.pending_automation_torrents.values_mut() {
-                if pending.automation.category == name {
-                    pending.automation.category.clear();
-                }
+        for pending in self.pending_automation_torrents() {
+            if pending.automation.category == name
+                && !self
+                    .set_pending_automation_category(pending.info_hash, String::new())
+                    .await?
+                && self.get(TorrentIdOrHash::Hash(pending.info_hash)).is_some()
+            {
+                self.set_torrent_automation_category(
+                    TorrentIdOrHash::Hash(pending.info_hash),
+                    String::new(),
+                )
+                .await?;
             }
         }
 
@@ -1032,6 +1058,7 @@ impl Session {
                 concurrent_initialize_semaphore: Arc::new(tokio::sync::Semaphore::new(
                     opts.concurrent_init_limit.unwrap_or(3),
                 )),
+                pending_automation_mutations: tokio::sync::Mutex::new(()),
                 pending_automation_resolution_semaphore: Arc::new(tokio::sync::Semaphore::new(
                     MAX_CONCURRENT_AUTOMATION_RESOLUTIONS,
                 )),
@@ -1136,6 +1163,16 @@ impl Session {
                             };
                         }
                     };
+                }
+            }
+
+            if let Some(persistence) = session.persistence.as_ref() {
+                for record in persistence.load_pending().await? {
+                    if session.get(TorrentIdOrHash::Hash(record.info_hash)).is_some() {
+                        persistence.delete_pending(record.info_hash).await?;
+                        continue;
+                    }
+                    session.register_pending_automation(record, false).await?;
                 }
             }
 
@@ -1341,158 +1378,366 @@ impl Session {
             .collect()
     }
 
-    /// Register a magnet immediately, then resolve its metadata in the session task set.
-    /// Returns false when the hash is already managed or already pending.
-    pub(crate) fn add_pending_automation_magnet(
+    /// Persist an accepted magnet before acknowledging it, then resolve asynchronously.
+    pub(crate) async fn add_pending_automation_magnet(
         self: &Arc<Self>,
         magnet_url: String,
-        opts: AddTorrentOptions,
+        mut opts: AddTorrentOptions,
     ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            !opts.list_only,
+            "pending automation magnets cannot be list-only"
+        );
+        anyhow::ensure!(
+            opts.storage_factory.is_none(),
+            "pending automation magnets require serializable storage options"
+        );
         let magnet = Magnet::parse(&magnet_url).context("provided URL is not a valid magnet")?;
         let info_hash = magnet
             .as_id20()
             .context("magnet link didn't contain a BTv1 infohash")?;
-        let cancellation_token = self.cancellation_token.child_token();
-        let generation = Arc::new(());
+        if opts.automation.added_at_unix_seconds == 0 {
+            opts.automation.added_at_unix_seconds = unix_time_seconds();
+        }
+        let record = SerializedPendingTorrent {
+            info_hash,
+            magnet_url,
+            paused: opts.paused,
+            options: serde_json::to_value(&opts)?,
+            state: PendingAutomationTorrentState::ResolvingMetadata,
+            metadata_attempts: 0,
+            last_error: None,
+            next_retry_at_unix_seconds: None,
+        };
+        self.register_pending_automation(record, true).await
+    }
 
+    async fn register_pending_automation(
+        self: &Arc<Self>,
+        record: SerializedPendingTorrent,
+        persist: bool,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        let magnet = Magnet::parse(&record.magnet_url).context("invalid saved pending magnet")?;
+        anyhow::ensure!(
+            magnet.as_id20() == Some(record.info_hash),
+            "pending torrent identity mismatch"
+        );
+        anyhow::ensure!(
+            record.options.is_object(),
+            "invalid pending torrent options"
+        );
+        let options: AddTorrentOptions = serde_json::from_value(record.options.clone())
+            .context("invalid pending torrent options")?;
+        anyhow::ensure!(!options.list_only, "invalid list-only pending submission");
+        let hash = record.info_hash;
         {
-            let mut db = self.db.write();
+            let db = self.db.read();
             if db
                 .torrents
                 .values()
-                .any(|torrent| torrent.info_hash() == info_hash)
-                || db.pending_automation_torrents.contains_key(&info_hash)
+                .any(|torrent| torrent.info_hash() == hash)
+                || db.pending_automation_torrents.contains_key(&hash)
             {
                 return Ok(false);
             }
-            if db.pending_automation_torrents.len() >= MAX_PENDING_AUTOMATION_TORRENTS {
-                bail!(
-                    "too many pending automation torrents (maximum {})",
-                    MAX_PENDING_AUTOMATION_TORRENTS
-                );
-            }
-            db.pending_automation_torrents.insert(
-                info_hash,
-                PendingAutomationTorrent {
-                    info_hash,
-                    name: magnet.name,
-                    automation: opts.automation.clone(),
-                    state: PendingAutomationTorrentState::ResolvingMetadata,
-                    metadata_attempts: 0,
-                    last_error: None,
-                    next_retry_at_unix_seconds: None,
-                    generation: generation.clone(),
-                    cancellation_token: cancellation_token.clone(),
-                },
+            anyhow::ensure!(
+                db.pending_automation_torrents.len() < MAX_PENDING_AUTOMATION_TORRENTS,
+                "too many pending automation torrents (maximum {})",
+                MAX_PENDING_AUTOMATION_TORRENTS
             );
         }
-
-        let session = self.clone();
-        self.spawn(
-            debug_span!(parent: self.rs(), "resolve_pending_magnet", ?info_hash),
-            "resolve_pending_magnet",
-            async move {
-                let result = session
-                    .add_torrent_with_resolution_control(
-                        AddTorrent::Url(magnet_url.into()),
-                        Some(opts),
-                        Some(MagnetResolutionControl {
-                            cancellation_token: cancellation_token.clone(),
-                            timeout: AUTOMATION_METADATA_RESOLUTION_TIMEOUT,
-                            retry_delay: AUTOMATION_METADATA_RETRY_DELAY,
-                            generation: generation.clone(),
-                        }),
-                    )
-                    .await;
-                match result {
-                    Ok(response) => {
-                        let pending = {
-                            let mut db = session.db.write();
-                            if db.pending_automation_torrents.get(&info_hash)
-                                .is_some_and(|pending| Arc::ptr_eq(&pending.generation, &generation))
-                            {
-                                db.pending_automation_torrents.remove(&info_hash)
-                            } else {
-                                None
-                            }
-                        };
-                        match response {
-                            AddTorrentResponse::Added(id, torrent) => {
-                                if let Some(pending) = pending {
-                                    torrent.set_automation_category(pending.automation.category);
-                                    torrent.set_automation_limits(
-                                        pending.automation.ratio_limit,
-                                        pending.automation.seeding_time_limit_seconds,
-                                    );
-                                    session.try_update_persistence_metadata(&torrent).await;
-                                } else if let Err(error) = session
-                                    .delete(TorrentIdOrHash::Id(id), false)
-                                    .await
-                                {
-                                    warn!(?info_hash, error = ?error, "could not forget cancelled pending magnet");
-                                }
-                            }
-                            AddTorrentResponse::AlreadyManaged(_, torrent) => {
-                                let Some(pending) = pending else {
-                                    return Ok(());
-                                };
-                                torrent.set_automation_category(pending.automation.category);
-                                torrent.set_automation_limits(
-                                    pending.automation.ratio_limit,
-                                    pending.automation.seeding_time_limit_seconds,
-                                );
-                                session.try_update_persistence_metadata(&torrent).await;
-                            }
-                            AddTorrentResponse::ListOnly(_) => unreachable!(
-                                "pending automation torrents are never added in list-only mode"
-                            ),
-                        }
-                    }
-                    Err(error) => {
-                        if cancellation_token.is_cancelled() {
-                            return Ok(());
-                        }
-                        let reason = error.downcast_ref::<PendingAutomationError>()
-                            .copied().unwrap_or(PendingAutomationError::TorrentAddFailed);
-                        // Arbitrary backend errors can contain private tracker URLs.
-                        warn!(?info_hash, %reason, "could not add pending magnet");
-                        if let Some(pending) = session
-                            .db
-                            .write()
-                            .pending_automation_torrents
-                            .get_mut(&info_hash)
-                            .filter(|pending| Arc::ptr_eq(&pending.generation, &generation))
-                        {
-                            pending.state = PendingAutomationTorrentState::Error;
-                            pending.last_error = Some(reason);
-                            pending.next_retry_at_unix_seconds = None;
-                        }
-                    }
-                }
-                Ok(())
-            },
-        );
+        if persist && let Some(persistence) = self.persistence.as_ref() {
+            persistence
+                .store_pending(&record)
+                .await
+                .context(PendingAutomationError::PersistenceFailed)?;
+        }
+        let pending = PendingAutomationTorrent {
+            info_hash: hash,
+            name: magnet.name,
+            automation: options.automation,
+            paused: record.paused,
+            state: record.state.clone(),
+            metadata_attempts: record.metadata_attempts,
+            last_error: record.last_error,
+            next_retry_at_unix_seconds: record.next_retry_at_unix_seconds,
+            submission: Arc::new(record),
+            generation: Arc::new(()),
+            cancellation_token: self.cancellation_token.child_token(),
+        };
+        self.db
+            .write()
+            .pending_automation_torrents
+            .insert(hash, pending.clone());
+        if !pending.paused
+            && matches!(
+                pending.state,
+                PendingAutomationTorrentState::ResolvingMetadata
+            )
+        {
+            self.spawn_pending_automation_resolution(pending);
+        }
         Ok(true)
     }
 
-    pub(crate) fn forget_pending_automation_torrent(&self, id: Id20) -> bool {
-        let mut db = self.db.write();
-        let pending = db.pending_automation_torrents.remove(&id);
-        if let Some(pending) = pending {
-            pending.cancellation_token.cancel();
-            true
-        } else {
-            false
-        }
+    fn spawn_pending_automation_resolution(self: &Arc<Self>, pending: PendingAutomationTorrent) {
+        let info_hash = pending.info_hash;
+        self.spawn(
+            debug_span!(parent: self.rs(), "resolve_pending_magnet", ?info_hash),
+            "resolve_pending_magnet",
+            self.clone().resolve_pending_automation(pending),
+        );
     }
 
-    pub(crate) fn set_pending_automation_category(&self, id: Id20, category: String) -> bool {
-        let mut db = self.db.write();
-        let Some(pending) = db.pending_automation_torrents.get_mut(&id) else {
-            return false;
+    async fn resolve_pending_automation(
+        self: Arc<Self>,
+        pending: PendingAutomationTorrent,
+    ) -> anyhow::Result<()> {
+        let session = self;
+        let info_hash = pending.info_hash;
+        let cancellation_token = pending.cancellation_token;
+        let generation = pending.generation;
+        let resolve = async {
+            if let Some(retry_at) = pending.next_retry_at_unix_seconds {
+                let delay = Duration::from_secs(retry_at.saturating_sub(unix_time_seconds()));
+                tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            let mut options: AddTorrentOptions = serde_json::from_value(pending.submission.options.clone())?;
+            options.paused = false;
+            options.automation = pending.automation;
+            let delay = AUTOMATION_METADATA_RETRY_DELAY.saturating_mul(1u32 << pending.metadata_attempts.min(4))
+                .min(AUTOMATION_METADATA_MAX_RETRY_DELAY);
+            session.add_torrent_with_resolution_control(AddTorrent::Url(pending.submission.magnet_url.clone().into()), Some(options), Some(MagnetResolutionControl {
+                cancellation_token: cancellation_token.clone(), generation: generation.clone(),
+                timeout: AUTOMATION_METADATA_RESOLUTION_TIMEOUT, retry_delay: delay,
+            })).await
+        }.await;
+        let _guard = session.pending_automation_mutations.lock().await;
+        if cancellation_token.is_cancelled() {
+            return Ok(());
+        }
+        let current = session
+            .db
+            .read()
+            .pending_automation_torrents
+            .get(&info_hash)
+            .filter(|current| Arc::ptr_eq(&current.generation, &generation))
+            .cloned();
+        let Some(mut current) = current else {
+            return Ok(());
+        };
+        match resolve {
+            Ok(AddTorrentResponse::Added(..)) => {
+                // store() atomically removed the durable pending record.
+                session
+                    .db
+                    .write()
+                    .pending_automation_torrents
+                    .remove(&info_hash);
+            }
+            Ok(AddTorrentResponse::AlreadyManaged(..)) => {
+                if let Some(persistence) = session.persistence.as_ref()
+                    && persistence.delete_pending(info_hash).await.is_err()
+                {
+                    // The managed record owns the job; startup will retry stale-row cleanup.
+                    warn!(?info_hash, reason = %PendingAutomationError::PersistenceFailed, "could not remove stale pending record");
+                }
+                session
+                    .db
+                    .write()
+                    .pending_automation_torrents
+                    .remove(&info_hash);
+            }
+            Ok(AddTorrentResponse::ListOnly(_)) => {
+                bail!("unexpected list-only automation response")
+            }
+            Err(error) => {
+                let reason = error
+                    .downcast_ref::<PendingAutomationError>()
+                    .copied()
+                    .unwrap_or(PendingAutomationError::TorrentAddFailed);
+                if session.get(TorrentIdOrHash::Hash(info_hash)).is_some() {
+                    // Registration committed before starting the managed torrent failed.
+                    session
+                        .db
+                        .write()
+                        .pending_automation_torrents
+                        .remove(&info_hash);
+                    warn!(?info_hash, %reason, "could not start registered torrent");
+                    return Ok(());
+                }
+                current.state = PendingAutomationTorrentState::Error;
+                current.last_error = Some(reason);
+                current.next_retry_at_unix_seconds = None;
+                if session.persist_pending_automation(&current).await.is_err() {
+                    current.last_error = Some(PendingAutomationError::PersistenceFailed);
+                }
+                let reported_reason = current.last_error.unwrap_or(reason);
+                warn!(?info_hash, reason = %reported_reason, "could not add pending magnet");
+                session
+                    .db
+                    .write()
+                    .pending_automation_torrents
+                    .insert(info_hash, current);
+            }
+        }
+        Ok(())
+    }
+
+    async fn persist_pending_automation(
+        &self,
+        pending: &PendingAutomationTorrent,
+    ) -> anyhow::Result<()> {
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence
+                .store_pending(&pending.serialized()?)
+                .await
+                .context(PendingAutomationError::PersistenceFailed)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn forget_pending_automation_torrent(
+        &self,
+        hash: Id20,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        if self.get(TorrentIdOrHash::Hash(hash)).is_some() {
+            return Ok(false);
+        }
+        if !self
+            .db
+            .read()
+            .pending_automation_torrents
+            .contains_key(&hash)
+        {
+            return Ok(false);
+        }
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.delete_pending(hash).await?;
+        }
+        if let Some(pending) = self.db.write().pending_automation_torrents.remove(&hash) {
+            pending.cancellation_token.cancel();
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn set_pending_automation_paused(
+        self: &Arc<Self>,
+        hash: Id20,
+        paused: bool,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        if self.get(TorrentIdOrHash::Hash(hash)).is_some() {
+            return Ok(false);
+        }
+        let Some(mut pending) = self
+            .db
+            .read()
+            .pending_automation_torrents
+            .get(&hash)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if pending.paused == paused
+            && (paused
+                || matches!(
+                    pending.state,
+                    PendingAutomationTorrentState::ResolvingMetadata
+                ))
+        {
+            return Ok(true);
+        }
+        let old_token = pending.cancellation_token.clone();
+        pending.paused = paused;
+        pending.next_retry_at_unix_seconds = None;
+        if !paused {
+            pending.state = PendingAutomationTorrentState::ResolvingMetadata;
+            pending.last_error = None;
+        }
+        pending.generation = Arc::new(());
+        pending.cancellation_token = self.cancellation_token.child_token();
+        self.persist_pending_automation(&pending).await?;
+        old_token.cancel();
+        self.db
+            .write()
+            .pending_automation_torrents
+            .insert(hash, pending.clone());
+        if !paused {
+            self.spawn_pending_automation_resolution(pending);
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn set_pending_automation_category(
+        &self,
+        hash: Id20,
+        category: String,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        anyhow::ensure!(
+            self.has_automation_category(&category),
+            "automation category does not exist"
+        );
+        if self.get(TorrentIdOrHash::Hash(hash)).is_some() {
+            return Ok(false);
+        }
+        let Some(mut pending) = self
+            .db
+            .read()
+            .pending_automation_torrents
+            .get(&hash)
+            .cloned()
+        else {
+            return Ok(false);
         };
         pending.automation.category = category;
-        true
+        self.persist_pending_automation(&pending).await?;
+        self.db
+            .write()
+            .pending_automation_torrents
+            .insert(hash, pending);
+        Ok(true)
+    }
+
+    async fn update_pending_metadata_diagnostics(
+        &self,
+        hash: Id20,
+        control: &MagnetResolutionControl,
+        failure: Option<(PendingAutomationError, Duration)>,
+    ) -> anyhow::Result<()> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        if control.cancellation_token.is_cancelled() {
+            bail!("magnet metadata resolution was cancelled");
+        }
+        let mut pending = self
+            .db
+            .read()
+            .pending_automation_torrents
+            .get(&hash)
+            .filter(|pending| Arc::ptr_eq(&pending.generation, &control.generation))
+            .cloned()
+            .context("pending magnet was cancelled or replaced")?;
+        if let Some((reason, delay)) = failure {
+            pending.last_error = Some(reason);
+            pending.next_retry_at_unix_seconds =
+                Some(unix_time_seconds().saturating_add(delay.as_secs()));
+        } else {
+            pending.metadata_attempts = pending.metadata_attempts.saturating_add(1);
+            pending.next_retry_at_unix_seconds = None;
+        }
+        self.persist_pending_automation(&pending).await?;
+        self.db
+            .write()
+            .pending_automation_torrents
+            .insert(hash, pending);
+        Ok(())
     }
 
     /// Add a torrent to the session.
@@ -1759,6 +2004,21 @@ impl Session {
 
         let _permit = self.spawner.semaphore().acquire_owned().await?;
 
+        // All registrations share the handoff lock, including native torrent-file adds.
+        let _pending_guard = self.pending_automation_mutations.lock().await;
+        if let Some(control) = resolution_control.as_ref() {
+            let db = self.db.read();
+            let current = db
+                .pending_automation_torrents
+                .get(&info_hash)
+                .filter(|pending| Arc::ptr_eq(&pending.generation, &control.generation))
+                .context("pending magnet was cancelled or replaced")?;
+            anyhow::ensure!(
+                !current.paused && !control.cancellation_token.is_cancelled(),
+                "magnet metadata resolution was cancelled"
+            );
+            opts.automation = current.automation.clone();
+        }
         let (managed_torrent, metadata) = {
             let mut g = self.db.write();
             if resolution_control
@@ -1774,6 +2034,10 @@ impl Session {
                     None
                 }
             }) {
+                anyhow::ensure!(
+                    handle.info_hash() == info_hash,
+                    "torrent ID is already in use"
+                );
                 return Ok(AddTorrentResponse::AlreadyManaged(id, handle));
             }
 
@@ -1866,6 +2130,25 @@ impl Session {
     }
 
     pub async fn delete(&self, id: TorrentIdOrHash, delete_files: bool) -> anyhow::Result<()> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        if let TorrentIdOrHash::Hash(hash) = id {
+            let pending_exists = self
+                .db
+                .read()
+                .pending_automation_torrents
+                .contains_key(&hash);
+            if pending_exists {
+                if let Some(persistence) = self.persistence.as_ref() {
+                    persistence.delete_pending(hash).await?;
+                }
+                if let Some(pending) = self.db.write().pending_automation_torrents.remove(&hash) {
+                    pending.cancellation_token.cancel();
+                }
+                if self.get(id).is_none() {
+                    return Ok(());
+                }
+            }
+        }
         let id = match id {
             TorrentIdOrHash::Id(id) => id,
             TorrentIdOrHash::Hash(h) => self
@@ -2125,17 +2408,8 @@ impl Session {
                 permit = self.pending_automation_resolution_semaphore.clone().acquire_owned() =>
                     permit.context("automation resolution semaphore is closed")?,
             };
-            {
-                let mut db = self.db.write();
-                if let Some(pending) = db
-                    .pending_automation_torrents
-                    .get_mut(&info_hash)
-                    .filter(|pending| Arc::ptr_eq(&pending.generation, &control.generation))
-                {
-                    pending.metadata_attempts = pending.metadata_attempts.saturating_add(1);
-                    pending.next_retry_at_unix_seconds = None;
-                }
-            }
+            self.update_pending_metadata_diagnostics(info_hash, control, None)
+                .await?;
             let result = tokio::select! {
                 biased;
                 _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
@@ -2153,18 +2427,12 @@ impl Session {
                 }
                 Ok(Err(error)) => return Err(error),
             };
-            {
-                let mut db = self.db.write();
-                if let Some(pending) = db
-                    .pending_automation_torrents
-                    .get_mut(&info_hash)
-                    .filter(|pending| Arc::ptr_eq(&pending.generation, &control.generation))
-                {
-                    pending.last_error = Some(reason);
-                    pending.next_retry_at_unix_seconds =
-                        Some(unix_time_seconds().saturating_add(retry_delay.as_secs()));
-                }
-            }
+            self.update_pending_metadata_diagnostics(
+                info_hash,
+                control,
+                Some((reason, retry_delay)),
+            )
+            .await?;
             warn!(?info_hash, %reason, retry_after_seconds = retry_delay.as_secs(), "waiting for torrent metadata");
             tokio::select! {
                 biased;
@@ -2370,7 +2638,7 @@ mod tests {
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
     use tokio::io::AsyncWriteExt;
 
-    use crate::TorrentAutomationMetadata;
+    use crate::{TorrentAutomationMetadata, session_persistence::SerializedPendingTorrent};
     use dht::Id20;
     use std::{sync::Arc, time::Duration};
 
@@ -2460,6 +2728,7 @@ mod tests {
             assert!(
                 session
                     .add_pending_automation_magnet(magnet, AddTorrentOptions::default())
+                    .await
                     .unwrap()
             );
         }
@@ -2470,6 +2739,7 @@ mod tests {
         );
         let error = session
             .add_pending_automation_magnet(overflow, AddTorrentOptions::default())
+            .await
             .unwrap_err();
         assert!(
             error
@@ -2495,6 +2765,7 @@ mod tests {
         let magnet = "magnet:?xt=urn:btih:0000000000000000000000000000000000000001";
         session
             .add_pending_automation_magnet(magnet.to_owned(), AddTorrentOptions::default())
+            .await
             .unwrap();
         let (info_hash, cancellation_token) = {
             let db = session.db.read();
@@ -2502,7 +2773,12 @@ mod tests {
             (pending.info_hash, pending.cancellation_token.clone())
         };
 
-        assert!(session.forget_pending_automation_torrent(info_hash));
+        assert!(
+            session
+                .forget_pending_automation_torrent(info_hash)
+                .await
+                .unwrap()
+        );
         assert!(cancellation_token.is_cancelled());
         session.stop().await;
     }
@@ -2535,6 +2811,17 @@ mod tests {
         session.db.write().pending_automation_torrents.insert(
             info_hash,
             PendingAutomationTorrent {
+                submission: Arc::new(SerializedPendingTorrent {
+                    info_hash,
+                    magnet_url: format!("magnet:?xt=urn:btih:{}", info_hash.as_string()),
+                    options: serde_json::to_value(AddTorrentOptions::default()).unwrap(),
+                    paused: false,
+                    state: PendingAutomationTorrentState::ResolvingMetadata,
+                    metadata_attempts: 0,
+                    last_error: None,
+                    next_retry_at_unix_seconds: None,
+                }),
+                paused: false,
                 info_hash,
                 name: Some("Retry fixture".to_owned()),
                 automation: TorrentAutomationMetadata {
@@ -2666,7 +2953,12 @@ mod tests {
             );
             tokio::time::advance(Duration::from_secs(1)).await;
         }
-        assert!(session.forget_pending_automation_torrent(info_hash));
+        assert!(
+            session
+                .forget_pending_automation_torrent(info_hash)
+                .await
+                .unwrap()
+        );
         assert!(worker.await.unwrap().is_err());
         tokio::time::advance(Duration::from_secs(1000)).await;
         assert!(session.pending_automation_torrents().is_empty());
@@ -2701,10 +2993,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn automation_metadata_backoff_allows_queued_jobs_to_run() {
-        let (session, info_hash, control, _output) = metadata_retry_fixture().await;
+        let (session, _info_hash, control, _output) = metadata_retry_fixture().await;
         let mut workers = Vec::new();
         let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for _ in 0..MAX_CONCURRENT_AUTOMATION_RESOLUTIONS + 1 {
+        for index in 0..MAX_CONCURRENT_AUTOMATION_RESOLUTIONS + 1 {
+            let info_hash = Id20::new([u8::try_from(index + 1).unwrap(); 20]);
+            let mut pending = session.pending_automation_torrents()[0].clone();
+            pending.info_hash = info_hash;
+            session
+                .db
+                .write()
+                .pending_automation_torrents
+                .insert(info_hash, pending);
             let session = session.clone();
             let started = started.clone();
             let control = MagnetResolutionControl {
@@ -2748,5 +3048,471 @@ mod tests {
             MAX_CONCURRENT_AUTOMATION_RESOLUTIONS
         );
         session.cancellation_token.cancel();
+    }
+
+    async fn persistent_pending_session(
+        output: &std::path::Path,
+        persistence: super::SessionPersistenceConfig,
+    ) -> Arc<Session> {
+        Session::new_with_opts(
+            output.to_path_buf(),
+            SessionOptions {
+                persistence: Some(persistence),
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn pending_restart_contract(config: impl Fn() -> super::SessionPersistenceConfig) {
+        let output = tempfile::tempdir().unwrap();
+        let session = persistent_pending_session(output.path(), config()).await;
+        session
+            .create_automation_category("pending-tv".to_owned())
+            .await
+            .unwrap();
+        session
+            .create_automation_category("pending-movies".to_owned())
+            .await
+            .unwrap();
+        let hash = Id20::new([0xa5; 20]);
+        let magnet = format!(
+            "magnet:?xt=urn:btih:{}&dn=Restart%20Fixture&x.private=fake-private-value",
+            hash.as_string()
+        );
+        session
+            .add_pending_automation_magnet(
+                magnet.clone(),
+                AddTorrentOptions {
+                    paused: true,
+                    overwrite: true,
+                    only_files: Some(vec![1, 2]),
+                    peer_limit: Some(7),
+                    initial_peers: Some(vec!["127.0.0.1:9".parse().unwrap()]),
+                    output_folder: Some(output.path().to_string_lossy().into_owned()),
+                    automation: TorrentAutomationMetadata {
+                        category: "pending-tv".to_owned(),
+                        ratio_limit: Some(1.5),
+                        seeding_time_limit_seconds: Some(600),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.pending_automation_torrents()[0].metadata_attempts,
+            0
+        );
+        let original_token = session.pending_automation_torrents()[0]
+            .cancellation_token
+            .clone();
+        session
+            .set_pending_automation_paused(hash, false)
+            .await
+            .unwrap();
+        assert!(original_token.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.pending_automation_torrents()[0].metadata_attempts == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let active_token = session.pending_automation_torrents()[0]
+            .cancellation_token
+            .clone();
+        session
+            .set_pending_automation_paused(hash, true)
+            .await
+            .unwrap();
+        assert!(active_token.is_cancelled());
+        session
+            .set_pending_automation_category(hash, "pending-movies".to_owned())
+            .await
+            .unwrap();
+        let attempts = session.pending_automation_torrents()[0].metadata_attempts;
+        session.stop().await;
+
+        let restored = persistent_pending_session(output.path(), config()).await;
+        let pending = restored.pending_automation_torrents().pop().unwrap();
+        assert_eq!(pending.info_hash, hash);
+        assert_eq!(pending.name.as_deref(), Some("Restart Fixture"));
+        assert!(pending.paused);
+        assert_eq!(pending.metadata_attempts, attempts);
+        assert_eq!(pending.automation.category, "pending-movies");
+        assert_eq!(pending.automation.ratio_limit, Some(1.5));
+        assert_eq!(pending.automation.seeding_time_limit_seconds, Some(600));
+        assert!(pending.next_retry_at_unix_seconds.is_none());
+        let record = pending.serialized().unwrap();
+        assert_eq!(record.magnet_url, magnet);
+        assert_eq!(record.options["only_files"], serde_json::json!([1, 2]));
+        assert_eq!(record.options["peer_limit"], 7);
+        assert_eq!(record.options["overwrite"], true);
+        assert!(!format!("{pending:?}").contains("fake-private-value"));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            restored.pending_automation_torrents()[0].metadata_attempts,
+            attempts
+        );
+        restored
+            .delete_automation_category("pending-movies")
+            .await
+            .unwrap();
+        assert!(
+            restored.pending_automation_torrents()[0]
+                .automation
+                .category
+                .is_empty()
+        );
+        restored.stop().await;
+        let restored = persistent_pending_session(output.path(), config()).await;
+        assert!(
+            restored.pending_automation_torrents()[0]
+                .automation
+                .category
+                .is_empty()
+        );
+        restored
+            .delete(crate::api::TorrentIdOrHash::Hash(hash), false)
+            .await
+            .unwrap();
+        assert!(restored.pending_automation_torrents().is_empty());
+        restored.stop().await;
+        let restored = persistent_pending_session(output.path(), config()).await;
+        assert!(restored.pending_automation_torrents().is_empty());
+        restored.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pending_json_restart_preserves_pause_options_and_deletion() {
+        let state = tempfile::tempdir().unwrap();
+        pending_restart_contract(|| super::SessionPersistenceConfig::Json {
+            folder: Some(state.path().to_path_buf()),
+        })
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires a dedicated PostgreSQL database in RQBIT_TEST_POSTGRES_URL"]
+    async fn pending_postgres_restart_preserves_pause_options_and_deletion() {
+        let url =
+            std::env::var("RQBIT_TEST_POSTGRES_URL").expect("set a dedicated test database URL");
+        pending_restart_contract(|| super::SessionPersistenceConfig::Postgres {
+            connection_string: url.clone(),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pending_json_write_failure_preserves_user_intent() {
+        let output = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let config = || super::SessionPersistenceConfig::Json {
+            folder: Some(state.path().to_path_buf()),
+        };
+        let session = persistent_pending_session(output.path(), config()).await;
+        session
+            .create_automation_category("valid-category".to_owned())
+            .await
+            .unwrap();
+        let hash = Id20::new([0xb5; 20]);
+        session
+            .add_pending_automation_magnet(
+                format!("magnet:?xt=urn:btih:{}", hash.as_string()),
+                AddTorrentOptions {
+                    paused: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let token = session.pending_automation_torrents()[0]
+            .cancellation_token
+            .clone();
+        let blocked = state.path().join("session.json.tmp");
+        tokio::fs::create_dir(&blocked).await.unwrap();
+        assert!(
+            session
+                .set_pending_automation_paused(hash, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            session
+                .set_pending_automation_category(hash, "valid-category".to_owned())
+                .await
+                .is_err()
+        );
+        assert!(
+            session
+                .forget_pending_automation_torrent(hash)
+                .await
+                .is_err()
+        );
+        assert!(
+            session
+                .add_pending_automation_magnet(
+                    format!("magnet:?xt=urn:btih:{}", Id20::new([0xc5; 20]).as_string()),
+                    AddTorrentOptions {
+                        paused: true,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(!token.is_cancelled());
+        let pending = session.pending_automation_torrents();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].paused);
+        assert!(pending[0].automation.category.is_empty());
+        tokio::fs::remove_dir(&blocked).await.unwrap();
+        session.stop().await;
+        let restored = persistent_pending_session(output.path(), config()).await;
+        assert_eq!(restored.pending_automation_torrents().len(), 1);
+        assert!(restored.pending_automation_torrents()[0].paused);
+        restored.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pending_json_restart_retains_active_backoff_and_fatal_diagnostics() {
+        let output = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let config = || super::SessionPersistenceConfig::Json {
+            folder: Some(state.path().to_path_buf()),
+        };
+        let session = persistent_pending_session(output.path(), config()).await;
+        let active_hash = Id20::new([0xd5; 20]);
+        let fatal_hash = Id20::new([0xe5; 20]);
+        for (hash, initial_peers) in [
+            (active_hash, Some(vec!["127.0.0.1:9".parse().unwrap()])),
+            (fatal_hash, None),
+        ] {
+            session
+                .add_pending_automation_magnet(
+                    format!("magnet:?xt=urn:btih:{}", hash.as_string()),
+                    AddTorrentOptions {
+                        initial_peers,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let pending = session.pending_automation_torrents();
+                if pending.iter().any(|torrent| {
+                    torrent.info_hash == active_hash && torrent.next_retry_at_unix_seconds.is_some()
+                }) && pending.iter().any(|torrent| {
+                    torrent.info_hash == fatal_hash
+                        && matches!(torrent.state, PendingAutomationTorrentState::Error)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = session.pending_automation_torrents();
+        session.stop().await;
+        let restored = persistent_pending_session(output.path(), config()).await;
+        for pending in restored.pending_automation_torrents() {
+            let previous = snapshot
+                .iter()
+                .find(|torrent| torrent.info_hash == pending.info_hash)
+                .unwrap();
+            assert_eq!(pending.metadata_attempts, previous.metadata_attempts);
+            assert_eq!(pending.last_error, previous.last_error);
+            assert_eq!(
+                pending.next_retry_at_unix_seconds,
+                previous.next_retry_at_unix_seconds
+            );
+            assert!(!pending.paused);
+            if pending.info_hash == fatal_hash {
+                assert!(matches!(
+                    pending.state,
+                    PendingAutomationTorrentState::Error
+                ));
+            }
+        }
+        restored.stop().await;
+    }
+
+    async fn pending_handoff_contract(
+        config: impl Fn() -> super::SessionPersistenceConfig,
+        fail_writes: Option<&std::path::Path>,
+    ) {
+        let output = tempfile::tempdir().unwrap();
+        tokio::fs::write(output.path().join("handoff.bin"), b"valid fixture data")
+            .await
+            .unwrap();
+        let created = crate::create_torrent(
+            output.path(),
+            crate::CreateTorrentOptions::default(),
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let bytes = created.as_bytes().unwrap();
+        let hash = created.info_hash();
+        let session = persistent_pending_session(output.path(), config()).await;
+        let options = AddTorrentOptions {
+            paused: true,
+            overwrite: true,
+            output_folder: Some(output.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        session
+            .register_pending_automation(
+                SerializedPendingTorrent {
+                    info_hash: hash,
+                    magnet_url: format!("magnet:?xt=urn:btih:{}", hash.as_string()),
+                    options: serde_json::to_value(&options).unwrap(),
+                    paused: false,
+                    state: PendingAutomationTorrentState::ResolvingMetadata,
+                    metadata_attempts: 1,
+                    last_error: Some(PendingAutomationError::MetadataTimeout),
+                    next_retry_at_unix_seconds: Some(super::unix_time_seconds() + 3600),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        let pending = session.pending_automation_torrents()[0].clone();
+        if let Some(state) = fail_writes {
+            // A failed metadata write and a failed database commit must both retain the submission.
+            for blocked in [
+                state.join(format!("{}.torrent.tmp", hash.as_string())),
+                state.join("session.json.tmp"),
+            ] {
+                tokio::fs::create_dir(&blocked).await.unwrap();
+                let error = session
+                    .add_torrent_with_resolution_control(
+                        crate::AddTorrent::TorrentFileBytes(bytes.clone()),
+                        Some(serde_json::from_value(pending.submission.options.clone()).unwrap()),
+                        Some(MagnetResolutionControl {
+                            cancellation_token: pending.cancellation_token.clone(),
+                            generation: pending.generation.clone(),
+                            timeout: Duration::from_secs(300),
+                            retry_delay: Duration::from_secs(30),
+                        }),
+                    )
+                    .await
+                    .err()
+                    .expect("handoff must fail while persistence is blocked");
+                assert_eq!(
+                    error.downcast_ref::<PendingAutomationError>(),
+                    Some(&PendingAutomationError::PersistenceFailed)
+                );
+                assert!(
+                    session
+                        .get(crate::api::TorrentIdOrHash::Hash(hash))
+                        .is_none()
+                );
+                let durable = session
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_pending()
+                    .await
+                    .unwrap();
+                assert_eq!(durable.len(), 1);
+                assert_eq!(*durable[0].info_hash(), hash);
+                assert_eq!(session.pending_automation_torrents().len(), 1);
+                tokio::fs::remove_dir(&blocked).await.unwrap();
+            }
+        }
+        let result = session
+            .add_torrent_with_resolution_control(
+                crate::AddTorrent::TorrentFileBytes(bytes),
+                Some(options),
+                Some(MagnetResolutionControl {
+                    cancellation_token: pending.cancellation_token.clone(),
+                    generation: pending.generation.clone(),
+                    timeout: Duration::from_secs(300),
+                    retry_delay: Duration::from_secs(30),
+                }),
+            )
+            .await
+            .unwrap();
+        let managed = result.into_handle().unwrap();
+        assert_eq!(managed.info_hash(), hash);
+        assert!(
+            session
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_pending()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        session.stop().await;
+        let restored = persistent_pending_session(output.path(), config()).await;
+        assert!(restored.pending_automation_torrents().is_empty());
+        let managed = restored
+            .get(crate::api::TorrentIdOrHash::Hash(hash))
+            .unwrap();
+        assert!(managed.is_paused());
+        assert!(managed.metadata.load().is_some());
+        assert_eq!(
+            tokio::fs::read(output.path().join("handoff.bin"))
+                .await
+                .unwrap(),
+            b"valid fixture data"
+        );
+        restored
+            .delete(crate::api::TorrentIdOrHash::Hash(hash), false)
+            .await
+            .unwrap();
+        restored.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pending_json_handoff_survives_restart_with_verified_metadata() {
+        let state = tempfile::tempdir().unwrap();
+        pending_handoff_contract(
+            || super::SessionPersistenceConfig::Json {
+                folder: Some(state.path().to_path_buf()),
+            },
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pending_json_failed_handoff_retains_submission_and_can_retry() {
+        let state = tempfile::tempdir().unwrap();
+        pending_handoff_contract(
+            || super::SessionPersistenceConfig::Json {
+                folder: Some(state.path().to_path_buf()),
+            },
+            Some(state.path()),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires a dedicated PostgreSQL database in RQBIT_TEST_POSTGRES_URL"]
+    async fn pending_postgres_handoff_survives_restart_with_verified_metadata() {
+        let url =
+            std::env::var("RQBIT_TEST_POSTGRES_URL").expect("set a dedicated test database URL");
+        pending_handoff_contract(
+            || super::SessionPersistenceConfig::Postgres {
+                connection_string: url.clone(),
+            },
+            None,
+        )
+        .await;
     }
 }

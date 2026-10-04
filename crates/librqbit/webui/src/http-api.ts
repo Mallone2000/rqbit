@@ -210,6 +210,13 @@ export const API: RqbitAPI & {
     );
   },
 
+  pendingAction: (hash, action): Promise<void> => {
+    return makeRequest(
+      "POST",
+      "/torrents/" + encodeURIComponent(hash) + "/" + action,
+    );
+  },
+
   pause: (index: number): Promise<void> => {
     return makeRequest("POST", `/torrents/${index}/pause`);
   },

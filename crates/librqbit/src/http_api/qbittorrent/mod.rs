@@ -284,18 +284,26 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
             size: 0,
             progress: 0.0,
             eta: UNKNOWN_ETA_SECONDS,
-            state: match pending.state {
-                PendingAutomationTorrentState::ResolvingMetadata => "metaDL",
-                PendingAutomationTorrentState::Error => "error",
+            state: if pending.paused {
+                "pausedDL"
+            } else {
+                match pending.state {
+                    PendingAutomationTorrentState::ResolvingMetadata => "metaDL",
+                    PendingAutomationTorrentState::Error => "error",
+                }
             },
             label: category.clone(),
             category,
             save_path: save_path.clone(),
             content_path: save_path.clone(),
             ratio: 0.0,
-            ratio_limit: -2.0,
+            ratio_limit: pending.automation.ratio_limit.unwrap_or(-2.0),
             seeding_time: 0,
-            seeding_time_limit: -2,
+            seeding_time_limit: pending
+                .automation
+                .seeding_time_limit_seconds
+                .and_then(|seconds| i64::try_from(seconds / 60).ok())
+                .unwrap_or(-2),
             inactive_seeding_time_limit: -2,
             last_activity: 0,
         });
@@ -671,8 +679,17 @@ async fn add_torrent(State(state): State<ApiState>, request: Request) -> QbitRes
                 .api
                 .session()
                 .add_pending_automation_magnet(magnet_url.into_owned(), options)
+                .await
                 .map_err(|error| {
-                    QbitError::internal(StatusCode::BAD_REQUEST, "failed to add magnet", error)
+                    let status = if matches!(
+                        error.downcast_ref::<crate::session::PendingAutomationError>(),
+                        Some(crate::session::PendingAutomationError::PersistenceFailed)
+                    ) {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    QbitError::internal(status, "failed to add magnet", error)
                 })?;
             return Ok((StatusCode::OK, if added { "" } else { "Fails." }).into_response());
         }
@@ -920,6 +937,10 @@ async fn set_category(
                 .api
                 .session()
                 .set_pending_automation_category(info_hash, form.category.clone())
+                .await
+                .map_err(|error| {
+                    QbitError::internal(StatusCode::CONFLICT, "failed to set category", error)
+                })?
         {
             continue;
         }
@@ -981,6 +1002,22 @@ async fn pause_torrents(
     Form(form): Form<TorrentActionForm>,
 ) -> QbitResult<StatusCode> {
     for hash in parse_hashes(&form.hashes)? {
+        if let TorrentIdOrHash::Hash(info_hash) = hash
+            && state
+                .api
+                .session()
+                .set_pending_automation_paused(info_hash, true)
+                .await
+                .map_err(|error| {
+                    QbitError::internal(
+                        StatusCode::CONFLICT,
+                        "failed to update pending torrent",
+                        error,
+                    )
+                })?
+        {
+            continue;
+        }
         let torrent = state
             .api
             .session()
@@ -1004,6 +1041,22 @@ async fn resume_torrents(
     Form(form): Form<TorrentActionForm>,
 ) -> QbitResult<StatusCode> {
     for hash in parse_hashes(&form.hashes)? {
+        if let TorrentIdOrHash::Hash(info_hash) = hash
+            && state
+                .api
+                .session()
+                .set_pending_automation_paused(info_hash, false)
+                .await
+                .map_err(|error| {
+                    QbitError::internal(
+                        StatusCode::CONFLICT,
+                        "failed to update pending torrent",
+                        error,
+                    )
+                })?
+        {
+            continue;
+        }
         let torrent = state
             .api
             .session()
@@ -1072,6 +1125,10 @@ async fn delete_torrents(
                 .api
                 .session()
                 .forget_pending_automation_torrent(info_hash)
+                .await
+                .map_err(|error| {
+                    QbitError::internal(StatusCode::CONFLICT, "failed to delete torrent", error)
+                })?
         {
             continue;
         }
@@ -2701,9 +2758,19 @@ mod tests {
                             .await
                             .unwrap();
                         assert_eq!(torrents[0]["hash"], info_hash);
-                        assert_eq!(torrents[0]["state"], "metaDL");
+                        assert_eq!(
+                            torrents[0]["state"],
+                            if field == "paused" && parsed == Some(true) {
+                                "pausedDL"
+                            } else {
+                                "metaDL"
+                            }
+                        );
                         assert!(
-                            session.forget_pending_automation_torrent(info_hash.parse().unwrap())
+                            session
+                                .forget_pending_automation_torrent(info_hash.parse().unwrap())
+                                .await
+                                .unwrap()
                         );
                     } else {
                         assert!(session.pending_automation_torrents().is_empty());
@@ -3221,6 +3288,183 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(diagnostics["pending_torrents"].as_array().unwrap().len(), 1);
+        session.stop().await;
+        server.abort();
+        tracker.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_pause_resume_and_native_forget_follow_authenticated_contract() {
+        let output = tempfile::tempdir().unwrap();
+        let persistence = tempfile::tempdir().unwrap();
+        let sentinel = output.path().join("keep-existing.bin");
+        tokio::fs::write(&sentinel, b"keep me").await.unwrap();
+        let (tracker_url, tracker) = start_empty_tracker().await;
+        let session = Session::new_with_opts(
+            output.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                persistence: Some(SessionPersistenceConfig::Json {
+                    folder: Some(persistence.path().to_path_buf()),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        session
+            .create_automation_category("pending-control".to_owned())
+            .await
+            .unwrap();
+        let (base, server) = start_full_http_api(session.clone(), true).await;
+        let native = base.trim_end_matches("/api/v2");
+        let client = reqwest::Client::new();
+        let hash = "abababababababababababababababababababab";
+        let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Paused%20Fixture&tr={tracker_url}");
+        let response = client
+            .post(format!("{base}/torrents/add"))
+            .basic_auth("test", Some("secret"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(
+                serde_urlencoded::to_string([
+                    ("urls", magnet.as_str()),
+                    ("paused", "true"),
+                    ("category", "pending-control"),
+                    ("ratioLimit", "1.5"),
+                    ("seedingTimeLimit", "10"),
+                ])
+                .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let info = client
+            .get(format!("{base}/torrents/info"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(info[0]["state"], "pausedDL");
+        assert_eq!(info[0]["ratio_limit"], 1.5);
+        assert_eq!(info[0]["seeding_time_limit"], 10);
+        assert_eq!(
+            session.pending_automation_torrents()[0].metadata_attempts,
+            0
+        );
+        let resume = client
+            .post(format!("{base}/torrents/resume"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!("hashes={hash}"));
+        assert_eq!(
+            resume.try_clone().unwrap().send().await.unwrap().status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            resume
+                .basic_auth("test", Some("secret"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        let pause_url = format!("{native}/torrents/{hash}/pause");
+        assert_eq!(
+            client.post(&pause_url).send().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .post(&pause_url)
+                .basic_auth("test", Some("secret"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        let list = client
+            .get(format!("{native}/torrents"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(list["pending_torrents"][0]["state"], "paused");
+        assert!(list["pending_torrents"][0]["next_retry_at_unix_seconds"].is_null());
+        assert_eq!(
+            client
+                .post(format!("{native}/torrents/{hash}/start"))
+                .basic_auth("test", Some("secret"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/pause"))
+                .basic_auth("test", Some("secret"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(format!("hashes={hash}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{native}/torrents/{hash}/forget"))
+                .basic_auth("test", Some("secret"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert!(session.pending_automation_torrents().is_empty());
+        assert_eq!(tokio::fs::read(&sentinel).await.unwrap(), b"keep me");
+        assert_eq!(
+            client
+                .post(&pause_url)
+                .basic_auth("test", Some("secret"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+        // An unavailable persistence target must not acknowledge or queue the submission.
+        let blocked = persistence.path().join("session.json.tmp");
+        tokio::fs::create_dir(&blocked).await.unwrap();
+        let response = client
+            .post(format!("{base}/torrents/add"))
+            .basic_auth("test", Some("secret"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(
+                serde_urlencoded::to_string([("urls", magnet.as_str()), ("paused", "true")])
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(response.text().await.unwrap(), "failed to add magnet");
+        assert!(session.pending_automation_torrents().is_empty());
+        tokio::fs::remove_dir(&blocked).await.unwrap();
         session.stop().await;
         server.abort();
         tracker.abort();

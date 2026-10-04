@@ -25,11 +25,13 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
-use super::{SerializedTorrent, SessionPersistenceStore};
+use super::{SerializedPendingTorrent, SerializedTorrent, SessionPersistenceStore};
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 struct SerializedSessionDatabase {
     torrents: HashMap<usize, SerializedTorrent>,
+    #[serde(default)]
+    pending_torrents: HashMap<String, SerializedPendingTorrent>,
     #[serde(default)]
     automation_categories: BTreeMap<String, AutomationCategory>,
 }
@@ -39,6 +41,7 @@ pub struct JsonSessionPersistenceStore {
     db_filename: PathBuf,
     db_content: tokio::sync::RwLock<SerializedSessionDatabase>,
     spawner: BlockingSpawner,
+    next_torrent_id: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for JsonSessionPersistenceStore {
@@ -64,7 +67,7 @@ impl JsonSessionPersistenceStore {
                 format!("couldn't create directory {output_folder:?} for session storage")
             })?;
 
-        let db = match tokio::fs::File::open(&db_filename).await {
+        let db: SerializedSessionDatabase = match tokio::fs::File::open(&db_filename).await {
             Ok(f) => {
                 let mut buf = Vec::new();
                 let mut rdr = tokio::io::BufReader::new(f);
@@ -78,7 +81,15 @@ impl JsonSessionPersistenceStore {
             }
         };
 
+        let next_torrent_id = db
+            .torrents
+            .keys()
+            .copied()
+            .max()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or(0);
         Ok(Self {
+            next_torrent_id: std::sync::atomic::AtomicUsize::new(next_torrent_id),
             db_filename,
             output_folder,
             db_content: tokio::sync::RwLock::new(db),
@@ -103,6 +114,10 @@ impl JsonSessionPersistenceStore {
     async fn flush(&self) -> anyhow::Result<()> {
         // we don't need the write lock technically, but we need to stop concurrent modifications
         let db_content = self.db_content.write().await;
+        self.flush_db(&db_content).await
+    }
+
+    async fn flush_db(&self, db_content: &SerializedSessionDatabase) -> anyhow::Result<()> {
         let tmp_filename = format!("{}.tmp", self.db_filename.to_str().unwrap());
         let mut tmp = tokio::fs::OpenOptions::new()
             .create(true)
@@ -114,12 +129,15 @@ impl JsonSessionPersistenceStore {
         trace!(?tmp_filename, "opened temp file");
 
         let mut buf = Vec::new();
-        serde_json::to_writer(&mut buf, &*db_content).context("error serializing")?;
+        serde_json::to_writer(&mut buf, db_content).context("error serializing")?;
 
         trace!(?tmp_filename, "serialized DB as JSON");
         tmp.write_all(&buf)
             .await
             .with_context(|| format!("error writing {tmp_filename:?}"))?;
+        tmp.flush().await?;
+        tmp.sync_all().await?;
+        drop(tmp);
         trace!(?tmp_filename, "wrote to temp file");
 
         tokio::fs::rename(&tmp_filename, &self.db_filename)
@@ -176,31 +194,44 @@ impl JsonSessionPersistenceStore {
 
         if write_torrent_file && !torrent_bytes.is_empty() {
             let torrent_bytes_file = self.torrent_bytes_filename(&torrent.info_hash());
-            match tokio::fs::OpenOptions::new()
+            let tmp_file = torrent_bytes_file.with_extension("torrent.tmp");
+            let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&torrent_bytes_file)
+                .open(&tmp_file)
                 .await
-            {
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(&torrent_bytes).await {
-                        warn!(error=?e, file=?torrent_bytes_file, "error writing torrent bytes")
-                    }
-                }
-                Err(e) => {
-                    warn!(error=?e, file=?torrent_bytes_file, "error opening torrent bytes file")
-                }
-            }
+                .context("error opening torrent metadata temp file")?;
+            file.write_all(&torrent_bytes)
+                .await
+                .context("error writing torrent metadata")?;
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&tmp_file, &torrent_bytes_file)
+                .await
+                .context("error committing torrent metadata")?;
         }
 
-        let previous = self.db_content.write().await.torrents.insert(id, st);
-        if let Err(error) = self.flush().await {
-            let mut db = self.db_content.write().await;
+        let mut db = self.db_content.write().await;
+        self.next_torrent_id
+            .fetch_max(id.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+        let previous = db.torrents.insert(id, st);
+        let hash = torrent.info_hash().as_string();
+        // Registration and pending removal are one durable transition.
+        let pending = if write_torrent_file {
+            db.pending_torrents.remove(&hash)
+        } else {
+            None
+        };
+        if let Err(error) = self.flush_db(&db).await {
             if let Some(previous) = previous {
                 db.torrents.insert(id, previous);
             } else {
                 db.torrents.remove(&id);
+            }
+            if let Some(pending) = pending {
+                db.pending_torrents.insert(hash, pending);
             }
             return Err(error);
         }
@@ -266,17 +297,54 @@ impl BitVFactory for JsonSessionPersistenceStore {
 
 #[async_trait]
 impl SessionPersistenceStore for JsonSessionPersistenceStore {
+    async fn load_pending(&self) -> anyhow::Result<Vec<SerializedPendingTorrent>> {
+        let db = self.db_content.read().await;
+        let mut records = Vec::with_capacity(db.pending_torrents.len());
+        for (hash, record) in &db.pending_torrents {
+            if *hash != record.info_hash.as_string() {
+                bail!("pending torrent identity mismatch");
+            }
+            records.push(record.clone());
+        }
+        Ok(records)
+    }
+
+    async fn store_pending(&self, torrent: &SerializedPendingTorrent) -> anyhow::Result<()> {
+        let mut db = self.db_content.write().await;
+        let key = torrent.info_hash().as_string();
+        let previous = db.pending_torrents.insert(key.clone(), torrent.clone());
+        if let Err(error) = self.flush_db(&db).await {
+            if let Some(previous) = previous {
+                db.pending_torrents.insert(key, previous);
+            } else {
+                db.pending_torrents.remove(&key);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn delete_pending(&self, info_hash: Id20) -> anyhow::Result<()> {
+        let mut db = self.db_content.write().await;
+        let key = info_hash.as_string();
+        let Some(previous) = db.pending_torrents.remove(&key) else {
+            return Ok(());
+        };
+        if let Err(error) = self.flush_db(&db).await {
+            db.pending_torrents.insert(key, previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn next_id(&self) -> anyhow::Result<TorrentId> {
-        Ok(self
-            .db_content
-            .read()
-            .await
-            .torrents
-            .keys()
-            .copied()
-            .max()
-            .map(|max| max + 1)
-            .unwrap_or(0))
+        self.next_torrent_id
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |id| id.checked_add(1),
+            )
+            .map_err(|_| anyhow::anyhow!("torrent ID space exhausted"))
     }
 
     async fn delete(&self, id: TorrentId) -> anyhow::Result<()> {
@@ -425,6 +493,7 @@ mod tests {
     fn old_session_json_defaults_automation_categories() {
         let db: SerializedSessionDatabase = serde_json::from_str(r#"{"torrents":{}}"#).unwrap();
         assert!(db.automation_categories.is_empty());
+        assert!(db.pending_torrents.is_empty());
     }
 
     #[tokio::test]
@@ -457,5 +526,18 @@ mod tests {
         .await
         .unwrap();
         assert!(restored.get(0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_torrent_ids_are_reserved_before_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonSessionPersistenceStore::new(
+            directory.path().to_path_buf(),
+            BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let (first, second) = tokio::join!(store.next_id(), store.next_id());
+        assert_ne!(first.unwrap(), second.unwrap());
     }
 }

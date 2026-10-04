@@ -244,11 +244,15 @@ impl Api {
                 info_hash: pending.info_hash.as_string(),
                 name: pending.name,
                 category: pending.automation.category,
-                state: match pending.state {
-                    crate::session::PendingAutomationTorrentState::ResolvingMetadata => {
-                        "resolving_metadata"
+                state: if pending.paused {
+                    "paused"
+                } else {
+                    match pending.state {
+                        crate::session::PendingAutomationTorrentState::ResolvingMetadata => {
+                            "resolving_metadata"
+                        }
+                        crate::session::PendingAutomationTorrentState::Error => "error",
                     }
-                    crate::session::PendingAutomationTorrentState::Error => "error",
                 },
                 metadata_attempts: pending.metadata_attempts,
                 error_code: pending.last_error.map(|error| error.code()),
@@ -316,6 +320,14 @@ impl Api {
         &self,
         idx: TorrentIdOrHash,
     ) -> Result<EmptyJsonResponse> {
+        if let TorrentIdOrHash::Hash(hash) = idx
+            && self
+                .session
+                .set_pending_automation_paused(hash, true)
+                .await?
+        {
+            return Ok(Default::default());
+        }
         let handle = self.mgr_handle(idx)?;
         self.session()
             .pause(&handle)
@@ -328,6 +340,14 @@ impl Api {
         &self,
         idx: TorrentIdOrHash,
     ) -> Result<EmptyJsonResponse> {
+        if let TorrentIdOrHash::Hash(hash) = idx
+            && self
+                .session
+                .set_pending_automation_paused(hash, false)
+                .await?
+        {
+            return Ok(Default::default());
+        }
         let handle = self.mgr_handle(idx)?;
         self.session
             .unpause(&handle)
