@@ -236,7 +236,31 @@ impl Api {
                 })
                 .collect()
         });
-        TorrentListResponse { torrents: items }
+        let mut pending_torrents: Vec<PendingTorrentResponse> = self
+            .session
+            .pending_automation_torrents()
+            .into_iter()
+            .map(|pending| PendingTorrentResponse {
+                info_hash: pending.info_hash.as_string(),
+                name: pending.name,
+                category: pending.automation.category,
+                state: match pending.state {
+                    crate::session::PendingAutomationTorrentState::ResolvingMetadata => {
+                        "resolving_metadata"
+                    }
+                    crate::session::PendingAutomationTorrentState::Error => "error",
+                },
+                metadata_attempts: pending.metadata_attempts,
+                error_code: pending.last_error.map(|error| error.code()),
+                message: pending.last_error.map(|error| error.to_string()),
+                next_retry_at_unix_seconds: pending.next_retry_at_unix_seconds,
+            })
+            .collect();
+        pending_torrents.sort_by(|a, b| a.info_hash.cmp(&b.info_hash));
+        TorrentListResponse {
+            torrents: items,
+            pending_torrents,
+        }
     }
 
     pub fn api_torrent_details(&self, idx: TorrentIdOrHash) -> Result<TorrentDetailsResponse> {
@@ -520,6 +544,20 @@ impl Api {
 #[derive(Serialize)]
 pub struct TorrentListResponse {
     pub torrents: Vec<TorrentDetailsResponse>,
+    /// Accepted automation magnets that do not yet have verified metadata.
+    pub pending_torrents: Vec<PendingTorrentResponse>,
+}
+
+#[derive(Serialize)]
+pub struct PendingTorrentResponse {
+    pub info_hash: String,
+    pub name: Option<String>,
+    pub category: String,
+    pub state: &'static str,
+    pub metadata_attempts: u32,
+    pub error_code: Option<&'static str>,
+    pub message: Option<String>,
+    pub next_retry_at_unix_seconds: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -64,6 +64,12 @@ This is not a full qBittorrent replacement. Queue ordering, sequential downloadi
 
 For a production-oriented Gluetun, Sonarr, and Radarr configuration with shared `/data` paths and hardlinks, use the [automation stack deployment guide](docker/compose-examples/automation-stack.md).
 
+Automation magnets remain visible immediately while metadata is discovered. A five-minute metadata deadline ends an attempt, not the job: rqbit retries after 30 seconds, doubling the delay up to five minutes. Backoff releases the shared eight-worker discovery limit; deleting a pending torrent cancels discovery and retries without deleting existing files. Timeouts and exhausted peer discovery remain `metaDL`; invalid metadata, unavailable discovery configuration, and failures adding the torrent remain `error`.
+
+The authenticated native `GET /torrents` response includes an additive `pending_torrents` collection with the hash, name, category, state, attempt count, sanitized error code/message, and next retry timestamp. The Web UI shows these jobs above the managed torrent list using its existing polling. It does not expose magnet URLs or tracker credentials. Pending jobs are still in memory only and must be resubmitted after a process restart; this change does not add pending persistence or pause/resume controls.
+
+Sonarr and Radarr translate qBittorrent `error` to a warning, and metadata discovery to a queued metadata download when DHT is enabled (otherwise a DHT-disabled warning); a client state cannot request a replacement release. Radarr explicitly excludes torrents from built-in failed download handling. Release blocklisting/replacement must be an explicit automation policy, separate from metadata discovery recovery. See [Sonarr's qBittorrent adapter](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/Clients/QBittorrent/QBittorrent.cs), [Radarr's qBittorrent adapter](https://github.com/Radarr/Radarr/blob/v6.4.4.10685/src/NzbDrone.Core/Download/Clients/QBittorrent/QBittorrent.cs), and [Radarr failed download handling](https://wiki.servarr.com/radarr/settings#failed-download-handling). Metadata exchange and hash validation follow [BEP 9](https://www.bittorrent.org/beps/bep_0009.html); an unreachable metadata source does not establish corruption.
+
 ## Persistence
 
 `rqbit server start` persists its state by default. Use a chosen JSON persistence directory when deploying a server:

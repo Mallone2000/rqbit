@@ -46,8 +46,29 @@ export interface AddTorrentResponse {
   seen_peers?: Array<string>;
 }
 
+export interface PendingTorrent {
+  info_hash: string;
+  name: string | null;
+  category: string;
+  state: "resolving_metadata" | "error";
+  metadata_attempts: number;
+  error_code:
+    | "metadata_timeout"
+    | "metadata_peers_exhausted"
+    | "no_peer_discovery"
+    | "invalid_metadata"
+    | "torrent_add_failed"
+    | "storage_initialization_failed"
+    | "persistence_failed"
+    | "torrent_start_failed"
+    | null;
+  message: string | null;
+  next_retry_at_unix_seconds: number | null;
+}
+
 export interface ListTorrentsResponse {
   torrents: Array<TorrentListItem>;
+  pending_torrents?: Array<PendingTorrent>;
 }
 
 export interface Speed {

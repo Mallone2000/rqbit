@@ -34,6 +34,9 @@ export const RqbitWebUI = (props: {
 
   const API = useContext(APIContext);
 
+  const setPendingTorrents = useTorrentStore(
+    (state) => state.setPendingTorrents,
+  );
   const setTorrents = useTorrentStore((state) => state.setTorrents);
   const setTorrentsLoading = useTorrentStore(
     (state) => state.setTorrentsLoading,
@@ -47,6 +50,7 @@ export const RqbitWebUI = (props: {
     try {
       const response = await API.listTorrents({ withStats: true });
       setTorrents(response.torrents);
+      setPendingTorrents(response.pending_torrents ?? []);
       setOtherError(null);
 
       // Determine polling interval based on torrent states

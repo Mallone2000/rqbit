@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { TorrentDetails, TorrentListItem } from "../api-types";
+import { PendingTorrent, TorrentDetails, TorrentListItem } from "../api-types";
 
 function deepEqual(obj1: any, obj2: any): boolean {
   // 1. Same reference or same primitive value
@@ -40,6 +40,8 @@ function torrentsEqual(a: TorrentListItem, b: TorrentListItem): boolean {
 }
 
 export interface TorrentStore {
+  pendingTorrents: Array<PendingTorrent>;
+  setPendingTorrents: (torrents: Array<PendingTorrent>) => void;
   torrents: Array<TorrentListItem> | null;
   setTorrents: (torrents: Array<TorrentListItem>) => void;
 
@@ -57,6 +59,8 @@ export interface TorrentStore {
 }
 
 export const useTorrentStore = create<TorrentStore>((set, get) => ({
+  pendingTorrents: [],
+  setPendingTorrents: (pendingTorrents) => set({ pendingTorrents }),
   torrents: null,
   torrentsLoading: false,
   torrentsInitiallyLoading: false,

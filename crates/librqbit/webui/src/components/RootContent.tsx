@@ -1,3 +1,4 @@
+import { PendingMetadata } from "./PendingMetadata";
 import { CardLayout } from "./CardLayout";
 import { ErrorComponent } from "./ErrorComponent";
 import { useTorrentStore } from "../stores/torrentStore";
@@ -15,20 +16,27 @@ export const RootContent = (props: {}) => {
     (state) => state.torrentsInitiallyLoading,
   );
 
+  const pendingTorrents = useTorrentStore((state) => state.pendingTorrents);
   const viewMode = useUIStore((state) => state.viewMode);
   const isLargeScreen = useIsLargeScreen();
 
   const useCompactLayout = viewMode === "compact" && isLargeScreen;
 
   return (
-    <div className={useCompactLayout ? "h-full" : "h-full flex flex-col"}>
+    <div className="h-full flex flex-col">
       <ErrorComponent
         error={closeableError}
         remove={() => setCloseableError(null)}
       />
       <ErrorComponent error={otherError} />
+      <PendingMetadata torrents={pendingTorrents} />
       {useCompactLayout ? (
-        <CompactLayout torrents={torrents} loading={torrentsInitiallyLoading} />
+        <div className="flex-1 min-h-0">
+          <CompactLayout
+            torrents={torrents}
+            loading={torrentsInitiallyLoading}
+          />
+        </div>
       ) : (
         <div className="flex-1 min-h-0">
           <CardLayout torrents={torrents} loading={torrentsInitiallyLoading} />

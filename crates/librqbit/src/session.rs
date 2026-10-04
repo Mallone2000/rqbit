@@ -79,6 +79,8 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 const MAX_PENDING_AUTOMATION_TORRENTS: usize = 64;
 const MAX_CONCURRENT_AUTOMATION_RESOLUTIONS: usize = 8;
 const AUTOMATION_METADATA_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const AUTOMATION_METADATA_RETRY_DELAY: Duration = Duration::from_secs(30);
+const AUTOMATION_METADATA_MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const MAX_REMOTE_TORRENT_SIZE: usize = 10 * 1024 * 1024;
 
 fn validate_sub_folder(path: &Path) -> anyhow::Result<()> {
@@ -121,10 +123,51 @@ pub struct SessionDatabase {
     pending_automation_torrents: HashMap<Id20, PendingAutomationTorrent>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum PendingAutomationTorrentState {
     ResolvingMetadata,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PendingAutomationError {
+    #[error(
+        "Metadata was not received before the discovery deadline; retrying. This does not establish corruption."
+    )]
+    MetadataTimeout,
+    #[error("Available peers did not provide metadata; retrying discovery.")]
+    MetadataPeersExhausted,
+    #[error("No peer discovery source is available. Supply a tracker or enable DHT.")]
+    NoPeerDiscovery,
+    #[error("Received torrent metadata is invalid.")]
+    InvalidMetadata,
+    #[error("Could not add the torrent. Review torrent options and server storage configuration.")]
+    TorrentAddFailed,
+    #[error(
+        "Could not initialize torrent files. Check free space, permissions, and the download path."
+    )]
+    StorageInitializationFailed,
+    #[error("Could not save the torrent session. Check access to session storage.")]
+    PersistenceFailed,
+    #[error("Could not start the torrent after receiving metadata.")]
+    TorrentStartFailed,
+}
+
+impl PendingAutomationError {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::MetadataTimeout => "metadata_timeout",
+            Self::MetadataPeersExhausted => "metadata_peers_exhausted",
+            Self::NoPeerDiscovery => "no_peer_discovery",
+            Self::InvalidMetadata => "invalid_metadata",
+            Self::TorrentAddFailed => "torrent_add_failed",
+            Self::StorageInitializationFailed => "storage_initialization_failed",
+            Self::PersistenceFailed => "persistence_failed",
+            Self::TorrentStartFailed => "torrent_start_failed",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +176,10 @@ pub(crate) struct PendingAutomationTorrent {
     pub name: Option<String>,
     pub automation: TorrentAutomationMetadata,
     pub state: PendingAutomationTorrentState,
+    pub metadata_attempts: u32,
+    pub last_error: Option<PendingAutomationError>,
+    pub next_retry_at_unix_seconds: Option<u64>,
+    generation: Arc<()>,
     cancellation_token: CancellationToken,
 }
 
@@ -614,6 +661,8 @@ struct InternalAddResult {
 struct MagnetResolutionControl {
     cancellation_token: CancellationToken,
     timeout: Duration,
+    retry_delay: Duration,
+    generation: Arc<()>,
 }
 
 impl Session {
@@ -1304,6 +1353,7 @@ impl Session {
             .as_id20()
             .context("magnet link didn't contain a BTv1 infohash")?;
         let cancellation_token = self.cancellation_token.child_token();
+        let generation = Arc::new(());
 
         {
             let mut db = self.db.write();
@@ -1328,6 +1378,10 @@ impl Session {
                     name: magnet.name,
                     automation: opts.automation.clone(),
                     state: PendingAutomationTorrentState::ResolvingMetadata,
+                    metadata_attempts: 0,
+                    last_error: None,
+                    next_retry_at_unix_seconds: None,
+                    generation: generation.clone(),
                     cancellation_token: cancellation_token.clone(),
                 },
             );
@@ -1338,14 +1392,6 @@ impl Session {
             debug_span!(parent: self.rs(), "resolve_pending_magnet", ?info_hash),
             "resolve_pending_magnet",
             async move {
-                let permit = tokio::select! {
-                    _ = cancellation_token.cancelled() => return Ok(()),
-                    permit = session
-                        .pending_automation_resolution_semaphore
-                        .clone()
-                        .acquire_owned()
-                        => permit.context("automation resolution semaphore is closed")?,
-                };
                 let result = session
                     .add_torrent_with_resolution_control(
                         AddTorrent::Url(magnet_url.into()),
@@ -1353,19 +1399,25 @@ impl Session {
                         Some(MagnetResolutionControl {
                             cancellation_token: cancellation_token.clone(),
                             timeout: AUTOMATION_METADATA_RESOLUTION_TIMEOUT,
+                            retry_delay: AUTOMATION_METADATA_RETRY_DELAY,
+                            generation: generation.clone(),
                         }),
                     )
                     .await;
-                drop(permit);
                 match result {
                     Ok(response) => {
-                        let pending = session
-                            .db
-                            .write()
-                            .pending_automation_torrents
-                            .remove(&info_hash);
+                        let pending = {
+                            let mut db = session.db.write();
+                            if db.pending_automation_torrents.get(&info_hash)
+                                .is_some_and(|pending| Arc::ptr_eq(&pending.generation, &generation))
+                            {
+                                db.pending_automation_torrents.remove(&info_hash)
+                            } else {
+                                None
+                            }
+                        };
                         match response {
-                            AddTorrentResponse::Added(_, torrent) => {
+                            AddTorrentResponse::Added(id, torrent) => {
                                 if let Some(pending) = pending {
                                     torrent.set_automation_category(pending.automation.category);
                                     torrent.set_automation_limits(
@@ -1374,7 +1426,7 @@ impl Session {
                                     );
                                     session.try_update_persistence_metadata(&torrent).await;
                                 } else if let Err(error) = session
-                                    .delete(TorrentIdOrHash::Hash(info_hash), false)
+                                    .delete(TorrentIdOrHash::Id(id), false)
                                     .await
                                 {
                                     warn!(?info_hash, error = ?error, "could not forget cancelled pending magnet");
@@ -1400,14 +1452,20 @@ impl Session {
                         if cancellation_token.is_cancelled() {
                             return Ok(());
                         }
-                        warn!(?info_hash, error = ?error, "error resolving pending magnet");
+                        let reason = error.downcast_ref::<PendingAutomationError>()
+                            .copied().unwrap_or(PendingAutomationError::TorrentAddFailed);
+                        // Arbitrary backend errors can contain private tracker URLs.
+                        warn!(?info_hash, %reason, "could not add pending magnet");
                         if let Some(pending) = session
                             .db
                             .write()
                             .pending_automation_torrents
                             .get_mut(&info_hash)
+                            .filter(|pending| Arc::ptr_eq(&pending.generation, &generation))
                         {
                             pending.state = PendingAutomationTorrentState::Error;
+                            pending.last_error = Some(reason);
+                            pending.next_retry_at_unix_seconds = None;
                         }
                     }
                 }
@@ -1418,7 +1476,8 @@ impl Session {
     }
 
     pub(crate) fn forget_pending_automation_torrent(&self, id: Id20) -> bool {
-        let pending = self.db.write().pending_automation_torrents.remove(&id);
+        let mut db = self.db.write();
+        let pending = db.pending_automation_torrents.remove(&id);
         if let Some(pending) = pending {
             pending.cancellation_token.cancel();
             true
@@ -1619,23 +1678,17 @@ impl Session {
                     (metadata, peer_rx)
                 }
                 None => {
-                    let peer_rx = make_peer_rx().context(
-                        "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
-                    )?;
-                    let resolve =
-                        self.resolve_magnet(info_hash, peer_rx, &trackers, opts.peer_opts);
-                    let resolved_magnet = if let Some(control) = resolution_control {
-                        tokio::select! {
-                            _ = control.cancellation_token.cancelled() => {
-                                bail!("magnet metadata resolution was cancelled")
-                            }
-                            result = tokio::time::timeout(control.timeout, resolve) => {
-                                result
-                                    .context("timed out resolving automation torrent metadata")??
-                            }
-                        }
+                    let resolve = || async {
+                        let peer_rx =
+                            make_peer_rx().ok_or(PendingAutomationError::NoPeerDiscovery)?;
+                        self.resolve_magnet(info_hash, peer_rx, &trackers, opts.peer_opts)
+                            .await
+                    };
+                    let resolved_magnet = if let Some(control) = resolution_control.as_ref() {
+                        self.resolve_automation_metadata(info_hash, control, resolve)
+                            .await?
                     } else {
-                        resolve.await?
+                        resolve().await?
                     };
 
                     // Add back seen_peers into the peer stream, as we consumed some peers
@@ -1708,6 +1761,12 @@ impl Session {
 
         let (managed_torrent, metadata) = {
             let mut g = self.db.write();
+            if resolution_control
+                .as_ref()
+                .is_some_and(|control| control.cancellation_token.is_cancelled())
+            {
+                bail!("magnet metadata resolution was cancelled")
+            }
             if let Some((id, handle)) = g.torrents.iter().find_map(|(eid, t)| {
                 if t.info_hash() == info_hash || *eid == id {
                     Some((*eid, t.clone()))
@@ -1754,7 +1813,8 @@ impl Session {
                 metadata.clone(),
                 only_files.clone(),
                 self.spawner
-                    .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
+                    .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))
+                    .context(PendingAutomationError::StorageInitializationFailed)?,
                 false,
             ));
             let handle = Arc::new(ManagedTorrent {
@@ -1776,14 +1836,14 @@ impl Session {
             && let Err(e) = p.store(id, &managed_torrent).await
         {
             self.db.write().torrents.remove(&id);
-            return Err(e);
+            return Err(e.context(PendingAutomationError::PersistenceFailed));
         }
 
         let _e = managed_torrent.shared.span.clone().entered();
 
         managed_torrent
             .start(peer_rx, opts.paused)
-            .context("error starting torrent")?;
+            .context(PendingAutomationError::TorrentStartFailed)?;
 
         if let Some(name) = metadata.info.name() {
             info!(?name, "added torrent");
@@ -2044,6 +2104,79 @@ impl Session {
         self.announce_port
     }
 
+    /// A discovery deadline is an attempt limit, not evidence of corrupt metadata.
+    /// Release the shared worker permit during backoff so unavailable swarms cannot
+    /// prevent other accepted jobs from discovering metadata.
+    async fn resolve_automation_metadata<T, F, Fut>(
+        &self,
+        info_hash: Id20,
+        control: &MagnetResolutionControl,
+        mut resolve: F,
+    ) -> anyhow::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        let mut retry_delay = control.retry_delay;
+        loop {
+            let permit = tokio::select! {
+                biased;
+                _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
+                permit = self.pending_automation_resolution_semaphore.clone().acquire_owned() =>
+                    permit.context("automation resolution semaphore is closed")?,
+            };
+            {
+                let mut db = self.db.write();
+                if let Some(pending) = db
+                    .pending_automation_torrents
+                    .get_mut(&info_hash)
+                    .filter(|pending| Arc::ptr_eq(&pending.generation, &control.generation))
+                {
+                    pending.metadata_attempts = pending.metadata_attempts.saturating_add(1);
+                    pending.next_retry_at_unix_seconds = None;
+                }
+            }
+            let result = tokio::select! {
+                biased;
+                _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
+                result = tokio::time::timeout(control.timeout, resolve()) => result,
+            };
+            drop(permit);
+            let reason = match result {
+                Ok(Ok(metadata)) => return Ok(metadata),
+                Err(_) => PendingAutomationError::MetadataTimeout,
+                Ok(Err(error))
+                    if error.downcast_ref::<PendingAutomationError>()
+                        == Some(&PendingAutomationError::MetadataPeersExhausted) =>
+                {
+                    PendingAutomationError::MetadataPeersExhausted
+                }
+                Ok(Err(error)) => return Err(error),
+            };
+            {
+                let mut db = self.db.write();
+                if let Some(pending) = db
+                    .pending_automation_torrents
+                    .get_mut(&info_hash)
+                    .filter(|pending| Arc::ptr_eq(&pending.generation, &control.generation))
+                {
+                    pending.last_error = Some(reason);
+                    pending.next_retry_at_unix_seconds =
+                        Some(unix_time_seconds().saturating_add(retry_delay.as_secs()));
+                }
+            }
+            warn!(?info_hash, %reason, retry_after_seconds = retry_delay.as_secs(), "waiting for torrent metadata");
+            tokio::select! {
+                biased;
+                _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
+                _ = tokio::time::sleep(retry_delay) => {}
+            }
+            retry_delay = retry_delay
+                .saturating_mul(2)
+                .min(AUTOMATION_METADATA_MAX_RETRY_DELAY);
+        }
+    }
+
     async fn resolve_magnet(
         self: &Arc<Self>,
         info_hash: Id20,
@@ -2069,7 +2202,9 @@ impl Session {
                 seen,
             } => {
                 trace!(?info, "received result from DHT");
-                let info = info.validate()?;
+                let info = info
+                    .validate()
+                    .map_err(|_| PendingAutomationError::InvalidMetadata)?;
                 Ok(ResolveMagnetResult {
                     metadata: TorrentMetadata::new(
                         info,
@@ -2087,7 +2222,7 @@ impl Session {
                 })
             }
             ReadMetainfoResult::ChannelClosed { .. } => {
-                bail!("input address stream exhausted, no way to discover torrent metainfo")
+                Err(PendingAutomationError::MetadataPeersExhausted.into())
             }
         }
     }
@@ -2235,9 +2370,15 @@ mod tests {
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
     use tokio::io::AsyncWriteExt;
 
+    use crate::TorrentAutomationMetadata;
+    use dht::Id20;
+    use std::{sync::Arc, time::Duration};
+
     use super::{
-        AddTorrentOptions, MAX_PENDING_AUTOMATION_TORRENTS, MAX_REMOTE_TORRENT_SIZE, Session,
-        SessionOptions, torrent_file_from_info_bytes, torrent_from_url, validate_sub_folder,
+        AddTorrentOptions, MAX_CONCURRENT_AUTOMATION_RESOLUTIONS, MAX_PENDING_AUTOMATION_TORRENTS,
+        MAX_REMOTE_TORRENT_SIZE, MagnetResolutionControl, PendingAutomationError,
+        PendingAutomationTorrent, PendingAutomationTorrentState, Session, SessionOptions,
+        torrent_file_from_info_bytes, torrent_from_url, validate_sub_folder,
     };
 
     #[test]
@@ -2364,5 +2505,248 @@ mod tests {
         assert!(session.forget_pending_automation_torrent(info_hash));
         assert!(cancellation_token.is_cancelled());
         session.stop().await;
+    }
+
+    async fn metadata_retry_fixture() -> (
+        Arc<Session>,
+        Id20,
+        MagnetResolutionControl,
+        tempfile::TempDir,
+    ) {
+        let output = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            output.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let info_hash = Id20::new([1; 20]);
+        let control = MagnetResolutionControl {
+            cancellation_token: session.cancellation_token.child_token(),
+            timeout: Duration::from_secs(300),
+            retry_delay: Duration::from_secs(30),
+            generation: Arc::new(()),
+        };
+        session.db.write().pending_automation_torrents.insert(
+            info_hash,
+            PendingAutomationTorrent {
+                info_hash,
+                name: Some("Retry fixture".to_owned()),
+                automation: TorrentAutomationMetadata {
+                    category: "sonarr".to_owned(),
+                    ..Default::default()
+                },
+                state: PendingAutomationTorrentState::ResolvingMetadata,
+                metadata_attempts: 0,
+                last_error: None,
+                next_retry_at_unix_seconds: None,
+                generation: control.generation.clone(),
+                cancellation_token: control.cancellation_token.clone(),
+            },
+        );
+        (session, info_hash, control, output)
+    }
+
+    async fn wait_for_metadata_attempt(session: &Session, attempts: u32, in_backoff: bool) {
+        for _ in 0..100 {
+            let pending = session.pending_automation_torrents();
+            if pending[0].metadata_attempts == attempts
+                && pending[0].next_retry_at_unix_seconds.is_some() == in_backoff
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("metadata resolver did not reach expected phase");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automation_metadata_timeout_retries_and_can_recover() {
+        let (session, info_hash, control, _output) = metadata_retry_fixture().await;
+        let worker_session = session.clone();
+        let worker = tokio::spawn(async move {
+            let mut attempt = 0;
+            worker_session
+                .resolve_automation_metadata(info_hash, &control, || {
+                    attempt += 1;
+                    let first_attempt = attempt == 1;
+                    async move {
+                        if first_attempt {
+                            futures::future::pending::<()>().await;
+                        }
+                        Ok(42)
+                    }
+                })
+                .await
+        });
+        wait_for_metadata_attempt(&session, 1, false).await;
+        tokio::time::advance(Duration::from_secs(300)).await;
+        wait_for_metadata_attempt(&session, 1, true).await;
+        let pending = session.pending_automation_torrents().pop().unwrap();
+        assert!(matches!(
+            pending.state,
+            PendingAutomationTorrentState::ResolvingMetadata
+        ));
+        assert_eq!(
+            pending.last_error,
+            Some(PendingAutomationError::MetadataTimeout)
+        );
+        assert_eq!(pending.automation.category, "sonarr");
+        assert_eq!(
+            session
+                .pending_automation_resolution_semaphore
+                .available_permits(),
+            MAX_CONCURRENT_AUTOMATION_RESOLUTIONS
+        );
+        #[cfg(feature = "tracing-subscriber-utils")]
+        let api = crate::Api::new(session.clone(), None, None);
+        #[cfg(not(feature = "tracing-subscriber-utils"))]
+        let api = crate::Api::new(session.clone(), None);
+        let json = serde_json::to_value(api.api_torrent_list()).unwrap();
+        assert_eq!(
+            json["pending_torrents"][0]["error_code"],
+            "metadata_timeout"
+        );
+        assert_eq!(
+            json["pending_torrents"][0]["info_hash"],
+            info_hash.as_string()
+        );
+        assert!(
+            json["pending_torrents"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not establish corruption")
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(worker.await.unwrap().unwrap(), 42);
+        assert_eq!(
+            session.pending_automation_torrents()[0].metadata_attempts,
+            2
+        );
+        assert!(
+            session.pending_automation_torrents()[0]
+                .next_retry_at_unix_seconds
+                .is_none()
+        );
+        session.cancellation_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automation_metadata_backoff_is_capped_and_deletion_cancels_it() {
+        let (session, info_hash, control, _output) = metadata_retry_fixture().await;
+        let worker_session = session.clone();
+        let worker = tokio::spawn(async move {
+            worker_session
+                .resolve_automation_metadata::<(), _, _>(info_hash, &control, || async {
+                    Err(PendingAutomationError::MetadataPeersExhausted.into())
+                })
+                .await
+        });
+        for (index, delay) in [30, 60, 120, 240, 300, 300].into_iter().enumerate() {
+            wait_for_metadata_attempt(&session, u32::try_from(index).unwrap() + 1, true).await;
+            assert_eq!(
+                session.pending_automation_torrents()[0].last_error,
+                Some(PendingAutomationError::MetadataPeersExhausted)
+            );
+            assert_eq!(
+                session
+                    .pending_automation_resolution_semaphore
+                    .available_permits(),
+                MAX_CONCURRENT_AUTOMATION_RESOLUTIONS
+            );
+            tokio::time::advance(Duration::from_secs(delay - 1)).await;
+            assert_eq!(
+                session.pending_automation_torrents()[0].metadata_attempts,
+                u32::try_from(index).unwrap() + 1
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert!(session.forget_pending_automation_torrent(info_hash));
+        assert!(worker.await.unwrap().is_err());
+        tokio::time::advance(Duration::from_secs(1000)).await;
+        assert!(session.pending_automation_torrents().is_empty());
+        session.cancellation_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automation_metadata_permanent_error_is_not_retried() {
+        let (session, info_hash, control, _output) = metadata_retry_fixture().await;
+        let error = session
+            .resolve_automation_metadata::<(), _, _>(info_hash, &control, || async {
+                Err(PendingAutomationError::InvalidMetadata.into())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<PendingAutomationError>(),
+            Some(&PendingAutomationError::InvalidMetadata)
+        );
+        assert_eq!(
+            session.pending_automation_torrents()[0].metadata_attempts,
+            1
+        );
+        assert_eq!(
+            session
+                .pending_automation_resolution_semaphore
+                .available_permits(),
+            MAX_CONCURRENT_AUTOMATION_RESOLUTIONS
+        );
+        session.cancellation_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automation_metadata_backoff_allows_queued_jobs_to_run() {
+        let (session, info_hash, control, _output) = metadata_retry_fixture().await;
+        let mut workers = Vec::new();
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..MAX_CONCURRENT_AUTOMATION_RESOLUTIONS + 1 {
+            let session = session.clone();
+            let started = started.clone();
+            let control = MagnetResolutionControl {
+                cancellation_token: control.cancellation_token.clone(),
+                timeout: control.timeout,
+                retry_delay: control.retry_delay,
+                generation: control.generation.clone(),
+            };
+            workers.push(tokio::spawn(async move {
+                session
+                    .resolve_automation_metadata::<(), _, _>(info_hash, &control, || {
+                        started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        futures::future::pending()
+                    })
+                    .await
+            }));
+        }
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CONCURRENT_AUTOMATION_RESOLUTIONS
+        );
+        tokio::time::advance(Duration::from_secs(300)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CONCURRENT_AUTOMATION_RESOLUTIONS + 1
+        );
+        control.cancellation_token.cancel();
+        for worker in workers {
+            assert!(worker.await.unwrap().is_err());
+        }
+        assert_eq!(
+            session
+                .pending_automation_resolution_semaphore
+                .available_permits(),
+            MAX_CONCURRENT_AUTOMATION_RESOLUTIONS
+        );
+        session.cancellation_token.cancel();
     }
 }

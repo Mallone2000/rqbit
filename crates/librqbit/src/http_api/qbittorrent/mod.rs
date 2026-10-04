@@ -3094,4 +3094,135 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn pending_metadata_diagnostics_are_authenticated_and_keep_serv_arr_states() {
+        let downloads = tempfile::tempdir().unwrap();
+        let (tracker_url, tracker) = start_empty_tracker().await;
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        session
+            .create_automation_category("sonarr".to_owned())
+            .await
+            .unwrap();
+        let (base, server) = start_full_http_api(session.clone(), true).await;
+        let native_url = format!("{}/torrents", base.trim_end_matches("/api/v2"));
+        let client = reqwest::Client::new();
+        let good_hash = "0202020202020202020202020202020202020202";
+        let bad_hash = "0303030303030303030303030303030303030303";
+        for magnet in [
+            format!("magnet:?xt=urn:btih:{good_hash}&dn=Waiting&tr={tracker_url}"),
+            format!("magnet:?xt=urn:btih:{bad_hash}&dn=NoDiscovery&x.private=private-test-value"),
+        ] {
+            let response = client
+                .post(format!("{base}/torrents/add"))
+                .basic_auth("test", Some("secret"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(
+                    serde_urlencoded::to_string([
+                        ("urls", magnet.as_str()),
+                        ("category", "sonarr"),
+                    ])
+                    .unwrap(),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+        assert_eq!(
+            client.get(&native_url).send().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let mut diagnostics = Value::Null;
+        for _ in 0..100 {
+            diagnostics = client
+                .get(&native_url)
+                .basic_auth("test", Some("secret"))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            if diagnostics["pending_torrents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|pending| pending["info_hash"] == bad_hash && pending["state"] == "error")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let pending = diagnostics["pending_torrents"].as_array().unwrap();
+        assert_eq!(pending.len(), 2);
+        let failed = pending
+            .iter()
+            .find(|pending| pending["info_hash"] == bad_hash)
+            .unwrap();
+        assert_eq!(failed["state"], "error");
+        assert_eq!(failed["error_code"], "no_peer_discovery");
+        assert!(failed["message"].as_str().unwrap().contains("enable DHT"));
+        assert!(failed["next_retry_at_unix_seconds"].is_null());
+        assert!(!diagnostics.to_string().contains("private-test-value"));
+        let torrents = client
+            .get(format!("{base}/torrents/info?category=sonarr"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let torrents = torrents.as_array().unwrap();
+        assert_eq!(
+            torrents
+                .iter()
+                .find(|torrent| torrent["hash"] == good_hash)
+                .unwrap()["state"],
+            "metaDL"
+        );
+        assert_eq!(
+            torrents
+                .iter()
+                .find(|torrent| torrent["hash"] == bad_hash)
+                .unwrap()["state"],
+            "error"
+        );
+        let deleted = client
+            .post(format!("{base}/torrents/delete"))
+            .basic_auth("test", Some("secret"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(
+                serde_urlencoded::to_string([("hashes", good_hash), ("deleteFiles", "false")])
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+        let diagnostics = client
+            .get(&native_url)
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(diagnostics["pending_torrents"].as_array().unwrap().len(), 1);
+        session.stop().await;
+        server.abort();
+        tracker.abort();
+    }
 }
