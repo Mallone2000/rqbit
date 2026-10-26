@@ -86,6 +86,9 @@ impl PostgresSessionStorage {
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS automation_metadata TEXT NOT NULL DEFAULT '{}'"
         );
         exec!("CREATE TABLE IF NOT EXISTS automation_categories (name TEXT PRIMARY KEY)");
+        exec!(
+            "CREATE TABLE IF NOT EXISTS automation_preferences (id INTEGER PRIMARY KEY CHECK (id = 1), excluded_file_names_enabled BOOLEAN NOT NULL, excluded_file_names TEXT NOT NULL)"
+        );
 
         exec!(
             "CREATE TABLE IF NOT EXISTS pending_torrents (info_hash BYTEA PRIMARY KEY, submission TEXT NOT NULL)"
@@ -96,6 +99,25 @@ impl PostgresSessionStorage {
 
 #[async_trait::async_trait]
 impl SessionPersistenceStore for PostgresSessionStorage {
+    async fn load_excluded_file_names(&self) -> anyhow::Result<(bool, String)> {
+        Ok(sqlx::query_as::<_, (bool, String)>(
+            "SELECT excluded_file_names_enabled, excluded_file_names FROM automation_preferences WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("error loading excluded file names")?
+        .unwrap_or((false, String::new())))
+    }
+
+    async fn store_excluded_file_names(&self, enabled: bool, patterns: &str) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO automation_preferences (id, excluded_file_names_enabled, excluded_file_names) VALUES (1, $1, $2) ON CONFLICT (id) DO UPDATE SET excluded_file_names_enabled = EXCLUDED.excluded_file_names_enabled, excluded_file_names = EXCLUDED.excluded_file_names")
+            .bind(enabled)
+            .bind(patterns)
+            .execute(&self.pool)
+            .await
+            .context("error storing excluded file names")?;
+        Ok(())
+    }
     async fn load_pending(&self) -> anyhow::Result<Vec<SerializedPendingTorrent>> {
         let rows: Vec<(Vec<u8>, String)> =
             sqlx::query_as("SELECT info_hash, submission FROM pending_torrents")

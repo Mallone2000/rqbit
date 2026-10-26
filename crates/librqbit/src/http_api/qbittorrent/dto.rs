@@ -14,6 +14,8 @@ pub(super) struct Preferences {
     pub max_seeding_time: u64,
     pub max_inactive_seeding_time_enabled: bool,
     pub max_inactive_seeding_time: u64,
+    pub excluded_file_names_enabled: bool,
+    pub excluded_file_names: String,
 }
 
 #[derive(Serialize)]
@@ -30,6 +32,12 @@ pub(super) struct TorrentInfo {
     pub size: u64,
     pub progress: f64,
     pub eta: u64,
+    pub dlspeed: u64,
+    pub downloaded: u64,
+    pub added_on: u64,
+    pub completion_on: u64,
+    pub num_complete: i64,
+    pub tags: String,
     pub state: &'static str,
     pub label: String,
     pub category: String,
@@ -83,6 +91,7 @@ pub(super) struct TorrentProperties {
     pub dl_limit: i64,
     pub up_limit: i64,
     pub piece_size: u32,
+    pub is_private: bool,
 }
 
 #[derive(Serialize)]

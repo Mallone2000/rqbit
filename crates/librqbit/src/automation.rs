@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 pub struct TorrentAutomationMetadata {
     #[serde(default)]
     pub category: String,
+    /// qBittorrent tags attached to this torrent. Stored with pending magnets too.
+    #[serde(default)]
+    pub tags: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub ratio_limit: Option<f64>,
     /// Active completed time limit, stored in seconds. Protocol adapters may
@@ -32,4 +35,19 @@ pub struct TorrentAutomationMetadata {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AutomationCategory {
     pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TorrentAutomationMetadata;
+
+    #[test]
+    fn older_automation_metadata_defaults_tags() {
+        let metadata: TorrentAutomationMetadata =
+            serde_json::from_str(r#"{"category":"sonarr"}"#).unwrap();
+        assert!(metadata.tags.is_empty());
+        let mut tagged = metadata;
+        tagged.tags.insert("cleanup".to_owned());
+        assert!(serde_json::to_string(&tagged).unwrap().contains("cleanup"));
+    }
 }

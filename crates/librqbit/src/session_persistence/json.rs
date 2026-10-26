@@ -34,6 +34,10 @@ struct SerializedSessionDatabase {
     pending_torrents: HashMap<String, SerializedPendingTorrent>,
     #[serde(default)]
     automation_categories: BTreeMap<String, AutomationCategory>,
+    #[serde(default)]
+    excluded_file_names_enabled: bool,
+    #[serde(default)]
+    excluded_file_names: String,
 }
 
 pub struct JsonSessionPersistenceStore {
@@ -297,6 +301,33 @@ impl BitVFactory for JsonSessionPersistenceStore {
 
 #[async_trait]
 impl SessionPersistenceStore for JsonSessionPersistenceStore {
+    async fn load_excluded_file_names(&self) -> anyhow::Result<(bool, String)> {
+        let db = self.db_content.read().await;
+        Ok((
+            db.excluded_file_names_enabled,
+            db.excluded_file_names.clone(),
+        ))
+    }
+
+    async fn store_excluded_file_names(&self, enabled: bool, patterns: &str) -> anyhow::Result<()> {
+        let previous = {
+            let mut db = self.db_content.write().await;
+            let previous = (
+                db.excluded_file_names_enabled,
+                db.excluded_file_names.clone(),
+            );
+            db.excluded_file_names_enabled = enabled;
+            db.excluded_file_names = patterns.to_owned();
+            previous
+        };
+        if let Err(error) = self.flush().await {
+            let mut db = self.db_content.write().await;
+            db.excluded_file_names_enabled = previous.0;
+            db.excluded_file_names = previous.1;
+            return Err(error);
+        }
+        Ok(())
+    }
     async fn load_pending(&self) -> anyhow::Result<Vec<SerializedPendingTorrent>> {
         let db = self.db_content.read().await;
         let mut records = Vec::with_capacity(db.pending_torrents.len());
@@ -494,6 +525,33 @@ mod tests {
         let db: SerializedSessionDatabase = serde_json::from_str(r#"{"torrents":{}}"#).unwrap();
         assert!(db.automation_categories.is_empty());
         assert!(db.pending_torrents.is_empty());
+        assert!(!db.excluded_file_names_enabled);
+        assert!(db.excluded_file_names.is_empty());
+    }
+
+    #[tokio::test]
+    async fn excluded_file_names_survive_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonSessionPersistenceStore::new(
+            directory.path().to_path_buf(),
+            BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        store
+            .store_excluded_file_names(true, "*.exe\nSample*")
+            .await
+            .unwrap();
+        let restored = JsonSessionPersistenceStore::new(
+            directory.path().to_path_buf(),
+            BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restored.load_excluded_file_names().await.unwrap(),
+            (true, "*.exe\nSample*".to_owned())
+        );
     }
 
     #[tokio::test]

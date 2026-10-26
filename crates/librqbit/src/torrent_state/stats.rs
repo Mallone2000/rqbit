@@ -190,6 +190,12 @@ fn format_seconds_to_time(seconds: u64, f: &mut core::fmt::Formatter<'_>) -> cor
 
 pub struct DurationWithHumanReadable(Duration);
 
+impl DurationWithHumanReadable {
+    pub fn as_secs(&self) -> u64 {
+        self.0.as_secs()
+    }
+}
+
 impl core::fmt::Display for DurationWithHumanReadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> core::fmt::Result {
         format_seconds_to_time(self.0.as_secs(), f)

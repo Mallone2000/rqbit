@@ -713,6 +713,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         } else {
             None
         },
+        qbittorrent_api_key: std::env::var("RQBIT_QBITTORRENT_API_KEY").ok(),
         allow_create: opts.http_api_allow_create,
         max_upload_body_size: opts.http_api_max_upload_size,
         enable_qbittorrent_api: opts.qbittorrent_api_enable,

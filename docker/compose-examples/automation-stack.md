@@ -15,6 +15,10 @@ For remote access, keep the application ports private and place an authenticated
 HTTPS reverse proxy or another trusted encrypted access layer in front of them.
 rqbit refuses to start the qBittorrent compatibility API unless a non-empty
 `RQBIT_HTTP_BASIC_AUTH_USERPASS` value is configured.
+For Cleanuparr's optional API key connection, add a non-empty
+`RQBIT_QBITTORRENT_API_KEY` secret to rqbit's environment and configure the
+same key in Cleanuparr. Keep the username/password setting for rqbit's native
+API and Sonarr/Radarr clients.
 
 The Compose example uses `ghcr.io/mallone2000/rqbit:latest`. A successful build
 of the `main` branch publishes that rolling multi-architecture image. Update an
@@ -76,6 +80,15 @@ Cleanuparr, connect it to rqbit and both Arr applications, configure its
 for metadata and error states, and enable [Seeker's replacement search](https://cleanuparr.github.io/docs/configuration/seeker/).
 Let Cleanuparr remove the failed item from the Arr queue so it can request a
 replacement; deleting it only in rqbit cannot do that.
+
+Cleanuparr's Malware Blocker, Download Cleaner, tagging, and blacklist
+synchronizer use the same qBittorrent API. Give Cleanuparr access to the same
+`/data` download tree to enable unlinked and orphaned file checks. Its
+blacklist sync updates the excluded-name pattern list; explicitly enable
+`excluded_file_names_enabled` through the qBittorrent preferences API before
+expecting new additions to skip those names. Existing torrents keep their
+saved file selections. Tracker seeder counts remain `-1` until a tracker
+reports them, and trackerless torrents may remain unknown.
 
 Enable **Use Hardlinks instead of Copy** in Sonarr/Radarr. The download and
 library directories must be on the same host filesystem beneath `DATA_ROOT`.

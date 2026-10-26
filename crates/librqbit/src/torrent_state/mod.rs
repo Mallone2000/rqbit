@@ -257,6 +257,10 @@ impl ManagedTorrent {
         self.shared.automation.write().category = category;
     }
 
+    pub(crate) fn set_automation_tags(&self, tags: std::collections::BTreeSet<String>) {
+        self.shared.automation.write().tags = tags;
+    }
+
     pub fn set_automation_limits(
         &self,
         ratio_limit: Option<f64>,

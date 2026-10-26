@@ -139,7 +139,7 @@ pub struct TrackerResponse<'a> {
     pub warning_message: Option<ByteBuf<'a>>,
     #[allow(dead_code)]
     #[serde(default)]
-    pub complete: u64,
+    pub complete: Option<u64>,
     pub interval: u64,
     #[allow(dead_code)]
     #[serde(rename = "min interval")]
@@ -148,7 +148,7 @@ pub struct TrackerResponse<'a> {
     pub tracker_id: Option<ByteBuf<'a>>,
     #[allow(dead_code)]
     #[serde(default)]
-    pub incomplete: u64,
+    pub incomplete: Option<u64>,
     #[serde(borrow)]
     pub peers: Peers<'a, SocketAddrV4>,
     #[serde(default, borrow)]

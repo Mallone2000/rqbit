@@ -304,6 +304,7 @@ impl TestHarness {
             Some(HttpApiOptions {
                 read_only: false,
                 basic_auth: None,
+                qbittorrent_api_key: None,
                 allow_create: true,
                 max_upload_body_size: None,
                 prometheus_handle: None,

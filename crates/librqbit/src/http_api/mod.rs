@@ -40,6 +40,8 @@ pub struct HttpApi {
 pub struct HttpApiOptions {
     pub read_only: bool,
     pub basic_auth: Option<(String, String)>,
+    /// Optional Bearer credential accepted only by the qBittorrent compatibility API.
+    pub qbittorrent_api_key: Option<String>,
     // Allow creating torrents via API.
     pub allow_create: bool,
     /// Maximum upload body size.
@@ -58,6 +60,10 @@ impl std::fmt::Debug for HttpApiOptions {
             .field(
                 "basic_auth",
                 &self.basic_auth.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "qbittorrent_api_key",
+                &self.qbittorrent_api_key.as_ref().map(|_| "<redacted>"),
             )
             .field("allow_create", &self.allow_create)
             .field("max_upload_body_size", &self.max_upload_body_size)
@@ -162,6 +168,10 @@ fn credential_digest(value: &str) -> [u8; 32] {
     digest.finish()
 }
 
+pub(crate) fn constant_time_secret_match(expected: &str, supplied: &str) -> bool {
+    constant_time_eq(&credential_digest(expected), &credential_digest(supplied))
+}
+
 fn constant_time_eq(expected: &[u8; 32], actual: &[u8; 32]) -> bool {
     let mut difference = 0_u8;
     for index in 0..expected.len() {
@@ -232,6 +242,15 @@ impl HttpApi {
                 anyhow::bail!("basic authentication requires a non-empty username and password")
             }
             .boxed();
+        }
+        if self.opts.enable_qbittorrent_api
+            && self
+                .opts
+                .qbittorrent_api_key
+                .as_ref()
+                .is_some_and(String::is_empty)
+        {
+            return async { anyhow::bail!("qBittorrent API key must not be empty") }.boxed();
         }
         let enforce_loopback_host =
             listener.bind_addr().ip().is_loopback() && !credentials_configured;
@@ -415,6 +434,7 @@ mod tests {
     fn debug_output_redacts_basic_auth_credentials() {
         let options = HttpApiOptions {
             basic_auth: Some(("sensitive-user".to_owned(), "sensitive-pass".to_owned())),
+            qbittorrent_api_key: Some("sensitive-key".to_owned()),
             ..Default::default()
         };
 
@@ -422,6 +442,7 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("sensitive-user"));
         assert!(!debug.contains("sensitive-pass"));
+        assert!(!debug.contains("sensitive-key"));
     }
 
     #[test]

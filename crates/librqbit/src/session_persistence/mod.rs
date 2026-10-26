@@ -111,6 +111,8 @@ impl std::fmt::Debug for SerializedPendingTorrent {
 // TODO: make this info_hash first, ID-second.
 #[async_trait]
 pub trait SessionPersistenceStore: core::fmt::Debug + Send + Sync + BitVFactory {
+    async fn load_excluded_file_names(&self) -> anyhow::Result<(bool, String)>;
+    async fn store_excluded_file_names(&self, enabled: bool, patterns: &str) -> anyhow::Result<()>;
     async fn load_pending(&self) -> anyhow::Result<Vec<SerializedPendingTorrent>>;
     async fn store_pending(&self, torrent: &SerializedPendingTorrent) -> anyhow::Result<()>;
     async fn delete_pending(&self, info_hash: Id20) -> anyhow::Result<()>;

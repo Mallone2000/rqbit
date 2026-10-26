@@ -354,6 +354,16 @@ pub(super) async fn require_auth(
         state.qbittorrent_sessions.clear_login_failures(client_ip);
         return next.run(request).await;
     }
+    if let Some((expected, supplied)) = state.opts.qbittorrent_api_key.as_deref().zip(
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer ")),
+    ) && crate::http_api::constant_time_secret_match(expected, supplied)
+    {
+        state.qbittorrent_sessions.clear_login_failures(client_ip);
+        return next.run(request).await;
+    }
     if headers.contains_key(AUTHORIZATION) {
         state.qbittorrent_sessions.record_login_failure(client_ip);
     }

@@ -74,7 +74,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
-use tracker_comms::{TrackerComms, UdpTrackerClient};
+use tracker_comms::{TrackerAnnounce, TrackerComms, TrackerObserver, UdpTrackerClient};
 
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
@@ -189,6 +189,12 @@ pub(crate) struct PendingAutomationTorrent {
 }
 
 impl PendingAutomationTorrent {
+    pub(crate) fn tracker_urls(&self) -> Vec<String> {
+        Magnet::parse(&self.submission.magnet_url)
+            .map(|magnet| magnet.trackers)
+            .unwrap_or_default()
+    }
+
     fn serialized(&self) -> anyhow::Result<SerializedPendingTorrent> {
         let mut record = (*self.submission).clone();
         record.options["paused"] = self.paused.into();
@@ -234,6 +240,9 @@ pub struct Session {
     peer_opts: PeerConnectionOptions,
     default_storage_factory: Option<BoxStorageFactory>,
     persistence: Option<Arc<dyn SessionPersistenceStore>>,
+    excluded_file_names: RwLock<ExcludedFileNames>,
+    excluded_file_names_mutation: tokio::sync::Mutex<()>,
+    tracker_announces: RwLock<HashMap<Id20, HashMap<String, TrackerAnnounce>>>,
     trackers: HashSet<url::Url>,
 
     lsd: Option<LocalServiceDiscovery>,
@@ -257,6 +266,77 @@ pub struct Session {
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
     client_name_and_version: String,
+}
+
+#[derive(Default)]
+struct ExcludedFileNames {
+    enabled: bool,
+    patterns: String,
+    compiled: Vec<regex::Regex>,
+}
+
+impl ExcludedFileNames {
+    fn new(enabled: bool, patterns: String) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            patterns.len() <= 64 * 1024,
+            "excluded file names are too long"
+        );
+        let mut compiled = Vec::new();
+        for pattern in patterns.lines().map(str::trim).filter(|p| !p.is_empty()) {
+            anyhow::ensure!(compiled.len() < 256, "too many excluded file name patterns");
+            let mut expression = String::from("(?i)^");
+            let mut chars = pattern.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '*' => expression.push_str(".*"),
+                    '?' => expression.push('.'),
+                    '[' => {
+                        let mut class = String::new();
+                        for next in chars.by_ref() {
+                            if next == ']' {
+                                break;
+                            }
+                            class.push(next);
+                        }
+                        if class.is_empty()
+                            || !class
+                                .chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '!')
+                        {
+                            expression.push_str("\\[");
+                            expression.push_str(&regex::escape(&class));
+                            expression.push_str("\\]");
+                        } else {
+                            expression.push('[');
+                            if let Some(negated) = class.strip_prefix('!') {
+                                expression.push('^');
+                                expression.push_str(negated);
+                            } else {
+                                expression.push_str(&class);
+                            }
+                            expression.push(']');
+                        }
+                    }
+                    _ => expression.push_str(&regex::escape(&ch.to_string())),
+                }
+            }
+            expression.push('$');
+            compiled.push(regex::Regex::new(&expression)?);
+        }
+        Ok(Self {
+            enabled,
+            patterns,
+            compiled,
+        })
+    }
+
+    fn excludes(&self, path: &Path) -> bool {
+        self.enabled
+            && path.components().any(|component| {
+                let name = component.as_os_str().to_string_lossy();
+                self.compiled.iter().any(|pattern| pattern.is_match(&name))
+            })
+    }
 }
 
 async fn torrent_from_url(
@@ -723,6 +803,76 @@ impl Session {
         name.is_empty() || self.db.read().automation_categories.contains_key(name)
     }
 
+    pub(crate) fn excluded_file_names(&self) -> (bool, String) {
+        let settings = self.excluded_file_names.read();
+        (settings.enabled, settings.patterns.clone())
+    }
+
+    pub(crate) fn tracker_announces(&self, hash: Id20) -> HashMap<String, TrackerAnnounce> {
+        self.tracker_announces
+            .read()
+            .get(&hash)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn set_excluded_file_names(
+        &self,
+        enabled: Option<bool>,
+        patterns: Option<String>,
+    ) -> anyhow::Result<()> {
+        let _guard = self.excluded_file_names_mutation.lock().await;
+        let (old_enabled, old_patterns) = self.excluded_file_names();
+        let updated = ExcludedFileNames::new(
+            enabled.unwrap_or(old_enabled),
+            patterns.unwrap_or(old_patterns),
+        )?;
+        if let Some(store) = self.persistence.as_ref() {
+            store
+                .store_excluded_file_names(updated.enabled, &updated.patterns)
+                .await?;
+        }
+        *self.excluded_file_names.write() = updated;
+        Ok(())
+    }
+
+    pub(crate) async fn add_automation_tags(
+        &self,
+        id: TorrentIdOrHash,
+        tags: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<()> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        if let Some(torrent) = self.get(id) {
+            let old = torrent.automation_metadata().tags;
+            let mut updated = old.clone();
+            updated.extend(tags.iter().cloned());
+            torrent.set_automation_tags(updated);
+            if let Err(error) = self.update_persistence_metadata(&torrent).await {
+                torrent.set_automation_tags(old);
+                return Err(error);
+            }
+            return Ok(());
+        }
+        if let TorrentIdOrHash::Hash(hash) = id {
+            let pending = self
+                .db
+                .read()
+                .pending_automation_torrents
+                .get(&hash)
+                .cloned();
+            if let Some(mut pending) = pending {
+                pending.automation.tags.extend(tags.iter().cloned());
+                self.persist_pending_automation(&pending).await?;
+                self.db
+                    .write()
+                    .pending_automation_torrents
+                    .insert(hash, pending);
+                return Ok(());
+            }
+        }
+        bail!("no such torrent in db")
+    }
+
     /// Returns false when the category already exists.
     pub async fn create_automation_category(&self, name: String) -> anyhow::Result<bool> {
         if self.db.read().automation_categories.contains_key(&name) {
@@ -1036,8 +1186,17 @@ impl Session {
                 }
             };
 
+            let excluded_file_names = if let Some(store) = persistence.as_ref() {
+                let (enabled, patterns) = store.load_excluded_file_names().await?;
+                ExcludedFileNames::new(enabled, patterns)?
+            } else {
+                ExcludedFileNames::default()
+            };
             let session = Arc::new(Self {
                 persistence,
+                excluded_file_names: RwLock::new(excluded_file_names),
+                excluded_file_names_mutation: tokio::sync::Mutex::new(()),
+                tracker_announces: RwLock::new(HashMap::new()),
                 bitv_factory,
                 peer_id,
                 dht,
@@ -1624,6 +1783,7 @@ impl Session {
         if let Some(pending) = self.db.write().pending_automation_torrents.remove(&hash) {
             pending.cancellation_token.cancel();
         }
+        self.tracker_announces.write().remove(&hash);
         Ok(true)
     }
 
@@ -1953,12 +2113,38 @@ impl Session {
 
         trace!("Torrent metadata: {:#?}", &metadata.info.info());
 
-        let only_files = compute_only_files(
+        let mut only_files = compute_only_files(
             &metadata.info,
             opts.only_files,
             opts.only_files_regex,
             opts.list_only,
         )?;
+        if opts.preferred_id.is_none() && !opts.list_only {
+            let excluded = self.excluded_file_names.read();
+            if excluded.enabled && !excluded.compiled.is_empty() {
+                let selected = only_files
+                    .take()
+                    .map(|files| files.into_iter().collect::<HashSet<_>>());
+                only_files = Some(
+                    metadata
+                        .info
+                        .iter_file_details()
+                        .enumerate()
+                        .filter_map(|(index, file)| {
+                            if selected
+                                .as_ref()
+                                .is_none_or(|selected| selected.contains(&index))
+                                && !excluded.excludes(&file.filename.to_pathbuf())
+                            {
+                                Some(index)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
 
         let output_folder = match (opts.output_folder, opts.sub_folder) {
             (None, None) => self.output_folder.join(
@@ -2145,6 +2331,7 @@ impl Session {
                     pending.cancellation_token.cancel();
                 }
                 if self.get(id).is_none() {
+                    self.tracker_announces.write().remove(&hash);
                     return Ok(());
                 }
             }
@@ -2218,6 +2405,7 @@ impl Session {
             .torrents
             .remove(&id)
             .context("torrent disappeared while deleting")?;
+        self.tracker_announces.write().remove(&torrent.info_hash());
 
         info!(id, "deleted torrent");
         Ok(())
@@ -2283,6 +2471,17 @@ impl Session {
             info_hash,
             session: self.clone(),
         };
+        let weak_session = Arc::downgrade(self);
+        let observer: TrackerObserver = Arc::new(move |url, announce| {
+            if let Some(session) = weak_session.upgrade() {
+                session
+                    .tracker_announces
+                    .write()
+                    .entry(info_hash)
+                    .or_default()
+                    .insert(url.as_str().to_owned(), announce);
+            }
+        });
         let tracker_rx = TrackerComms::start(
             info_hash,
             self.peer_id,
@@ -2292,6 +2491,7 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            Some(observer),
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {
@@ -2638,6 +2838,22 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn excluded_file_names_match_case_insensitive_files_and_parent_directories() {
+        let settings =
+            super::ExcludedFileNames::new(true, "*.EXE\nSample*\nclip[0-9].mkv".to_owned())
+                .unwrap();
+        assert!(settings.excludes(std::path::Path::new("Movie/Payload.exe")));
+        assert!(settings.excludes(std::path::Path::new("Sample Extras/video.mkv")));
+        assert!(settings.excludes(std::path::Path::new("Movie/clip3.mkv")));
+        assert!(!settings.excludes(std::path::Path::new("Movie/video.mkv")));
+        assert!(
+            !super::ExcludedFileNames::new(false, "*.exe".to_owned())
+                .unwrap()
+                .excludes(std::path::Path::new("payload.exe"))
+        );
+    }
+
     use buffers::ByteBuf;
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};

@@ -3,6 +3,7 @@ mod dto;
 
 use std::{
     collections::{BTreeMap, HashSet},
+    path::Path,
     sync::Arc,
 };
 
@@ -38,6 +39,13 @@ const WEB_API_VERSION: &str = "2.8.1";
 const UNKNOWN_ETA_SECONDS: u64 = 8_640_000;
 const MAX_LOGIN_BODY_SIZE: usize = 8 * 1024;
 const MAX_MAGNET_URL_SIZE: usize = 16 * 1024;
+
+fn path_for_qbittorrent(path: &Path) -> String {
+    path.components()
+        .collect::<std::path::PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
 
 #[derive(Debug)]
 struct QbitError {
@@ -102,11 +110,13 @@ pub(super) fn make_api_router(state: ApiState) -> Router {
 
     if !state.opts.read_only {
         protected = protected
+            .route("/app/setPreferences", post(set_preferences))
             .route("/torrents/add", post(add_torrent))
             .route("/torrents/delete", post(delete_torrents))
             .route("/torrents/createCategory", post(create_category))
             .route("/torrents/removeCategories", post(remove_categories))
             .route("/torrents/setCategory", post(set_category))
+            .route("/torrents/addTags", post(add_tags))
             .route("/torrents/setShareLimits", post(set_share_limits))
             .route("/torrents/pause", post(pause_torrents))
             .route("/torrents/resume", post(resume_torrents))
@@ -142,6 +152,8 @@ async fn app_version() -> impl IntoResponse {
 }
 
 async fn preferences(State(state): State<ApiState>) -> Json<Preferences> {
+    let (excluded_file_names_enabled, excluded_file_names) =
+        state.api.session().excluded_file_names();
     Json(Preferences {
         save_path: state
             .api
@@ -158,7 +170,55 @@ async fn preferences(State(state): State<ApiState>) -> Json<Preferences> {
         max_seeding_time: 0,
         max_inactive_seeding_time_enabled: false,
         max_inactive_seeding_time: 0,
+        excluded_file_names_enabled,
+        excluded_file_names,
     })
+}
+
+#[derive(Deserialize)]
+struct PreferencesForm {
+    json: String,
+}
+
+async fn set_preferences(
+    State(state): State<ApiState>,
+    Form(form): Form<PreferencesForm>,
+) -> QbitResult<StatusCode> {
+    let value: serde_json::Value = serde_json::from_str(&form.json)
+        .map_err(|_| QbitError::bad_request("invalid preferences JSON"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| QbitError::bad_request("preferences must be an object"))?;
+    let enabled = object
+        .get("excluded_file_names_enabled")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                QbitError::bad_request("excluded_file_names_enabled must be a boolean")
+            })
+        })
+        .transpose()?;
+    let patterns = object
+        .get("excluded_file_names")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| QbitError::bad_request("excluded_file_names must be a string"))
+        })
+        .transpose()?;
+    state
+        .api
+        .session()
+        .set_excluded_file_names(enabled, patterns)
+        .await
+        .map_err(|error| {
+            QbitError::internal(
+                StatusCode::BAD_REQUEST,
+                "invalid excluded file names",
+                error,
+            )
+        })?;
+    Ok(StatusCode::OK)
 }
 
 #[derive(Default, Deserialize)]
@@ -220,6 +280,19 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                     stats.progress_bytes as f64 / stats.total_bytes as f64
                 };
                 let ratio = share_ratio(automation.uploaded_bytes, stats.progress_bytes);
+                let dlspeed = stats
+                    .live
+                    .as_ref()
+                    .map_or(0, |live| live.download_speed.as_bytes());
+                let eta = if stats.finished {
+                    0
+                } else {
+                    stats
+                        .live
+                        .as_ref()
+                        .and_then(|live| live.time_remaining.as_ref())
+                        .map_or(UNKNOWN_ETA_SECONDS, |time| time.as_secs())
+                };
                 let state_name = torrent_state_name(
                     stats.state,
                     stats.finished,
@@ -241,15 +314,25 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                         .unwrap_or_else(|| torrent.info_hash().as_string()),
                     size: stats.total_bytes,
                     progress,
-                    eta: UNKNOWN_ETA_SECONDS,
+                    eta,
+                    dlspeed,
+                    downloaded: stats.progress_bytes,
+                    added_on: automation.added_at_unix_seconds,
+                    completion_on: automation.completed_at_unix_seconds.unwrap_or_default(),
+                    num_complete: known_seeders(&session.tracker_announces(torrent.info_hash())),
+                    tags: automation
+                        .tags
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     state: state_name,
                     label: category.clone(),
                     category,
-                    save_path: save_path.clone(),
-                    content_path: content_path
-                        .unwrap_or_else(|| torrent.output_folder().to_path_buf())
-                        .to_string_lossy()
-                        .into_owned(),
+                    save_path: path_for_qbittorrent(torrent.output_folder()),
+                    content_path: path_for_qbittorrent(
+                        &content_path.unwrap_or_else(|| torrent.output_folder().to_path_buf()),
+                    ),
                     ratio,
                     ratio_limit: automation.ratio_limit.unwrap_or(-2.0),
                     seeding_time: automation.seeding_seconds,
@@ -284,6 +367,18 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
             size: 0,
             progress: 0.0,
             eta: UNKNOWN_ETA_SECONDS,
+            dlspeed: 0,
+            downloaded: 0,
+            added_on: pending.automation.added_at_unix_seconds,
+            completion_on: 0,
+            num_complete: known_seeders(&session.tracker_announces(pending.info_hash)),
+            tags: pending
+                .automation
+                .tags
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
             state: if pending.paused {
                 "pausedDL"
             } else {
@@ -390,10 +485,44 @@ async fn torrent_properties(
     State(state): State<ApiState>,
     Query(query): Query<HashQuery>,
 ) -> QbitResult<Json<TorrentProperties>> {
+    let id = parse_hash(&query.hash)?;
+    if state.api.session().get(id).is_none()
+        && let TorrentIdOrHash::Hash(hash) = id
+        && let Some(pending) = state
+            .api
+            .session()
+            .pending_automation_torrents()
+            .into_iter()
+            .find(|pending| pending.info_hash == hash)
+    {
+        return Ok(Json(TorrentProperties {
+            save_path: state
+                .api
+                .session()
+                .output_folder()
+                .to_string_lossy()
+                .into_owned(),
+            total_size: 0,
+            total_downloaded: 0,
+            total_uploaded: 0,
+            total_wasted: 0,
+            time_elapsed: 0,
+            seeding_time: 0,
+            nb_connections: 0,
+            share_ratio: 0.0,
+            addition_date: pending.automation.added_at_unix_seconds,
+            completion_date: 0,
+            created_by: String::new(),
+            dl_limit: -1,
+            up_limit: -1,
+            piece_size: 0,
+            is_private: false,
+        }));
+    }
     let torrent = state
         .api
         .session()
-        .get(parse_hash(&query.hash)?)
+        .get(id)
         .ok_or_else(|| QbitError::not_found("torrent not found"))?;
     let (stats, automation, _) = torrent.refresh_automation_stats(unix_time_seconds());
     let metadata = torrent
@@ -403,12 +532,7 @@ async fn torrent_properties(
     let share_ratio = share_ratio(automation.uploaded_bytes, stats.progress_bytes);
 
     Ok(Json(TorrentProperties {
-        save_path: state
-            .api
-            .session()
-            .output_folder()
-            .to_string_lossy()
-            .into_owned(),
+        save_path: path_for_qbittorrent(torrent.output_folder()),
         total_size: stats.total_bytes,
         total_downloaded: stats.progress_bytes,
         total_uploaded: automation.uploaded_bytes,
@@ -427,6 +551,7 @@ async fn torrent_properties(
         dl_limit: -1,
         up_limit: -1,
         piece_size: metadata.info.lengths().default_piece_length(),
+        is_private: metadata.info.info().private,
     }))
 }
 
@@ -434,10 +559,28 @@ async fn torrent_trackers(
     State(state): State<ApiState>,
     Query(query): Query<HashQuery>,
 ) -> QbitResult<Json<Vec<TorrentTracker>>> {
+    let id = parse_hash(&query.hash)?;
+    if state.api.session().get(id).is_none()
+        && let TorrentIdOrHash::Hash(hash) = id
+        && let Some(pending) = state
+            .api
+            .session()
+            .pending_automation_torrents()
+            .into_iter()
+            .find(|pending| pending.info_hash == hash)
+    {
+        let mut seen = HashSet::new();
+        let mut trackers = Vec::new();
+        for url in pending.tracker_urls() {
+            push_tracker(&mut trackers, &mut seen, &url, 0);
+        }
+        apply_tracker_announces(&mut trackers, &state.api.session().tracker_announces(hash));
+        return Ok(Json(trackers));
+    }
     let torrent = state
         .api
         .session()
-        .get(parse_hash(&query.hash)?)
+        .get(id)
         .ok_or_else(|| QbitError::not_found("torrent not found"))?;
     let mut seen = HashSet::new();
     let mut trackers = Vec::new();
@@ -475,7 +618,48 @@ async fn torrent_trackers(
         push_tracker(&mut trackers, &mut seen, url, 0);
     }
 
+    apply_tracker_announces(
+        &mut trackers,
+        &state.api.session().tracker_announces(torrent.info_hash()),
+    );
+
     Ok(Json(trackers))
+}
+
+fn known_seeders(
+    announces: &std::collections::HashMap<String, tracker_comms::TrackerAnnounce>,
+) -> i64 {
+    announces
+        .values()
+        .filter(|announce| announce.status == 2)
+        .filter_map(|announce| announce.seeds)
+        .max()
+        .map(|seeds| i64::try_from(seeds).unwrap_or(i64::MAX))
+        .unwrap_or(-1)
+}
+
+fn apply_tracker_announces(
+    trackers: &mut [TorrentTracker],
+    announces: &std::collections::HashMap<String, tracker_comms::TrackerAnnounce>,
+) {
+    for tracker in trackers {
+        if let Some(announce) = announces.get(&tracker.url) {
+            tracker.status = announce.status;
+            tracker.num_seeds = announce
+                .seeds
+                .map(|count| i64::try_from(count).unwrap_or(i64::MAX))
+                .unwrap_or(-1);
+            tracker.num_leeches = announce
+                .leeches
+                .map(|count| i64::try_from(count).unwrap_or(i64::MAX))
+                .unwrap_or(-1);
+            tracker.num_peers = announce
+                .peers
+                .map(|count| i64::try_from(count).unwrap_or(i64::MAX))
+                .unwrap_or(-1);
+            tracker.msg = announce.message.clone();
+        }
+    }
 }
 
 fn push_tracker(
@@ -508,10 +692,22 @@ async fn torrent_files(
     State(state): State<ApiState>,
     Query(query): Query<HashQuery>,
 ) -> QbitResult<Json<Vec<TorrentFile>>> {
+    let id = parse_hash(&query.hash)?;
+    if state.api.session().get(id).is_none()
+        && let TorrentIdOrHash::Hash(hash) = id
+        && state
+            .api
+            .session()
+            .pending_automation_torrents()
+            .iter()
+            .any(|pending| pending.info_hash == hash)
+    {
+        return Ok(Json(Vec::new()));
+    }
     let torrent = state
         .api
         .session()
-        .get(parse_hash(&query.hash)?)
+        .get(id)
         .ok_or_else(|| QbitError::not_found("torrent not found"))?;
     let stats = torrent.stats();
     let metadata = torrent
@@ -957,6 +1153,44 @@ async fn set_category(
 }
 
 #[derive(Deserialize)]
+struct AddTagsForm {
+    hashes: String,
+    tags: String,
+}
+
+async fn add_tags(
+    State(state): State<ApiState>,
+    Form(form): Form<AddTagsForm>,
+) -> QbitResult<StatusCode> {
+    let tags = form
+        .tags
+        .split(',')
+        .map(str::trim)
+        .map(|tag| {
+            if tag.is_empty() || tag.len() > 128 || tag.chars().any(char::is_control) {
+                Err(QbitError::bad_request("invalid tag"))
+            } else {
+                Ok(tag.to_owned())
+            }
+        })
+        .collect::<QbitResult<std::collections::BTreeSet<_>>>()?;
+    if tags.is_empty() || tags.len() > 64 {
+        return Err(QbitError::bad_request("invalid number of tags"));
+    }
+    for hash in parse_hashes(&form.hashes)? {
+        state
+            .api
+            .session()
+            .add_automation_tags(hash, &tags)
+            .await
+            .map_err(|error| {
+                QbitError::internal(StatusCode::CONFLICT, "failed to add tags", error)
+            })?;
+    }
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ShareLimitsForm {
     hashes: String,
@@ -1216,6 +1450,10 @@ mod tests {
         (format!("http://{address}"), task)
     }
 
+    fn form_body(fields: &[(&str, &str)]) -> String {
+        serde_urlencoded::to_string(fields).unwrap()
+    }
+
     async fn start_empty_tracker() -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1230,6 +1468,116 @@ mod tests {
             .unwrap();
         });
         (format!("http://{address}/announce"), task)
+    }
+
+    async fn start_tracker_health_fixture() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/working",
+                        get(|| async { "d8:completei7e10:incompletei2e8:intervali60e5:peers0:e" }),
+                    )
+                    .route(
+                        "/failed",
+                        get(|| async { "d14:failure reason20:unregistered torrente" }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn tracker_health_and_seed_counts_are_reported() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(HttpApi::new(
+            Api::new(session.clone(), None, None),
+            Some(HttpApiOptions {
+                read_only: false,
+                basic_auth: Some(("client".to_owned(), "password".to_owned())),
+                enable_qbittorrent_api: true,
+                ..Default::default()
+            }),
+        ));
+        let (base, server) = start_server(make_api_router(state)).await;
+        let (tracker_base, tracker) = start_tracker_health_fixture().await;
+        let client = reqwest::Client::new();
+        for (hash, suffix, expected_status) in [
+            ("b2".repeat(20), "working", 2),
+            ("c3".repeat(20), "failed", 4),
+        ] {
+            let magnet = format!("magnet:?xt=urn:btih:{hash}&tr={tracker_base}/{suffix}");
+            assert_eq!(
+                client
+                    .post(format!("{base}/torrents/add"))
+                    .basic_auth("client", Some("password"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(form_body(&[("urls", &magnet)]))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::OK
+            );
+            let mut observed = false;
+            for _ in 0..100 {
+                let trackers: Value = client
+                    .get(format!("{base}/torrents/trackers?hash={hash}"))
+                    .basic_auth("client", Some("password"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if trackers[0]["status"] == expected_status {
+                    observed = true;
+                    if expected_status == 2 {
+                        assert_eq!(trackers[0]["num_seeds"], 7);
+                        let info: Value = client
+                            .get(format!("{base}/torrents/info?hashes={hash}"))
+                            .basic_auth("client", Some("password"))
+                            .send()
+                            .await
+                            .unwrap()
+                            .json()
+                            .await
+                            .unwrap();
+                        assert_eq!(info[0]["num_complete"], 7);
+                    } else {
+                        assert!(
+                            trackers[0]["msg"]
+                                .as_str()
+                                .unwrap()
+                                .contains("unregistered")
+                        );
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(observed, "tracker announce was not reported for {suffix}");
+        }
+        tracker.abort();
+        server.abort();
     }
 
     async fn start_full_http_api(
@@ -1253,6 +1601,256 @@ mod tests {
         .make_http_api_and_run(listener, None);
         let task = tokio::spawn(async move { server.await.unwrap() });
         (format!("http://{address}/api/v2"), task)
+    }
+
+    #[tokio::test]
+    async fn cleanuparr_pending_contract_and_bearer_auth() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(HttpApi::new(
+            Api::new(session.clone(), None, None),
+            Some(HttpApiOptions {
+                read_only: false,
+                basic_auth: Some(("client".to_owned(), "password".to_owned())),
+                qbittorrent_api_key: Some("test-api-key".to_owned()),
+                enable_qbittorrent_api: true,
+                ..Default::default()
+            }),
+        ));
+        let (base, server) = start_server(make_api_router(state)).await;
+        let client = reqwest::Client::new();
+        assert_eq!(
+            client
+                .get(format!("{base}/torrents/info"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/torrents/info"))
+                .bearer_auth("wrong-key")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/app/setPreferences"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("json=%7B%7D")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/app/setPreferences"))
+                .bearer_auth("test-api-key")
+                .header("Origin", "https://untrusted.example")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("json=%7B%7D")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/app/setPreferences"))
+                .bearer_auth("test-api-key")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(form_body(&[(
+                    "json",
+                    r#"{"excluded_file_names_enabled":"true"}"#
+                )]))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+
+        let response = client
+            .post(format!("{base}/app/setPreferences"))
+            .bearer_auth("test-api-key")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_body(&[(
+                "json",
+                r#"{"excluded_file_names":"*.exe\nSample*","excluded_file_names_enabled":true}"#,
+            )]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let preferences: Value = client
+            .get(format!("{base}/app/preferences"))
+            .bearer_auth("test-api-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(preferences["excluded_file_names_enabled"], true);
+        assert_eq!(preferences["excluded_file_names"], "*.exe\nSample*");
+
+        let source = tempfile::tempdir().unwrap();
+        let movie = source.path().join("Movie");
+        std::fs::create_dir(&movie).unwrap();
+        std::fs::write(movie.join("video.mkv"), b"safe media").unwrap();
+        std::fs::write(movie.join("payload.exe"), b"blocked file").unwrap();
+        let torrent = create_torrent(
+            &movie,
+            CreateTorrentOptions::default(),
+            &BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let managed = session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(torrent.as_bytes().unwrap()),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        let names = managed
+            .metadata
+            .load_full()
+            .unwrap()
+            .file_infos
+            .iter()
+            .map(|file| file.relative_filename.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let blocked = names
+            .iter()
+            .position(|name| name.ends_with("payload.exe"))
+            .unwrap();
+        let allowed = names
+            .iter()
+            .position(|name| name.ends_with("video.mkv"))
+            .unwrap();
+        let selected = managed.only_files().unwrap();
+        assert!(!selected.contains(&blocked));
+        assert!(selected.contains(&allowed));
+
+        let hash = "a1".repeat(20);
+        let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Pending");
+        let response = client
+            .post(format!("{base}/torrents/add"))
+            .bearer_auth("test-api-key")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_body(&[("urls", magnet.as_str())]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let info: Value = client
+            .get(format!("{base}/torrents/info?hashes={hash}"))
+            .bearer_auth("test-api-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(info[0]["hash"], hash);
+        assert_eq!(info[0]["num_complete"], -1);
+        assert_eq!(info[0]["dlspeed"], 0);
+        assert!(info[0]["added_on"].as_u64().unwrap() > 0);
+        let properties: Value = client
+            .get(format!("{base}/torrents/properties?hash={hash}"))
+            .bearer_auth("test-api-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(properties["is_private"], false);
+        let files: Value = client
+            .get(format!("{base}/torrents/files?hash={hash}"))
+            .bearer_auth("test-api-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(files.as_array().unwrap().is_empty());
+        let response = client
+            .post(format!("{base}/torrents/addTags"))
+            .bearer_auth("test-api-key")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_body(&[
+                ("hashes", hash.as_str()),
+                ("tags", "unlinked"),
+            ]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let info: Value = client
+            .get(format!("{base}/torrents/info?hashes={hash}"))
+            .bearer_auth("test-api-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(info[0]["tags"], "unlinked");
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/addTags"))
+                .bearer_auth("test-api-key")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(form_body(&[
+                    ("hashes", hash.as_str()),
+                    ("tags", "bad,tag\nname")
+                ]))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let response = client
+            .post(format!("{base}/torrents/delete"))
+            .bearer_auth("test-api-key")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_body(&[
+                ("hashes", hash.as_str()),
+                ("deleteFiles", "false"),
+            ]))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.abort();
     }
 
     fn multipart_body(boundary: &str, category: &str, filename: &str, torrent: &[u8]) -> Vec<u8> {
@@ -2017,9 +2615,14 @@ mod tests {
         let torrents = torrents.as_array().unwrap();
         assert_eq!(torrents.len(), 2);
         for torrent in torrents {
+            let expected_save_path = if torrent["name"] == single_name {
+                downloads.path().to_path_buf()
+            } else {
+                downloads.path().join("Show Name")
+            };
             assert_eq!(
                 torrent["save_path"],
-                downloads.path().to_string_lossy().as_ref()
+                expected_save_path.to_string_lossy().as_ref()
             );
             let expected_content_path = if torrent["name"] == single_name {
                 downloads.path().join(single_name)
@@ -2030,7 +2633,9 @@ mod tests {
                 torrent["content_path"],
                 expected_content_path.to_string_lossy().as_ref()
             );
-            assert_ne!(torrent["content_path"], torrent["save_path"]);
+            if torrent["name"] == single_name {
+                assert_ne!(torrent["content_path"], torrent["save_path"]);
+            }
         }
 
         let inspected_hash = torrents[0]["hash"].as_str().unwrap();
@@ -2043,10 +2648,7 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(
-            properties["save_path"],
-            downloads.path().to_string_lossy().as_ref()
-        );
+        assert_eq!(properties["save_path"], torrents[0]["save_path"]);
         assert!(properties["total_size"].as_u64().unwrap() > 0);
 
         let files: Value = client
@@ -2251,6 +2853,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        for (path, body) in [
+            ("app/setPreferences", "json=%7B%7D"),
+            ("torrents/addTags", "hashes=all&tags=blocked"),
+        ] {
+            let response = reqwest::Client::new()
+                .post(format!("{base}/{path}"))
+                .basic_auth("test", Some("secret"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        }
         server.abort();
     }
 
@@ -2428,11 +3044,16 @@ mod tests {
                         seeding_time_limit_seconds: Some(600),
                         uploaded_bytes: 200,
                         seeding_seconds: 42,
+                        tags: ["cleanup".to_owned()].into_iter().collect(),
                         ..Default::default()
                     },
                     ..Default::default()
                 }),
             )
+            .await
+            .unwrap();
+        session
+            .set_excluded_file_names(Some(true), Some("*.exe".to_owned()))
             .await
             .unwrap();
         session.stop().await;
@@ -2451,6 +3072,8 @@ mod tests {
         assert_eq!(metadata[0].seeding_time_limit_seconds, Some(600));
         assert_eq!(metadata[0].uploaded_bytes, 200);
         assert_eq!(metadata[0].seeding_seconds, 42);
+        assert!(metadata[0].tags.contains("cleanup"));
+        assert_eq!(restored.excluded_file_names(), (true, "*.exe".to_owned()));
 
         let state = Arc::new(HttpApi::new(
             Api::new(restored.clone(), None, None),
