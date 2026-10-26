@@ -3,7 +3,7 @@ import { APIContext } from "../context";
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { PendingTorrent } from "../api-types";
-import { PendingMetadata } from "./PendingMetadata";
+import { executePendingActions, PendingMetadata } from "./PendingMetadata";
 
 const fixture: PendingTorrent = {
   info_hash: "0101010101010101010101010101010101010101",
@@ -12,8 +12,7 @@ const fixture: PendingTorrent = {
   state: "resolving_metadata",
   metadata_attempts: 1,
   error_code: "metadata_peers_exhausted",
-  message:
-    "Available peers did not provide metadata; retrying discovery.",
+  message: "Available peers did not provide metadata; retrying discovery.",
   next_retry_at_unix_seconds: 12345,
 };
 
@@ -70,6 +69,71 @@ describe("pending metadata diagnostics", () => {
     );
     expect(html).toContain(">Pause</button>");
     expect(html).toContain("Remove, keep files");
+  });
+
+  it("offers selection and bulk actions for pending torrents", () => {
+    const html = renderToStaticMarkup(
+      <WithActions>
+        <PendingMetadata
+          torrents={[
+            fixture,
+            {
+              ...fixture,
+              info_hash: "0202020202020202020202020202020202020202",
+              name: "Second fixture",
+              state: "error",
+            },
+          ]}
+        />
+      </WithActions>,
+    );
+    expect(html).toContain("Select all");
+    expect(html).toContain("Select Linux fixture");
+    expect(html).toContain("Select Second fixture");
+    expect(html).toContain("Pause selected (0)");
+    expect(html).toContain("Resume / retry selected (0)");
+    expect(html).toContain("Remove selected, keep files (0)");
+    expect(html).toContain("disabled");
+  });
+
+  it("does not offer selection when pending actions are unavailable", () => {
+    const html = renderToStaticMarkup(<PendingMetadata torrents={[fixture]} />);
+    expect(html).not.toContain("Select all");
+    expect(html).not.toContain("Select Linux fixture");
+  });
+
+  it("continues bulk actions after a failure and reports each result", async () => {
+    const second = {
+      ...fixture,
+      info_hash: "0202020202020202020202020202020202020202",
+      name: "Second fixture",
+    };
+    const calls: string[] = [];
+    const result = await executePendingActions(
+      [fixture, second],
+      "forget",
+      async (hash, action) => {
+        calls.push(`${hash}:${action}`);
+        if (hash === fixture.info_hash) throw new Error("request failed");
+      },
+    );
+    expect(calls).toEqual([
+      `${fixture.info_hash}:forget`,
+      `${second.info_hash}:forget`,
+    ]);
+    expect(result).toEqual({
+      succeeded: [second.info_hash],
+      failed: ["Linux fixture: request failed"],
+    });
+  });
+
+  it("shows the API's error text for a failed pending action", async () => {
+    const result = await executePendingActions([fixture], "pause", async () => {
+      throw { text: "Torrent was already removed" };
+    });
+    expect(result.failed).toEqual([
+      "Linux fixture: Torrent was already removed",
+    ]);
   });
 
   it("shows paused discovery as stopped and offers resume", () => {
