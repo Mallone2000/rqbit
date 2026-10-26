@@ -69,6 +69,25 @@ Categories inherit rqbit's global download directory; they do not move content.
 Do not configure a Remote Path Mapping: `/data` has the same meaning in all
 three containers.
 
+To request a replacement automatically when a magnet has not obtained metadata
+within five minutes, set these variables on the rqbit service (supply the keys
+through your environment or secret manager, not in the Compose file):
+
+```yaml
+environment:
+  RQBIT_SONARR_URL: http://127.0.0.1:8989
+  RQBIT_SONARR_API_KEY: ${SONARR_API_KEY:?}
+  RQBIT_RADARR_URL: http://127.0.0.1:7878
+  RQBIT_RADARR_API_KEY: ${RADARR_API_KEY:?}
+```
+
+The default routing categories are `sonarr` and `radarr`. Set
+`RQBIT_SONARR_CATEGORY` or `RQBIT_RADARR_CATEGORY` on rqbit if you chose different
+download-client categories. rqbit blocklists the timed-out queue entry in the
+corresponding service, requests an episode or movie search, then removes the
+pending magnet. Keep rqbit session persistence enabled so interrupted service
+requests can be retried after restart.
+
 Enable **Use Hardlinks instead of Copy** in Sonarr/Radarr. The download and
 library directories must be on the same host filesystem beneath `DATA_ROOT`.
 The import leaves rqbit's download path in place for seeding; later removal with

@@ -26,6 +26,7 @@ use crate::{
     merge_streams::merge_streams,
     peer_connection::PeerConnectionOptions,
     read_buf::ReadBuf,
+    servarr::{ReplacementPlan, ServarrService},
     session_persistence::{
         SerializedPendingTorrent, SessionPersistenceStore, json::JsonSessionPersistenceStore,
     },
@@ -184,6 +185,7 @@ pub(crate) struct PendingAutomationTorrent {
     pub metadata_attempts: u32,
     pub last_error: Option<PendingAutomationError>,
     pub next_retry_at_unix_seconds: Option<u64>,
+    replacement: Option<ReplacementPlan>,
     generation: Arc<()>,
     cancellation_token: CancellationToken,
 }
@@ -198,6 +200,7 @@ impl PendingAutomationTorrent {
         record.metadata_attempts = self.metadata_attempts;
         record.last_error = self.last_error;
         record.next_retry_at_unix_seconds = self.next_retry_at_unix_seconds;
+        record.replacement = self.replacement.clone();
         Ok(record)
     }
 }
@@ -234,6 +237,7 @@ pub struct Session {
     peer_opts: PeerConnectionOptions,
     default_storage_factory: Option<BoxStorageFactory>,
     persistence: Option<Arc<dyn SessionPersistenceStore>>,
+    servarr_services: Vec<ServarrService>,
     trackers: HashSet<url::Url>,
 
     lsd: Option<LocalServiceDiscovery>,
@@ -566,6 +570,9 @@ pub struct SessionOptions {
     /// all remembered torrents will continue where they left off.
     pub persistence: Option<SessionPersistenceConfig>,
 
+    /// Optional Sonarr/Radarr connections used to recover timed-out automation magnets.
+    pub servarr_services: Vec<crate::ServarrConfig>,
+
     /// The peer ID to use. If not specified, a random one will be generated.
     pub peer_id: Option<Id20>,
 
@@ -621,6 +628,7 @@ impl Default for SessionOptions {
             disable_trackers: false,
             fastresume: false,
             persistence: None,
+            servarr_services: Vec::new(),
             peer_id: None,
             listen: None,
             connect: None,
@@ -983,6 +991,16 @@ impl Session {
                     .context("error building HTTP(S) client")?
             };
 
+            let mut servarr_services = Vec::new();
+            let mut servarr_categories = HashSet::new();
+            for config in opts.servarr_services {
+                anyhow::ensure!(
+                    servarr_categories.insert(config.category.clone()),
+                    "multiple Servarr services use the same category"
+                );
+                servarr_services.push(ServarrService::new(config)?);
+            }
+
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
@@ -1052,6 +1070,7 @@ impl Session {
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
+                servarr_services,
                 connector: stream_connector,
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),
@@ -1408,6 +1427,7 @@ impl Session {
             metadata_attempts: 0,
             last_error: None,
             next_retry_at_unix_seconds: None,
+            replacement: None,
         };
         self.register_pending_automation(record, true).await
     }
@@ -1462,6 +1482,7 @@ impl Session {
             metadata_attempts: record.metadata_attempts,
             last_error: record.last_error,
             next_retry_at_unix_seconds: record.next_retry_at_unix_seconds,
+            replacement: record.replacement.clone(),
             submission: Arc::new(record),
             generation: Arc::new(()),
             cancellation_token: self.cancellation_token.child_token(),
@@ -1477,6 +1498,10 @@ impl Session {
             )
         {
             self.spawn_pending_automation_resolution(pending);
+        } else if !pending.paused
+            && pending.last_error == Some(PendingAutomationError::MetadataTimeout)
+        {
+            self.spawn_pending_replacement(pending);
         }
         Ok(true)
     }
@@ -1531,6 +1556,7 @@ impl Session {
         let Some(mut current) = current else {
             return Ok(());
         };
+        let mut replacement_pending = None;
         match resolve {
             Ok(AddTorrentResponse::Added(..)) => {
                 // store() atomically removed the durable pending record.
@@ -1583,8 +1609,15 @@ impl Session {
                     .db
                     .write()
                     .pending_automation_torrents
-                    .insert(info_hash, current);
+                    .insert(info_hash, current.clone());
+                if reason == PendingAutomationError::MetadataTimeout {
+                    replacement_pending = Some(current);
+                }
             }
+        }
+        drop(_guard);
+        if let Some(pending) = replacement_pending {
+            session.spawn_pending_replacement(pending);
         }
         Ok(())
     }
@@ -1600,6 +1633,236 @@ impl Session {
                 .context(PendingAutomationError::PersistenceFailed)?;
         }
         Ok(())
+    }
+
+    fn spawn_pending_replacement(self: &Arc<Self>, pending: PendingAutomationTorrent) {
+        if !self
+            .servarr_services
+            .iter()
+            .any(|service| service.category == pending.automation.category)
+        {
+            return;
+        }
+        let info_hash = pending.info_hash;
+        self.spawn(
+            debug_span!(parent: self.rs(), "recover_pending_magnet", ?info_hash),
+            "recover_pending_magnet",
+            self.clone().recover_pending_magnet(pending),
+        );
+    }
+
+    async fn recover_pending_magnet(
+        self: Arc<Self>,
+        pending: PendingAutomationTorrent,
+    ) -> anyhow::Result<()> {
+        let info_hash = pending.info_hash;
+        let generation = pending.generation;
+        let cancellation_token = pending.cancellation_token;
+        let mut attempts = 0u32;
+        loop {
+            let current = self
+                .db
+                .read()
+                .pending_automation_torrents
+                .get(&info_hash)
+                .filter(|current| Arc::ptr_eq(&current.generation, &generation))
+                .cloned();
+            let Some(current) = current else {
+                return Ok(());
+            };
+            if current.paused || !matches!(current.state, PendingAutomationTorrentState::Error) {
+                return Ok(());
+            }
+            if current.last_error == Some(PendingAutomationError::PersistenceFailed) {
+                let result = self
+                    .persist_pending_timeout_if_failed(info_hash, &generation)
+                    .await;
+                match result {
+                    Ok(true) => continue,
+                    Ok(false) => return Ok(()),
+                    Err(_) => {
+                        if attempts == 0 {
+                            warn!(
+                                ?info_hash,
+                                "could not save timed-out pending magnet; retrying"
+                            );
+                        }
+                        attempts = attempts.saturating_add(1);
+                    }
+                }
+            } else if current.last_error != Some(PendingAutomationError::MetadataTimeout) {
+                return Ok(());
+            } else if let Some(service) = self
+                .servarr_services
+                .iter()
+                .find(|service| service.category == current.automation.category)
+            {
+                let result = tokio::select! {
+                    _ = cancellation_token.cancelled() => return Ok(()),
+                    result = self.try_recover_pending_magnet(&current, service) => result,
+                };
+                match result {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(_) => {
+                        if attempts == 0 {
+                            warn!(?info_hash, kind = ?service.kind, "could not trigger replacement search; retrying");
+                        }
+                        attempts = attempts.saturating_add(1);
+                    }
+                }
+            }
+            tokio::select! {
+                _ = cancellation_token.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+        }
+    }
+
+    async fn try_recover_pending_magnet(
+        &self,
+        pending: &PendingAutomationTorrent,
+        service: &ServarrService,
+    ) -> anyhow::Result<bool> {
+        let info_hash = pending.info_hash;
+        let generation = &pending.generation;
+        let mut plan = match pending.replacement.clone() {
+            Some(plan) => plan,
+            None => {
+                let item = service
+                    .find_queue_item(info_hash)
+                    .await?
+                    .context("timed-out magnet is not in the Servarr queue yet")?;
+                let plan = service.plan(item)?;
+                if !self
+                    .persist_replacement_plan(
+                        info_hash,
+                        generation,
+                        &service.category,
+                        plan.clone(),
+                    )
+                    .await?
+                {
+                    return Ok(false);
+                }
+                plan
+            }
+        };
+        if !plan.blocklisted {
+            service.blocklist(plan.queue_id).await?;
+            plan.blocklisted = true;
+            if !self
+                .persist_replacement_plan(info_hash, generation, &service.category, plan.clone())
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        if !plan.search_triggered {
+            service.trigger_search(&plan.target).await?;
+            plan.search_triggered = true;
+            if !self
+                .persist_replacement_plan(info_hash, generation, &service.category, plan)
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        self.forget_pending_automation_if_generation(info_hash, generation, &service.category)
+            .await
+    }
+
+    async fn persist_pending_timeout_if_failed(
+        &self,
+        hash: Id20,
+        generation: &Arc<()>,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        let Some(mut pending) = self
+            .db
+            .read()
+            .pending_automation_torrents
+            .get(&hash)
+            .filter(|pending| {
+                Arc::ptr_eq(&pending.generation, generation)
+                    && matches!(pending.state, PendingAutomationTorrentState::Error)
+                    && pending.last_error == Some(PendingAutomationError::PersistenceFailed)
+            })
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        pending.last_error = Some(PendingAutomationError::MetadataTimeout);
+        self.persist_pending_automation(&pending).await?;
+        self.db
+            .write()
+            .pending_automation_torrents
+            .insert(hash, pending);
+        Ok(true)
+    }
+
+    async fn persist_replacement_plan(
+        &self,
+        hash: Id20,
+        generation: &Arc<()>,
+        category: &str,
+        plan: ReplacementPlan,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        let Some(mut pending) = self
+            .db
+            .read()
+            .pending_automation_torrents
+            .get(&hash)
+            .filter(|pending| {
+                Arc::ptr_eq(&pending.generation, generation)
+                    && pending.automation.category == category
+                    && !pending.paused
+                    && matches!(pending.state, PendingAutomationTorrentState::Error)
+                    && pending.last_error == Some(PendingAutomationError::MetadataTimeout)
+            })
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        pending.replacement = Some(plan);
+        self.persist_pending_automation(&pending).await?;
+        self.db
+            .write()
+            .pending_automation_torrents
+            .insert(hash, pending);
+        Ok(true)
+    }
+
+    async fn forget_pending_automation_if_generation(
+        &self,
+        hash: Id20,
+        generation: &Arc<()>,
+        category: &str,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        if !self
+            .db
+            .read()
+            .pending_automation_torrents
+            .get(&hash)
+            .is_some_and(|pending| {
+                Arc::ptr_eq(&pending.generation, generation)
+                    && pending.automation.category == category
+                    && !pending.paused
+                    && matches!(pending.state, PendingAutomationTorrentState::Error)
+                    && pending.last_error == Some(PendingAutomationError::MetadataTimeout)
+            })
+        {
+            return Ok(false);
+        }
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.delete_pending(hash).await?;
+        }
+        if let Some(pending) = self.db.write().pending_automation_torrents.remove(&hash) {
+            pending.cancellation_token.cancel();
+        }
+        Ok(true)
     }
 
     pub(crate) async fn forget_pending_automation_torrent(
@@ -1660,6 +1923,7 @@ impl Session {
         if !paused {
             pending.state = PendingAutomationTorrentState::ResolvingMetadata;
             pending.last_error = None;
+            pending.replacement = None;
         }
         pending.generation = Arc::new(());
         pending.cancellation_token = self.cancellation_token.child_token();
@@ -1697,7 +1961,13 @@ impl Session {
         else {
             return Ok(false);
         };
+        let replace_recovery = pending.automation.category != category
+            && matches!(pending.state, PendingAutomationTorrentState::Error)
+            && pending.last_error == Some(PendingAutomationError::MetadataTimeout);
         pending.automation.category = category;
+        if replace_recovery {
+            pending.replacement = None;
+        }
         self.persist_pending_automation(&pending).await?;
         self.db
             .write()
@@ -2641,7 +2911,7 @@ mod tests {
     use buffers::ByteBuf;
     use itertools::Itertools;
     use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::{TorrentAutomationMetadata, session_persistence::SerializedPendingTorrent};
     use dht::Id20;
@@ -2825,6 +3095,7 @@ mod tests {
                     metadata_attempts: 0,
                     last_error: None,
                     next_retry_at_unix_seconds: None,
+                    replacement: None,
                 }),
                 paused: false,
                 info_hash,
@@ -2837,6 +3108,7 @@ mod tests {
                 metadata_attempts: 0,
                 last_error: None,
                 next_retry_at_unix_seconds: None,
+                replacement: None,
                 generation: control.generation.clone(),
                 cancellation_token: control.cancellation_token.clone(),
             },
@@ -2963,6 +3235,253 @@ mod tests {
         );
         drop(permits);
         session.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_magnet_blocklists_and_searches_in_sonarr_after_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hash = Id20::new([0xf6; 20]);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = requests.clone();
+        let server = tokio::spawn(async move {
+            for request_number in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    let Some(headers_end) =
+                        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers_end = headers_end + 4;
+                    let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= headers_end + content_length {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                captured.lock().unwrap().push(request.clone());
+                let (status, body) = match request_number {
+                    0 => ("503 Service Unavailable", String::new()),
+                    1 => (
+                        "200 OK",
+                        serde_json::json!({
+                            "records": [{
+                                "id": 17,
+                                "downloadId": hash.as_string().to_uppercase(),
+                                "episodeIds": [42, 43]
+                            }],
+                            "totalRecords": 1
+                        })
+                        .to_string(),
+                    ),
+                    2 => ("204 No Content", String::new()),
+                    _ => ("201 Created", "{}".to_owned()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let output = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            output.path().to_path_buf(),
+            SessionOptions {
+                persistence: Some(super::SessionPersistenceConfig::Json {
+                    folder: Some(state.path().to_path_buf()),
+                }),
+                servarr_services: vec![crate::ServarrConfig {
+                    kind: crate::ServarrKind::Sonarr,
+                    category: "sonarr".to_owned(),
+                    url: format!("http://{address}"),
+                    api_key: "example-key".to_owned(),
+                }],
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        session
+            .create_automation_category("sonarr".to_owned())
+            .await
+            .unwrap();
+        let permits = session
+            .pending_automation_resolution_semaphore
+            .clone()
+            .acquire_many_owned(u32::try_from(MAX_CONCURRENT_AUTOMATION_RESOLUTIONS).unwrap())
+            .await
+            .unwrap();
+        session
+            .add_pending_automation_magnet(
+                format!("magnet:?xt=urn:btih:{}", hash.as_string()),
+                AddTorrentOptions {
+                    initial_peers: Some(vec!["127.0.0.1:9".parse().unwrap()]),
+                    automation: TorrentAutomationMetadata {
+                        category: "sonarr".to_owned(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            session.pending_automation_torrents()[0].last_error,
+            Some(PendingAutomationError::MetadataTimeout)
+        );
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !session.pending_automation_torrents().is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "recovery stalled after {} requests",
+                requests.lock().unwrap().len()
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert!(requests[1].starts_with("GET /api/v3/queue?page=1&pageSize=100 "));
+            assert!(
+                requests[1]
+                    .to_ascii_lowercase()
+                    .contains("x-api-key: example-key")
+            );
+            assert!(requests[2].starts_with("DELETE /api/v3/queue/17?"));
+            assert!(requests[2].contains("removeFromClient=false"));
+            assert!(requests[2].contains("blocklist=true"));
+            assert!(requests[2].contains("skipRedownload=true"));
+            assert!(requests[3].starts_with("POST /api/v3/command "));
+            assert!(requests[3].contains("\"name\":\"EpisodeSearch\""));
+            assert!(requests[3].contains("\"episodeIds\":[42,43]"));
+        }
+        assert!(
+            session
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_pending()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(permits);
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn restart_finishes_a_previously_accepted_replacement_search() {
+        let output = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let config = || SessionOptions {
+            persistence: Some(super::SessionPersistenceConfig::Json {
+                folder: Some(state.path().to_path_buf()),
+            }),
+            servarr_services: vec![crate::ServarrConfig {
+                kind: crate::ServarrKind::Radarr,
+                category: "radarr".to_owned(),
+                url: "http://127.0.0.1:1".to_owned(),
+                api_key: "example-key".to_owned(),
+            }],
+            dht: None,
+            listen: None,
+            disable_local_service_discovery: true,
+            ..Default::default()
+        };
+        let session = Session::new_with_opts(output.path().to_path_buf(), config())
+            .await
+            .unwrap();
+        let hash = Id20::new([0xf7; 20]);
+        session
+            .persistence
+            .as_ref()
+            .unwrap()
+            .store_pending(&SerializedPendingTorrent {
+                info_hash: hash,
+                magnet_url: format!("magnet:?xt=urn:btih:{}", hash.as_string()),
+                options: serde_json::to_value(AddTorrentOptions {
+                    automation: TorrentAutomationMetadata {
+                        category: "radarr".to_owned(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .unwrap(),
+                paused: false,
+                state: PendingAutomationTorrentState::Error,
+                metadata_attempts: 1,
+                last_error: Some(PendingAutomationError::MetadataTimeout),
+                next_retry_at_unix_seconds: None,
+                replacement: Some(crate::servarr::ReplacementPlan {
+                    queue_id: 19,
+                    target: crate::servarr::ReplacementTarget::RadarrMovie(81),
+                    blocklisted: true,
+                    search_triggered: true,
+                }),
+            })
+            .await
+            .unwrap();
+        session.stop().await;
+
+        let restored = Session::new_with_opts(output.path().to_path_buf(), config())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !restored.pending_automation_torrents().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            restored
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_pending()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        restored.stop().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3428,6 +3947,7 @@ mod tests {
                     metadata_attempts: 1,
                     last_error: Some(PendingAutomationError::MetadataTimeout),
                     next_retry_at_unix_seconds: Some(super::unix_time_seconds() + 3600),
+                    replacement: None,
                 },
                 true,
             )
