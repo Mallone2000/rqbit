@@ -137,7 +137,7 @@ pub(crate) enum PendingAutomationTorrentState {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PendingAutomationError {
     #[error(
-        "Metadata was not received before the discovery deadline; retrying. This does not establish corruption."
+        "Metadata was not received within five minutes. Discovery stopped; this does not establish corruption."
     )]
     MetadataTimeout,
     #[error("Available peers did not provide metadata; retrying discovery.")]
@@ -2387,9 +2387,8 @@ impl Session {
         self.announce_port
     }
 
-    /// A discovery deadline is an attempt limit, not evidence of corrupt metadata.
-    /// Release the shared worker permit during backoff so unavailable swarms cannot
-    /// prevent other accepted jobs from discovering metadata.
+    /// The deadline covers both waiting for a worker slot and discovering metadata.
+    /// Release the worker permit during peer backoff so other jobs can use it.
     async fn resolve_automation_metadata<T, F, Fut>(
         &self,
         info_hash: Id20,
@@ -2401,24 +2400,29 @@ impl Session {
         Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
         let mut retry_delay = control.retry_delay;
+        let deadline = tokio::time::Instant::now() + control.timeout;
         loop {
             let permit = tokio::select! {
                 biased;
                 _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
-                permit = self.pending_automation_resolution_semaphore.clone().acquire_owned() =>
-                    permit.context("automation resolution semaphore is closed")?,
+                permit = tokio::time::timeout_at(
+                    deadline,
+                    self.pending_automation_resolution_semaphore.clone().acquire_owned(),
+                ) => permit
+                    .map_err(|_| PendingAutomationError::MetadataTimeout)?
+                    .context("automation resolution semaphore is closed")?,
             };
             self.update_pending_metadata_diagnostics(info_hash, control, None)
                 .await?;
             let result = tokio::select! {
                 biased;
                 _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
-                result = tokio::time::timeout(control.timeout, resolve()) => result,
+                result = tokio::time::timeout_at(deadline, resolve()) => result,
             };
             drop(permit);
             let reason = match result {
                 Ok(Ok(metadata)) => return Ok(metadata),
-                Err(_) => PendingAutomationError::MetadataTimeout,
+                Err(_) => return Err(PendingAutomationError::MetadataTimeout.into()),
                 Ok(Err(error))
                     if error.downcast_ref::<PendingAutomationError>()
                         == Some(&PendingAutomationError::MetadataPeersExhausted) =>
@@ -2437,6 +2441,7 @@ impl Session {
             tokio::select! {
                 biased;
                 _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
+                _ = tokio::time::sleep_until(deadline) => return Err(PendingAutomationError::MetadataTimeout.into()),
                 _ = tokio::time::sleep(retry_delay) => {}
             }
             retry_delay = retry_delay
@@ -2804,7 +2809,7 @@ mod tests {
         let info_hash = Id20::new([1; 20]);
         let control = MagnetResolutionControl {
             cancellation_token: session.cancellation_token.child_token(),
-            timeout: Duration::from_secs(300),
+            timeout: Duration::from_secs(3600),
             retry_delay: Duration::from_secs(30),
             generation: Arc::new(()),
         };
@@ -2853,36 +2858,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn automation_metadata_timeout_retries_and_can_recover() {
-        let (session, info_hash, control, _output) = metadata_retry_fixture().await;
+    async fn automation_metadata_timeout_is_terminal() {
+        let (session, info_hash, mut control, _output) = metadata_retry_fixture().await;
+        control.timeout = Duration::from_secs(300);
         let worker_session = session.clone();
         let worker = tokio::spawn(async move {
-            let mut attempt = 0;
             worker_session
-                .resolve_automation_metadata(info_hash, &control, || {
-                    attempt += 1;
-                    let first_attempt = attempt == 1;
-                    async move {
-                        if first_attempt {
-                            futures::future::pending::<()>().await;
-                        }
-                        Ok(42)
-                    }
+                .resolve_automation_metadata::<(), _, _>(info_hash, &control, || {
+                    futures::future::pending()
                 })
                 .await
         });
         wait_for_metadata_attempt(&session, 1, false).await;
         tokio::time::advance(Duration::from_secs(300)).await;
-        wait_for_metadata_attempt(&session, 1, true).await;
+        let error = worker.await.unwrap().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<PendingAutomationError>(),
+            Some(&PendingAutomationError::MetadataTimeout)
+        );
         let pending = session.pending_automation_torrents().pop().unwrap();
         assert!(matches!(
             pending.state,
             PendingAutomationTorrentState::ResolvingMetadata
         ));
-        assert_eq!(
-            pending.last_error,
-            Some(PendingAutomationError::MetadataTimeout)
-        );
+        assert!(pending.next_retry_at_unix_seconds.is_none());
         assert_eq!(pending.automation.category, "sonarr");
         assert_eq!(
             session
@@ -2890,37 +2889,80 @@ mod tests {
                 .available_permits(),
             MAX_CONCURRENT_AUTOMATION_RESOLUTIONS
         );
-        #[cfg(feature = "tracing-subscriber-utils")]
-        let api = crate::Api::new(session.clone(), None, None);
-        #[cfg(not(feature = "tracing-subscriber-utils"))]
-        let api = crate::Api::new(session.clone(), None);
-        let json = serde_json::to_value(api.api_torrent_list()).unwrap();
+        session.cancellation_token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_pending_automation_times_out_and_stays_in_error() {
+        let output = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let session = persistent_pending_session(
+            output.path(),
+            super::SessionPersistenceConfig::Json {
+                folder: Some(state.path().to_path_buf()),
+            },
+        )
+        .await;
+        let permits = session
+            .pending_automation_resolution_semaphore
+            .clone()
+            .acquire_many_owned(u32::try_from(MAX_CONCURRENT_AUTOMATION_RESOLUTIONS).unwrap())
+            .await
+            .unwrap();
+        let info_hash = Id20::new([0xf5; 20]);
+        session
+            .add_pending_automation_magnet(
+                format!("magnet:?xt=urn:btih:{}", info_hash.as_string()),
+                AddTorrentOptions {
+                    initial_peers: Some(vec!["127.0.0.1:9".parse().unwrap()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(300)).await;
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let pending = session.pending_automation_torrents().pop().unwrap();
+                if matches!(pending.state, PendingAutomationTorrentState::Error) {
+                    break pending;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending magnet did not reach an error state at its deadline");
         assert_eq!(
-            json["pending_torrents"][0]["error_code"],
-            "metadata_timeout"
+            pending.last_error,
+            Some(PendingAutomationError::MetadataTimeout)
         );
-        assert_eq!(
-            json["pending_torrents"][0]["info_hash"],
-            info_hash.as_string()
-        );
+        assert!(pending.next_retry_at_unix_seconds.is_none());
         assert!(
-            json["pending_torrents"][0]["message"]
-                .as_str()
-                .unwrap()
-                .contains("does not establish corruption")
-        );
-        tokio::time::advance(Duration::from_secs(30)).await;
-        assert_eq!(worker.await.unwrap().unwrap(), 42);
-        assert_eq!(
-            session.pending_automation_torrents()[0].metadata_attempts,
-            2
-        );
-        assert!(
-            session.pending_automation_torrents()[0]
-                .next_retry_at_unix_seconds
+            session
+                .get(super::TorrentIdOrHash::Hash(info_hash))
                 .is_none()
         );
-        session.cancellation_token.cancel();
+        let saved = session
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_pending()
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(matches!(
+            saved[0].state,
+            PendingAutomationTorrentState::Error
+        ));
+        assert_eq!(
+            saved[0].last_error,
+            Some(PendingAutomationError::MetadataTimeout)
+        );
+        drop(permits);
+        session.stop().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2992,7 +3034,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn automation_metadata_backoff_allows_queued_jobs_to_run() {
+    async fn automation_metadata_timeout_releases_slot_for_queued_jobs() {
         let (session, _info_hash, control, _output) = metadata_retry_fixture().await;
         let mut workers = Vec::new();
         let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3009,7 +3051,11 @@ mod tests {
             let started = started.clone();
             let control = MagnetResolutionControl {
                 cancellation_token: control.cancellation_token.clone(),
-                timeout: control.timeout,
+                timeout: if index == MAX_CONCURRENT_AUTOMATION_RESOLUTIONS {
+                    control.timeout
+                } else {
+                    Duration::from_secs(300)
+                },
                 retry_delay: control.retry_delay,
                 generation: control.generation.clone(),
             };

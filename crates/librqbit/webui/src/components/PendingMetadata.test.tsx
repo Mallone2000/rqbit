@@ -11,9 +11,9 @@ const fixture: PendingTorrent = {
   category: "sonarr",
   state: "resolving_metadata",
   metadata_attempts: 1,
-  error_code: "metadata_timeout",
+  error_code: "metadata_peers_exhausted",
   message:
-    "Metadata discovery timed out; retrying. This does not establish corruption.",
+    "Available peers did not provide metadata; retrying discovery.",
   next_retry_at_unix_seconds: 12345,
 };
 
@@ -31,12 +31,12 @@ describe("pending metadata diagnostics", () => {
     expect(renderToStaticMarkup(<PendingMetadata torrents={[]} />)).toBe("");
   });
 
-  it("explains a timeout and the scheduled retry", () => {
+  it("explains peer discovery and the scheduled retry", () => {
     const html = renderToStaticMarkup(<PendingMetadata torrents={[fixture]} />);
     expect(html).toContain("Linux fixture");
     expect(html).toContain("sonarr");
     expect(html).toContain("Waiting for metadata");
-    expect(html).toContain("does not establish corruption");
+    expect(html).toContain("retrying discovery");
     expect(html).toContain("Attempts: 1");
     expect(html).toContain("Next retry:");
   });
