@@ -69,24 +69,13 @@ Categories inherit rqbit's global download directory; they do not move content.
 Do not configure a Remote Path Mapping: `/data` has the same meaning in all
 three containers.
 
-To request a replacement automatically when a magnet has not obtained metadata
-within five minutes, set these variables on the rqbit service (supply the keys
-through your environment or secret manager, not in the Compose file):
-
-```yaml
-environment:
-  RQBIT_SONARR_URL: http://127.0.0.1:8989
-  RQBIT_SONARR_API_KEY: ${SONARR_API_KEY:?}
-  RQBIT_RADARR_URL: http://127.0.0.1:7878
-  RQBIT_RADARR_API_KEY: ${RADARR_API_KEY:?}
-```
-
-The default routing categories are `sonarr` and `radarr`. Set
-`RQBIT_SONARR_CATEGORY` or `RQBIT_RADARR_CATEGORY` on rqbit if you chose different
-download-client categories. rqbit blocklists the timed-out queue entry in the
-corresponding service, requests an episode or movie search, then removes the
-pending magnet. Keep rqbit session persistence enabled so interrupted service
-requests can be retried after restart.
+rqbit stops unresolved magnets after five minutes and exposes them as `error`
+through its qBittorrent API. It does not contact Sonarr or Radarr. If you use
+Cleanuparr, connect it to rqbit and both Arr applications, configure its
+[Queue Cleaner](https://cleanuparr.github.io/docs/configuration/queue-cleaner/)
+for metadata and error states, and enable [Seeker's replacement search](https://cleanuparr.github.io/docs/configuration/seeker/).
+Let Cleanuparr remove the failed item from the Arr queue so it can request a
+replacement; deleting it only in rqbit cannot do that.
 
 Enable **Use Hardlinks instead of Copy** in Sonarr/Radarr. The download and
 library directories must be on the same host filesystem beneath `DATA_ROOT`.

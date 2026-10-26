@@ -14,8 +14,7 @@ use clap_complete::Shell;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions,
     CreateTorrentOptions, DhtSessionConfig, ListOnlyResponse, ListenerMode, ListenerOptions,
-    PeerConnectionOptions, ServarrConfig, ServarrKind, Session, SessionOptions,
-    SessionPersistenceConfig, TorrentStatsState,
+    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
     dht::DhtPersistenceConfig,
     http_api::{HttpApi, HttpApiOptions},
     librqbit_spawn,
@@ -66,40 +65,6 @@ fn parse_umask(value: &str) -> anyhow::Result<libc::mode_t> {
 
 fn parse_cli_duration(value: &str) -> Result<Duration, humantime::DurationError> {
     humantime::parse_duration(value)
-}
-
-fn optional_env(name: &str) -> anyhow::Result<Option<String>> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            bail!("{name} must contain valid UTF-8")
-        }
-    }
-}
-
-fn servarr_config_from_env(
-    kind: ServarrKind,
-    prefix: &str,
-    default_category: &str,
-) -> anyhow::Result<Option<ServarrConfig>> {
-    let url_name = format!("RQBIT_{prefix}_URL");
-    let key_name = format!("RQBIT_{prefix}_API_KEY");
-    let category_name = format!("RQBIT_{prefix}_CATEGORY");
-    let url = optional_env(&url_name)?;
-    let api_key = optional_env(&key_name)?;
-    let category = optional_env(&category_name)?;
-    match (url, api_key, category) {
-        (None, None, None) => Ok(None),
-        (None, None, Some(_)) => bail!("{category_name} requires {url_name} and {key_name}"),
-        (Some(url), Some(api_key), category) => Ok(Some(ServarrConfig {
-            kind,
-            category: category.unwrap_or_else(|| default_category.to_owned()),
-            url,
-            api_key,
-        })),
-        _ => bail!("{url_name} and {key_name} must be set together"),
-    }
 }
 
 #[derive(Parser)]
@@ -685,19 +650,10 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         })
     };
 
-    let servarr_services = [
-        servarr_config_from_env(ServarrKind::Sonarr, "SONARR", "sonarr")?,
-        servarr_config_from_env(ServarrKind::Radarr, "RADARR", "radarr")?,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
     let mut sopts = SessionOptions {
         dht,
         // This will be overridden by "server start" below if needed.
         persistence: None,
-        servarr_services,
         peer_id: None,
         listen,
         connect: Some(ConnectionOptions {

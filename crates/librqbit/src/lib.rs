@@ -66,7 +66,6 @@ mod peer_connection;
 mod peer_info_reader;
 mod piece_tracker;
 mod read_buf;
-mod servarr;
 mod session;
 mod session_persistence;
 pub mod session_stats;
@@ -94,7 +93,6 @@ pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
 pub use listen::{ListenerMode, ListenerOptions};
 pub use peer_connection::PeerConnectionOptions;
-pub use servarr::{ServarrConfig, ServarrKind};
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
     SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,

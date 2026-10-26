@@ -90,8 +90,6 @@ pub struct SerializedPendingTorrent {
     pub(crate) last_error: Option<crate::session::PendingAutomationError>,
     #[serde(default)]
     pub(crate) next_retry_at_unix_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) replacement: Option<crate::servarr::ReplacementPlan>,
 }
 
 impl SerializedPendingTorrent {
@@ -150,42 +148,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::SerializedPendingTorrent;
-    use crate::{
-        servarr::{ReplacementPlan, ReplacementTarget},
-        session::PendingAutomationTorrentState,
-    };
+    use crate::session::{PendingAutomationError, PendingAutomationTorrentState};
 
     #[test]
-    fn replacement_plan_round_trips_and_old_pending_records_default_to_none() {
+    fn pending_record_from_client_recovery_build_still_loads() {
         let record = SerializedPendingTorrent {
             info_hash: librqbit_core::Id20::new([0xa1; 20]),
-            magnet_url: "magnet:?xt=urn:btih:a1".to_owned(),
+            magnet_url: format!("magnet:?xt=urn:btih:{}", "a1".repeat(20)),
             options: serde_json::json!({}),
             paused: false,
             state: PendingAutomationTorrentState::Error,
             metadata_attempts: 1,
-            last_error: None,
+            last_error: Some(PendingAutomationError::MetadataTimeout),
             next_retry_at_unix_seconds: None,
-            replacement: None,
         };
-        let mut old_value = serde_json::to_value(&record).unwrap();
-        old_value.as_object_mut().unwrap().remove("replacement");
-        let old: SerializedPendingTorrent = serde_json::from_value(old_value).unwrap();
-        assert!(old.replacement.is_none());
-
-        let mut updated = record;
-        updated.replacement = Some(ReplacementPlan {
-            queue_id: 17,
-            target: ReplacementTarget::SonarrEpisodes(vec![42, 43]),
-            blocklisted: true,
-            search_triggered: false,
+        let mut saved = serde_json::to_value(&record).unwrap();
+        saved["replacement"] = serde_json::json!({
+            "queue_id": 17,
+            "target": { "radarr_movie": 81 },
+            "blocklisted": true,
+            "search_triggered": false
         });
-        let restored: SerializedPendingTorrent =
-            serde_json::from_value(serde_json::to_value(&updated).unwrap()).unwrap();
-        let plan = restored.replacement.unwrap();
-        assert_eq!(plan.queue_id, 17);
-        assert!(plan.blocklisted);
-        assert!(!plan.search_triggered);
-        assert!(matches!(plan.target, ReplacementTarget::SonarrEpisodes(ids) if ids == [42, 43]));
+
+        let restored: SerializedPendingTorrent = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.info_hash, record.info_hash);
+        assert!(matches!(
+            restored.state,
+            PendingAutomationTorrentState::Error
+        ));
+        assert_eq!(
+            restored.last_error,
+            Some(PendingAutomationError::MetadataTimeout)
+        );
     }
 }
