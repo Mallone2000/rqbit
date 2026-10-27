@@ -105,12 +105,12 @@ jobs:
       - name: install Tauri
         run: cargo install tauri-cli --locked --version 2.8.4
 
-      - name: npm install (desktop)
-        working-directory: desktop
-        run: npm ci
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
 
-      - name: npm install (librqbit/webui)
-        working-directory: crates/librqbit/webui
+      - name: Install frontend workspace dependencies
         run: npm ci
 
       - name: cargo tauri build
@@ -219,12 +219,12 @@ jobs:
       - name: install Tauri
         run: cargo install tauri-cli --locked --version 2.8.4
 
-      - name: npm install (desktop)
-        working-directory: desktop
-        run: npm ci
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
 
-      - name: npm install (librqbit/webui)
-        working-directory: crates/librqbit/webui
+      - name: Install frontend workspace dependencies
         run: npm ci
 
       - name: cargo tauri build
@@ -255,12 +255,12 @@ jobs:
       - name: install Tauri
         run: cargo install tauri-cli --locked --version 2.8.4
 
-      - name: npm install (desktop)
-        working-directory: desktop
-        run: npm ci
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
 
-      - name: npm install (librqbit/webui)
-        working-directory: crates/librqbit/webui
+      - name: Install frontend workspace dependencies
         run: npm ci
 
       - name: cargo tauri build

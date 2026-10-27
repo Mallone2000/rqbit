@@ -38,6 +38,9 @@ jobs:
       - name: Run Web UI tests
         run: npm test --workspace rqbit-webui
 
+      - name: Build desktop frontend
+        run: npm run build --workspace rqbit
+
   check-rust-compat:
     runs-on: ubuntu-latest
     strategy:
