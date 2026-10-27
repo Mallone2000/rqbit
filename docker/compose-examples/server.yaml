@@ -18,8 +18,11 @@ services:
       # Replace this if you want to change the HTTP/Web UI port
       # RQBIT_HTTP_API_LISTEN_ADDR: 0.0.0.0:3030
 
-      # Required because host networking exposes the writable API beyond loopback.
-      # Use an authenticated HTTPS reverse proxy for access outside a trusted LAN.
+      # Required on every listener, including loopback and read-only mode.
+      # Use an HTTPS reverse proxy; session cookies are Secure by default.
+      # UPnP HTTP routes also require authentication (anonymous players will fail).
+      # For trusted plaintext HTTP only, explicitly opt in:
+      # RQBIT_HTTP_API_INSECURE_COOKIES: "true"
       RQBIT_HTTP_BASIC_AUTH_USERPASS: "${RQBIT_USER:?}:${RQBIT_PASSWORD:?}"
     volumes:
       - db:/home/rqbit/db

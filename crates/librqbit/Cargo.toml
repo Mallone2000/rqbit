@@ -15,7 +15,7 @@ readme = "README.md"
 default = ["default-tls", "http-api-client"]
 
 tokio-console = ["console-subscriber", "tokio/tracing"]
-http-api = ["axum", "tower-http"]
+http-api = ["axum", "tower-http", "subtle"]
 http-api-client = []
 upnp-serve-adapter = ["upnp-serve"]
 webui = []
@@ -87,6 +87,7 @@ hex.workspace = true
 backon.workspace = true
 dashmap.workspace = true
 base64.workspace = true
+subtle = { workspace = true, optional = true }
 serde_with.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 metrics-exporter-prometheus = { workspace = true, optional = true }

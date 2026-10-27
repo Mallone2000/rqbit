@@ -59,9 +59,10 @@ pub async fn h_torrent_stream_file(
         );
     }
 
-    if let Ok(mime) = state.api.torrent_file_mime_type(id, file_id) {
-        output_headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static(mime));
-    }
+    set_content_headers(
+        &mut output_headers,
+        state.api.torrent_file_mime_type(id, file_id).ok(),
+    );
 
     let range_header = headers.get(http::header::RANGE);
     debug!(torrent_id=%id, file_id=file_id, range=?range_header, "request for HTTP stream");
@@ -122,4 +123,75 @@ pub async fn h_torrent_stream_file(
 
     let s = tokio_util::io::ReaderStream::with_capacity(stream, 65536);
     Ok((status, (output_headers, axum::body::Body::from_stream(s))))
+}
+
+fn set_content_headers(headers: &mut HeaderMap, mime: Option<&'static str>) {
+    // Torrent contents are untrusted even when the user is authenticated. Never
+    // run downloaded HTML/SVG/scripts with the management UI's session authority.
+    let inline = mime.is_some_and(|mime| {
+        mime.starts_with("audio/")
+            || mime.starts_with("video/")
+            || matches!(
+                mime,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif"
+            )
+    });
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static(if inline {
+            mime.unwrap_or("application/octet-stream")
+        } else {
+            "application/octet-stream"
+        }),
+    );
+    if !inline {
+        headers.insert(
+            http::header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static("sandbox; default-src 'none'; frame-ancestors 'none'"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downloaded_active_content_cannot_execute_on_the_api_origin() {
+        for mime in [
+            None,
+            Some("text/html"),
+            Some("image/svg+xml"),
+            Some("application/javascript"),
+            Some("application/pdf"),
+            Some("application/xhtml+xml"),
+        ] {
+            let mut headers = HeaderMap::new();
+            set_content_headers(&mut headers, mime);
+            assert_eq!(
+                headers[http::header::CONTENT_TYPE],
+                "application/octet-stream"
+            );
+            assert_eq!(headers[http::header::CONTENT_DISPOSITION], "attachment");
+            assert_eq!(
+                headers["content-security-policy"],
+                "sandbox; default-src 'none'; frame-ancestors 'none'"
+            );
+            assert_eq!(headers["x-content-type-options"], "nosniff");
+        }
+        for mime in ["video/mp4", "audio/mpeg", "image/png"] {
+            let mut headers = HeaderMap::new();
+            set_content_headers(&mut headers, Some(mime));
+            assert_eq!(headers[http::header::CONTENT_TYPE], mime);
+            assert!(!headers.contains_key(http::header::CONTENT_DISPOSITION));
+        }
+    }
 }

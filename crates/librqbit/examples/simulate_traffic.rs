@@ -303,7 +303,15 @@ impl TestHarness {
             api,
             Some(HttpApiOptions {
                 read_only: false,
-                basic_auth: None,
+                basic_auth: {
+                    let credentials = std::env::var("RQBIT_HTTP_BASIC_AUTH_USERPASS")
+                        .context("set RQBIT_HTTP_BASIC_AUTH_USERPASS for the test server")?;
+                    let (user, password) = credentials
+                        .split_once(':')
+                        .context("credentials must be username:password")?;
+                    Some((user.to_owned(), password.to_owned()))
+                },
+                insecure_session_cookies: true,
                 qbittorrent_api_key: None,
                 allow_create: true,
                 max_upload_body_size: None,

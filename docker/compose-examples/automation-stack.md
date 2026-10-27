@@ -15,10 +15,13 @@ For remote access, keep the application ports private and place an authenticated
 HTTPS reverse proxy or another trusted encrypted access layer in front of them.
 rqbit refuses to start the qBittorrent compatibility API unless a non-empty
 `RQBIT_HTTP_BASIC_AUTH_USERPASS` value is configured.
-For Cleanuparr's optional API key connection, add a non-empty
+For Cleanuparr's optional API key connection, add a random 32–256 character
 `RQBIT_QBITTORRENT_API_KEY` secret to rqbit's environment and configure the
 same key in Cleanuparr. Keep the username/password setting for rqbit's native
-API and Sonarr/Radarr clients.
+API and Sonarr/Radarr clients. Browser cookies require HTTPS by default. For an
+explicitly trusted plaintext network only, set `RQBIT_HTTP_API_INSECURE_COOKIES=true`;
+this does not encrypt HTTP credentials or cookies. UPnP HTTP endpoints also require
+authentication; anonymous DLNA players are unsupported.
 
 The Compose example uses `ghcr.io/mallone2000/rqbit:latest`. A successful build
 of the `main` branch publishes that rolling multi-architecture image. Update an

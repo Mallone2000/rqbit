@@ -17,7 +17,7 @@ use http::{
 use librqbit_dualstack_sockets::WrappedSocketAddr;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use uuid::Uuid;
+use subtle::ConstantTimeEq;
 
 use super::ApiState;
 use crate::http_api::credentials_match_basic;
@@ -39,7 +39,7 @@ struct AuthFailures {
 
 #[derive(Default)]
 pub(crate) struct Sessions {
-    entries: Mutex<HashMap<String, Instant>>,
+    entries: Mutex<HashMap<[u8; 32], Instant>>,
     auth_failures: Mutex<HashMap<Option<IpAddr>, AuthFailures>>,
 }
 
@@ -52,12 +52,12 @@ impl Sessions {
             && let Some(oldest) = entries
                 .iter()
                 .min_by_key(|(_, expires)| **expires)
-                .map(|(sid, _)| sid.clone())
+                .map(|(sid, _)| *sid)
         {
             entries.remove(&oldest);
         }
-        let sid = Uuid::new_v4().simple().to_string();
-        entries.insert(sid.clone(), now + SESSION_TTL);
+        let sid = hex::encode(rand::random::<[u8; 32]>());
+        entries.insert(crate::http_api::credential_digest(&sid), now + SESSION_TTL);
         sid
     }
 
@@ -65,7 +65,17 @@ impl Sessions {
         let now = Instant::now();
         let mut entries = self.entries.lock();
         entries.retain(|_, expires| *expires > now);
-        entries.get(sid).is_some_and(|expires| *expires > now)
+        if sid.len() != 64 || !sid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+        let supplied = crate::http_api::credential_digest(sid);
+        // Scan the bounded store without secret-dependent early returns. Raw session
+        // credentials are never retained in the server's session records.
+        let mut found = subtle::Choice::from(0);
+        for expected in entries.keys() {
+            found |= expected.ct_eq(&supplied);
+        }
+        bool::from(found)
     }
 
     pub(crate) fn authenticates(&self, headers: &HeaderMap) -> bool {
@@ -73,7 +83,9 @@ impl Sessions {
     }
 
     fn revoke(&self, sid: &str) {
-        self.entries.lock().remove(sid);
+        self.entries
+            .lock()
+            .remove(&crate::http_api::credential_digest(sid));
     }
 
     pub(crate) fn login_is_allowed(&self, client_ip: Option<IpAddr>) -> bool {
@@ -83,6 +95,9 @@ impl Sessions {
             entry.banned_until.is_some_and(|until| until > now)
                 || now.duration_since(entry.last_failure) <= AUTH_FAILURE_WINDOW
         });
+        if failures.len() >= MAX_TRACKED_CLIENTS && !failures.contains_key(&client_ip) {
+            return false;
+        }
         !failures
             .get(&client_ip)
             .and_then(|entry| entry.banned_until)
@@ -96,14 +111,9 @@ impl Sessions {
             entry.banned_until.is_some_and(|until| until > now)
                 || now.duration_since(entry.last_failure) <= AUTH_FAILURE_WINDOW
         });
-        if failures.len() >= MAX_TRACKED_CLIENTS
-            && !failures.contains_key(&client_ip)
-            && let Some(oldest) = failures
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_failure)
-                .map(|(ip, _)| *ip)
-        {
-            failures.remove(&oldest);
+        // Never evict an active ban to make room for a new address.
+        if failures.len() >= MAX_TRACKED_CLIENTS && !failures.contains_key(&client_ip) {
+            return;
         }
 
         let entry = failures.entry(client_ip).or_insert(AuthFailures {
@@ -152,6 +162,12 @@ pub(super) async fn login(State(state): State<ApiState>, request: Request) -> Re
         Err(error) => return error.into_response(),
     };
 
+    // Reading a body yields. A ban may have been established by another request
+    // while this form was in flight; do not let queued logins bypass it.
+    if !state.qbittorrent_sessions.login_is_allowed(client_ip) {
+        return (StatusCode::TOO_MANY_REQUESTS, "Fails.").into_response();
+    }
+
     if !crate::http_api::constant_time_credentials_match(
         expected_user,
         expected_pass,
@@ -169,10 +185,15 @@ pub(super) async fn login(State(state): State<ApiState>, request: Request) -> Re
     response.headers_mut().insert(
         SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "SID={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-            SESSION_TTL.as_secs()
+            "SID={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+            SESSION_TTL.as_secs(),
+            if state.opts.insecure_session_cookies {
+                ""
+            } else {
+                "; Secure"
+            }
         ))
-        .expect("UUID SID always makes a valid cookie"),
+        .expect("hex SID always makes a valid cookie"),
     );
     response
         .headers_mut()
@@ -184,8 +205,7 @@ pub(in crate::http_api) async fn web_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Response {
-    let authenticated =
-        state.opts.basic_auth.is_none() || state.qbittorrent_sessions.authenticates(&headers);
+    let authenticated = state.qbittorrent_sessions.authenticates(&headers);
     let mut response = axum::Json(serde_json::json!({
         "authenticated": authenticated,
         "authentication_required": state.opts.basic_auth.is_some(),
@@ -201,7 +221,7 @@ pub(in crate::http_api) async fn web_public_ip(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Response {
-    if state.opts.basic_auth.is_some() && !state.qbittorrent_sessions.authenticates(&headers) {
+    if !state.qbittorrent_sessions.authenticates(&headers) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
@@ -255,7 +275,7 @@ pub(in crate::http_api) async fn web_login(
         .get::<ConnectInfo<WrappedSocketAddr>>()
         .map(|ConnectInfo(address)| address.0.ip());
     let Some((expected_user, expected_pass)) = state.opts.basic_auth.as_ref() else {
-        return StatusCode::NO_CONTENT.into_response();
+        return StatusCode::FORBIDDEN.into_response();
     };
 
     if !state.qbittorrent_sessions.login_is_allowed(client_ip) {
@@ -269,6 +289,16 @@ pub(in crate::http_api) async fn web_login(
         Ok(login) => login,
         Err(error) => return error.into_response(),
     };
+
+    // Reading a body yields. A ban may have been established by another request
+    // while this form was in flight; do not let queued logins bypass it.
+    if !state.qbittorrent_sessions.login_is_allowed(client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many authentication failures",
+        )
+            .into_response();
+    }
 
     if !crate::http_api::constant_time_credentials_match(
         expected_user,
@@ -286,10 +316,15 @@ pub(in crate::http_api) async fn web_login(
     response.headers_mut().insert(
         SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "SID={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-            SESSION_TTL.as_secs()
+            "SID={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+            SESSION_TTL.as_secs(),
+            if state.opts.insecure_session_cookies {
+                ""
+            } else {
+                "; Secure"
+            }
         ))
-        .expect("UUID SID always makes a valid cookie"),
+        .expect("hex SID always makes a valid cookie"),
     );
     response
         .headers_mut()
@@ -332,7 +367,7 @@ pub(super) async fn require_auth(
     next: Next,
 ) -> Response {
     if state.opts.basic_auth.is_none() {
-        return next.run(request).await;
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
     if state.qbittorrent_sessions.authenticates(&headers) {
@@ -354,17 +389,15 @@ pub(super) async fn require_auth(
         state.qbittorrent_sessions.clear_login_failures(client_ip);
         return next.run(request).await;
     }
-    if let Some((expected, supplied)) = state.opts.qbittorrent_api_key.as_deref().zip(
-        headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer ")),
-    ) && crate::http_api::constant_time_secret_match(expected, supplied)
-    {
+    if crate::http_api::credentials_match_bearer(
+        state.opts.qbittorrent_api_key.as_deref(),
+        &headers,
+    ) {
         state.qbittorrent_sessions.clear_login_failures(client_ip);
         return next.run(request).await;
     }
-    if headers.contains_key(AUTHORIZATION) {
+
+    if headers.contains_key(AUTHORIZATION) || sid_from_headers(&headers).is_some() {
         state.qbittorrent_sessions.record_login_failure(client_ip);
     }
 
@@ -384,6 +417,19 @@ pub(in crate::http_api) async fn require_same_origin(
 }
 
 fn request_source_matches_host(headers: &HeaderMap) -> bool {
+    if headers.get_all(ORIGIN).iter().count() > 1
+        || headers.get_all(REFERER).iter().count() > 1
+        || headers.get_all(HOST).iter().count() > 1
+    {
+        return false;
+    }
+    // Fetch Metadata covers browser requests that omit Origin and Referer.
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site == "cross-site")
+    {
+        return false;
+    }
     let source = headers.get(ORIGIN).or_else(|| headers.get(REFERER));
     let Some(source) = source else {
         return true;
@@ -400,6 +446,9 @@ fn request_source_matches_host(headers: &HeaderMap) -> bool {
     let Some(source_authority) = source.authority() else {
         return false;
     };
+    if !matches!(source.scheme_str(), Some("http" | "https" | "tauri")) {
+        return false;
+    }
     if source_authority.as_str().eq_ignore_ascii_case(host) {
         return true;
     }
@@ -419,7 +468,7 @@ fn request_source_matches_host(headers: &HeaderMap) -> bool {
         Some(scheme) if scheme.eq_ignore_ascii_case("tauri") => {
             source_authority.as_str().eq_ignore_ascii_case("localhost")
         }
-        Some(scheme) if scheme.eq_ignore_ascii_case("http") => {
+        Some(scheme) if cfg!(debug_assertions) && scheme.eq_ignore_ascii_case("http") => {
             let source_host = source_authority.host();
             let source_port = source_authority.port_u16();
             (source_host.eq_ignore_ascii_case("localhost")
@@ -439,13 +488,18 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 fn sid_from_headers(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(http::header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .map(str::trim)
-        .find_map(|cookie| cookie.strip_prefix("SID="))
+    let mut sid = None;
+    for header in headers.get_all(http::header::COOKIE) {
+        for cookie in header.to_str().ok()?.split(';').map(str::trim) {
+            if let Some(value) = cookie.strip_prefix("SID=") {
+                if sid.is_some() {
+                    return None;
+                }
+                sid = Some(value);
+            }
+        }
+    }
+    sid
 }
 
 #[cfg(test)]
@@ -491,6 +545,14 @@ mod tests {
         );
         assert!(!request_source_matches_host(&headers));
 
+        for origin in ["ftp://localhost:3030", "null"] {
+            headers.insert(super::ORIGIN, HeaderValue::from_str(origin).unwrap());
+            assert!(!request_source_matches_host(&headers));
+        }
+        headers.remove(super::ORIGIN);
+        headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(!request_source_matches_host(&headers));
+        headers.remove("sec-fetch-site");
         headers.insert(super::ORIGIN, HeaderValue::from_bytes(b"\xff").unwrap());
         assert!(!request_source_matches_host(&headers));
 
@@ -514,6 +576,184 @@ mod tests {
             HeaderValue::from_static("http://127.0.0.1:9999"),
         );
         assert!(!request_source_matches_host(&headers));
+    }
+
+    #[tokio::test]
+    async fn cookie_transport_requires_explicit_insecure_opt_in() {
+        use crate::{
+            Api, Session, SessionOptions,
+            http_api::{HttpApi, HttpApiOptions},
+        };
+        use axum::{body::Body, extract::State};
+        use std::sync::Arc;
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for web in [false, true] {
+            for insecure in [false, true] {
+                let state = Arc::new(HttpApi::new(
+                    Api::new(session.clone(), None, None),
+                    Some(HttpApiOptions {
+                        basic_auth: Some(("user".into(), "secret".into())),
+                        insecure_session_cookies: insecure,
+                        ..Default::default()
+                    }),
+                ));
+                let request = http::Request::builder()
+                    .method("POST")
+                    .header(
+                        http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .header("x-forwarded-proto", "http")
+                    .body(Body::from("username=user&password=secret"))
+                    .unwrap();
+                let response = if web {
+                    super::web_login(State(state.clone()), request).await
+                } else {
+                    super::login(State(state.clone()), request).await
+                };
+                assert!(response.status().is_success());
+                let cookie = response.headers()[super::SET_COOKIE].to_str().unwrap();
+                assert_eq!(cookie.contains("; Secure"), !insecure);
+                assert!(cookie.contains("; HttpOnly; SameSite=Strict;"));
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    http::header::COOKIE,
+                    HeaderValue::from_str(cookie.split(';').next().unwrap()).unwrap(),
+                );
+                assert!(state.qbittorrent_sessions.authenticates(&headers));
+                let response = super::logout(State(state.clone()), headers.clone()).await;
+                assert!(response.status().is_success());
+                assert!(!state.qbittorrent_sessions.authenticates(&headers));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn in_flight_login_cannot_bypass_a_new_ban() {
+        use crate::{
+            Api, Session, SessionOptions,
+            http_api::{HttpApi, HttpApiOptions},
+        };
+        use axum::{body::Body, extract::State};
+        use bytes::Bytes;
+        use std::{convert::Infallible, sync::Arc};
+
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for web in [false, true] {
+            let state = Arc::new(HttpApi::new(
+                Api::new(session.clone(), None, None),
+                Some(HttpApiOptions {
+                    basic_auth: Some(("user".into(), "secret".into())),
+                    ..Default::default()
+                }),
+            ));
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let body = Body::from_stream(futures::stream::once(async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok::<_, Infallible>(Bytes::from_static(b"username=user&password=secret"))
+            }));
+            let request = http::Request::builder()
+                .method("POST")
+                .header(
+                    http::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(body)
+                .unwrap();
+            let task_state = state.clone();
+            let task = tokio::spawn(async move {
+                if web {
+                    super::web_login(State(task_state), request).await
+                } else {
+                    super::login(State(task_state), request).await
+                }
+            });
+            started_rx.await.unwrap();
+            for _ in 0..MAX_AUTH_FAILURES {
+                state.qbittorrent_sessions.record_login_failure(None);
+            }
+            release_tx.send(()).unwrap();
+            let response = task.await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert!(!response.headers().contains_key(http::header::SET_COOKIE));
+        }
+    }
+
+    #[test]
+    fn session_tokens_reject_forgery_expiry_and_duplicate_cookies() {
+        let sessions = Sessions::default();
+        let sid = sessions.issue();
+        assert_eq!(sid.len(), 64);
+        assert!(sessions.is_valid(&sid));
+        for value in [
+            String::new(),
+            sid[..63].to_owned(),
+            format!("{sid}0"),
+            "0".repeat(64),
+            "z".repeat(64),
+        ] {
+            assert!(!sessions.is_valid(&value));
+        }
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_str(&format!("other=1; SID={sid}")).unwrap(),
+        );
+        assert!(sessions.authenticates(&headers));
+        headers.append(http::header::COOKIE, HeaderValue::from_static("SID=forged"));
+        assert!(!sessions.authenticates(&headers));
+        headers.clear();
+        headers.insert(
+            http::header::COOKIE,
+            HeaderValue::from_str(&format!("SID={sid}; SID={sid}")).unwrap(),
+        );
+        assert!(!sessions.authenticates(&headers));
+        sessions.entries.lock().insert(
+            crate::http_api::credential_digest(&sid),
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert!(!sessions.is_valid(&sid));
+        assert!(!Sessions::default().is_valid(&sid));
+    }
+
+    #[test]
+    fn login_bans_survive_client_table_exhaustion() {
+        let sessions = Sessions::default();
+        let target = Some(Ipv4Addr::LOCALHOST.into());
+        for _ in 0..MAX_AUTH_FAILURES {
+            sessions.record_login_failure(target);
+        }
+        for index in 0..super::MAX_TRACKED_CLIENTS {
+            sessions.record_login_failure(Some(
+                Ipv4Addr::from(0x0a000001 + u32::try_from(index).unwrap()).into(),
+            ));
+        }
+        assert!(!sessions.login_is_allowed(target));
+        assert!(!sessions.login_is_allowed(Some(Ipv4Addr::from(0x0b000001).into())));
     }
 
     #[test]

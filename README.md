@@ -8,7 +8,7 @@ Alongside the upstream client capabilities, this fork adds:
 - persistent download categories and automation-oriented torrent metadata;
 - web UI login/logout and category management;
 - JSON or PostgreSQL session persistence; and
-- hardened HTTP behavior, including safer logging and authentication requirements for writable non-loopback listeners.
+- hardened HTTP behavior, including safer logging and mandatory authentication on every HTTP listener.
 
 This repository is not an official upstream release channel. Fork-specific changes may not be present in crates.io packages, upstream releases, or `ikatson/rqbit` Docker images.
 
@@ -17,22 +17,24 @@ This repository is not an official upstream release channel. Fork-specific chang
 Build this checkout first (see [Build and install](#build-and-install)), then start a persistent server:
 
 ```sh
-rqbit server start ~/Downloads
+export RQBIT_HTTP_BASIC_AUTH_USERPASS='username:replace-with-a-long-random-password'
+# Local HTTP only; use HTTPS and omit this flag for remote access.
+rqbit --http-api-insecure-cookies server start ~/Downloads
 ```
 
 The native API and web UI are available at <http://127.0.0.1:3030/> and <http://127.0.0.1:3030/web/>. Add a torrent with a magnet URI, an HTTP(S) `.torrent` URL, or a local torrent file:
 
 ```sh
-rqbit download -o ~/Downloads 'magnet:?xt=urn:btih:...'
-rqbit download -o ~/Downloads https://example.org/file.torrent
-rqbit download -o ~/Downloads /path/to/file.torrent
+rqbit download --disable-http-api -o ~/Downloads 'magnet:?xt=urn:btih:...'
+rqbit download --disable-http-api -o ~/Downloads https://example.org/file.torrent
+rqbit download --disable-http-api -o ~/Downloads /path/to/file.torrent
 ```
 
 For a long-running server, submit torrents through the web UI or native API. Use `rqbit --help` and `rqbit server start --help` as the authoritative CLI reference.
 
 ## Web UI and authentication
 
-The default API listener is loopback-only. When exposing the writable API outside the host, configure Basic authentication and terminate TLS in a reverse proxy or another trusted encrypted access layer:
+Every HTTP listener requires a non-empty username and password, including loopback and read-only servers. Missing, empty, or whitespace-only credentials prevent startup. The default listener is loopback-only. For remote access, terminate TLS in a reverse proxy and keep the backend listener private:
 
 ```sh
 RQBIT_HTTP_BASIC_AUTH_USERPASS='username:password' \
@@ -41,7 +43,11 @@ RQBIT_HTTP_BASIC_AUTH_USERPASS='username:password' \
 
 Basic authentication protects access but does not encrypt traffic. Do not expose the HTTP listener directly to an untrusted network.
 
-Unauthenticated loopback listeners accept only local Host names, including in read-only mode, to prevent browser DNS rebinding from reading API data. The `/rust_log` endpoint is available only on writable servers. Torrent downloads reject symlinks beneath their output directory so an existing link cannot redirect writes outside it; choose a separate output directory if you need to keep linked files there.
+There is no anonymous API mode. Native APIs, metrics, logs, streaming, and optional UPnP HTTP routes require credentials or a valid login session. The optional Bearer key is limited to the qBittorrent routes. The static login page/assets and authentication status/login endpoints remain public so users can sign in. Standard unauthenticated UPnP/DLNA players will no longer work. The `/rust_log` endpoint is available only on writable servers. Torrent downloads reject symlinks beneath their output directory so an existing link cannot redirect writes outside it; choose a separate output directory if you need to keep linked files there.
+
+Session cookies use `Secure`, `HttpOnly`, and `SameSite=Strict` by default and expire server-side after one hour; logout revokes the session. Use HTTPS for browser access. Only for local development or a trusted plaintext network, explicitly set `RQBIT_HTTP_API_INSECURE_COOKIES=true` (or `--http-api-insecure-cookies`) to allow HTTP login cookies. Forwarded headers cannot disable secure cookies. HTTP Basic credentials and Bearer keys still require TLS to protect them in transit. The desktop app's optional HTTP server uses `RQBIT_HTTP_BASIC_AUTH_USERPASS` too; without it, that listener fails closed while native desktop commands remain available.
+
+Downloaded active content such as HTML, SVG, scripts, and PDFs is served as an attachment with a sandbox content policy, preventing it from running with the web UI's session. Audio/video and supported raster images remain streamable. API responses are marked `no-store`, and cross-origin browser requests are rejected, including reads authenticated by cookies. Hardcoded development HTTP origins are allowed only in debug builds.
 
 The web UI supports authenticated login and logout. It provides torrent management, streaming, log viewing, settings, category management, and the server's public IP address. After the UI is authenticated, rqbit obtains that address through an outbound HTTPS request to `api64.ipify.org`; if the lookup is unavailable, the UI continues without displaying it.
 
@@ -59,7 +65,7 @@ RQBIT_HTTP_API_LISTEN_ADDR=0.0.0.0:3030 \
 Connect clients using the qBittorrent Web API with the same host, port, and credentials. Categories retain rqbit's global download directory rather than moving content.
 For multi-file torrents stored in their own folder, the compatibility API reports the parent directory as `save_path` and the torrent folder as `content_path`. This lets Sonarr and Radarr import the torrent folder without scanning the shared download directory. File names from `/api/v2/torrents/files` are relative to the reported `save_path`, including the content folder, so Cleanuparr can address the same files.
 
-Cleanuparr can use those username/password credentials or an optional Bearer key. Set `RQBIT_QBITTORRENT_API_KEY` to a non-empty secret and enter the same value as Cleanuparr's qBittorrent API key. Username/password configuration remains required to enable the compatibility API and protects rqbit's native API; the Bearer key is accepted only on `/api/v2/` routes. Keep the key out of logs and deployment manifests.
+Cleanuparr can use those username/password credentials or an optional Bearer key. Set `RQBIT_QBITTORRENT_API_KEY` to a cryptographically random secret with 32–256 ASCII token characters (for example, generate 32 random bytes with `openssl rand -hex 32`) and enter the same value as Cleanuparr's qBittorrent API key. Username/password configuration remains required to enable the compatibility API and protects rqbit's native API; the Bearer key is accepted only on `/api/v2/` routes. Keep the key out of logs and deployment manifests. Keys shorter than 32 non-padding characters, malformed keys, and keys longer than 256 characters prevent startup. Send the exact key in one `Authorization: Bearer <key>` header; query-string keys, duplicate authorization headers, prefixes, and truncated keys are rejected. Tokens use constant-time hash comparison; sessions use random 256-bit identifiers and retain only their hashes. See [security review and remaining dependency advisories](SECURITY-REVIEW.md).
 
 Magnets submitted through this API have five minutes of active discovery to obtain metadata, including any wait for a resolution slot. If that deadline expires, rqbit stops resolution and reports the pending torrent as `error` until a client explicitly retries or deletes it. Pausing and resuming, manually retrying, or restarting rqbit starts a new discovery period. rqbit does not contact Sonarr, Radarr, or Cleanuparr.
 
@@ -252,11 +258,11 @@ Common native operations include listing torrents, adding a magnet or `.torrent`
 
 ```sh
 curl -d 'magnet:?xt=urn:btih:...' http://127.0.0.1:3030/torrents
-curl http://127.0.0.1:3030/torrents
-curl http://127.0.0.1:3030/metrics
+curl --user username http://127.0.0.1:3030/torrents
+curl --user username http://127.0.0.1:3030/metrics
 ```
 
-When authentication is enabled, supply credentials with `curl -u username:password`. The qBittorrent-compatible routes are available only when `RQBIT_QBITTORRENT_API_ENABLE=true` is configured.
+Supply credentials with `curl -u username:password`. The qBittorrent-compatible routes are available only when `RQBIT_QBITTORRENT_API_ENABLE=true` is configured.
 
 ## Other useful capabilities
 

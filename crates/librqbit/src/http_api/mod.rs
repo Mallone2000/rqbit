@@ -7,10 +7,11 @@ use axum::routing::get;
 use base64::Engine;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use http::{HeaderMap, StatusCode, header::HOST};
+use http::{HeaderMap, StatusCode};
 use librqbit_dualstack_sockets::TcpListener;
 use sha1w::{ISha256, Sha256};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, OnFailure};
 use tracing::{Span, debug_span, info};
 
@@ -40,6 +41,8 @@ pub struct HttpApi {
 pub struct HttpApiOptions {
     pub read_only: bool,
     pub basic_auth: Option<(String, String)>,
+    /// Explicit opt-in for session cookies over plaintext HTTP on trusted networks.
+    pub insecure_session_cookies: bool,
     /// Optional Bearer credential accepted only by the qBittorrent compatibility API.
     pub qbittorrent_api_key: Option<String>,
     // Allow creating torrents via API.
@@ -57,6 +60,7 @@ impl std::fmt::Debug for HttpApiOptions {
         let mut debug = formatter.debug_struct("HttpApiOptions");
         debug
             .field("read_only", &self.read_only)
+            .field("insecure_session_cookies", &self.insecure_session_cookies)
             .field(
                 "basic_auth",
                 &self.basic_auth.as_ref().map(|_| "<redacted>"),
@@ -84,7 +88,7 @@ async fn simple_basic_auth(
 ) -> Result<axum::response::Response> {
     let (expected_user, expected_pass) = match (expected_username, expected_password) {
         (Some(u), Some(p)) => (u, p),
-        _ => return Ok(next.run(request).await),
+        _ => return Err(ApiError::unauthorized()),
     };
     #[cfg(feature = "webui")]
     if request.uri().path() == "/"
@@ -113,7 +117,9 @@ async fn simple_basic_auth(
         Some(&(expected_user.to_owned(), expected_pass.to_owned())),
         &headers,
     ) {
-        if headers.contains_key(http::header::AUTHORIZATION) {
+        if headers.contains_key(http::header::AUTHORIZATION)
+            || headers.contains_key(http::header::COOKIE)
+        {
             sessions.record_login_failure(client_ip);
         }
         if headers.contains_key("x-rqbit-webui") {
@@ -137,12 +143,9 @@ pub(crate) fn credentials_match_basic(
     headers: &HeaderMap,
 ) -> bool {
     let Some((expected_user, expected_pass)) = expected else {
-        return true;
+        return false;
     };
-    let Some((user, pass)) = headers
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Basic "))
+    let Some((user, pass)) = authorization_credential(headers, "Basic")
         .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
         .and_then(|v| String::from_utf8(v).ok())
         .and_then(|v| v.split_once(':').map(|(u, p)| (u.to_owned(), p.to_owned())))
@@ -173,11 +176,39 @@ pub(crate) fn constant_time_secret_match(expected: &str, supplied: &str) -> bool
 }
 
 fn constant_time_eq(expected: &[u8; 32], actual: &[u8; 32]) -> bool {
-    let mut difference = 0_u8;
-    for index in 0..expected.len() {
-        difference |= expected[index] ^ actual[index];
+    bool::from(expected.ct_eq(actual))
+}
+
+// Reject ambiguous headers and never accept credentials from URLs or query strings.
+fn authorization_credential<'a>(headers: &'a HeaderMap, scheme: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(http::header::AUTHORIZATION).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
     }
-    difference == 0
+    let (actual_scheme, credential) = value.split_once(' ')?;
+    (actual_scheme.eq_ignore_ascii_case(scheme) && !credential.is_empty()).then_some(credential)
+}
+
+fn valid_api_key(key: &str) -> bool {
+    // RFC 6750 b64token syntax, with a minimum length to reject accidental weak keys.
+    (32..=256).contains(&key.len())
+        && key.trim_end_matches('=').len() >= 32
+        && !key.starts_with('=')
+        && key
+            .trim_end_matches('=')
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte))
+}
+
+fn credentials_match_bearer(expected: Option<&str>, headers: &HeaderMap) -> bool {
+    expected
+        .zip(authorization_credential(headers, "Bearer"))
+        .is_some_and(|(expected, supplied)| {
+            valid_api_key(expected)
+                && valid_api_key(supplied)
+                && constant_time_secret_match(expected, supplied)
+        })
 }
 
 fn compile_cors_allow_regex(value: &str) -> std::result::Result<regex::bytes::Regex, regex::Error> {
@@ -187,27 +218,28 @@ fn compile_cors_allow_regex(value: &str) -> std::result::Result<regex::bytes::Re
     regex::bytes::Regex::new(&format!(r"\A(?:{value})\z"))
 }
 
-async fn require_loopback_host(
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
-) -> impl IntoResponse {
-    let is_loopback = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|host| host.parse::<http::uri::Authority>().ok())
-        .is_some_and(|authority| {
-            let host = authority.host();
-            host.eq_ignore_ascii_case("localhost")
-                || host.eq_ignore_ascii_case("localhost.")
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        });
-    if !is_loopback {
-        return (StatusCode::FORBIDDEN, "Invalid Host header").into_response();
-    }
-    next.run(request).await
+async fn security_headers(request: Request, next: Next) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", http::HeaderValue::from_static("DENY"));
+    headers
+        .entry("content-security-policy")
+        .or_insert(http::HeaderValue::from_static(
+            "frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
+        ));
+    headers.insert(
+        "referrer-policy",
+        http::HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 impl HttpApi {
@@ -236,42 +268,22 @@ impl HttpApi {
             .opts
             .basic_auth
             .as_ref()
-            .is_some_and(|(user, pass)| !user.is_empty() && !pass.is_empty());
-        if self.opts.basic_auth.is_some() && !credentials_configured {
+            .is_some_and(|(user, pass)| !user.trim().is_empty() && !pass.trim().is_empty());
+        if !credentials_configured {
             return async {
-                anyhow::bail!("basic authentication requires a non-empty username and password")
+                anyhow::bail!("HTTP API requires a non-empty username and password, including loopback and read-only listeners")
             }
             .boxed();
         }
-        if self.opts.enable_qbittorrent_api
-            && self
-                .opts
-                .qbittorrent_api_key
-                .as_ref()
-                .is_some_and(String::is_empty)
-        {
-            return async { anyhow::bail!("qBittorrent API key must not be empty") }.boxed();
-        }
-        let enforce_loopback_host =
-            listener.bind_addr().ip().is_loopback() && !credentials_configured;
-        if self.opts.enable_qbittorrent_api && !credentials_configured {
-            return async {
-                anyhow::bail!(
-                    "the qBittorrent compatibility API requires a non-empty username and password"
-                )
-            }
-            .boxed();
-        }
-        if !self.opts.read_only
-            && !listener.bind_addr().ip().is_loopback()
-            && !credentials_configured
+        if self
+            .opts
+            .qbittorrent_api_key
+            .as_deref()
+            .is_some_and(|key| !valid_api_key(key))
         {
             return async {
-                anyhow::bail!(
-                    "a writable HTTP API on a non-loopback address requires a non-empty username and password"
-                )
-            }
-            .boxed();
+                anyhow::bail!("qBittorrent API key must contain 32 to 256 ASCII token characters; generate a random secret")
+            }.boxed();
         }
 
         #[cfg(feature = "prometheus")]
@@ -313,7 +325,7 @@ impl HttpApi {
 
             tower_http::cors::CorsLayer::default()
                 .allow_origin(AllowOrigin::predicate(move |v, _| {
-                    ALLOWED_ORIGINS.contains(&v.as_bytes())
+                    (cfg!(debug_assertions) && ALLOWED_ORIGINS.contains(&v.as_bytes()))
                         || allow_regex
                             .as_ref()
                             .map(move |r| r.is_match(v.as_bytes()))
@@ -322,6 +334,10 @@ impl HttpApi {
                 .allow_headers(AllowHeaders::mirror_request())
                 .allow_credentials(true)
         };
+
+        if let Some(upnp_router) = upnp_router {
+            main_router = main_router.nest("/upnp", upnp_router);
+        }
 
         // Simple one-user basic auth
         if let Some((user, pass)) = state.opts.basic_auth.clone() {
@@ -372,17 +388,11 @@ impl HttpApi {
             main_router = main_router.nest("/api/v2", qbittorrent::make_api_router(state.clone()));
         }
 
-        if let Some(upnp_router) = upnp_router {
-            main_router = main_router.nest("/upnp", upnp_router);
-        }
-
-        // An unauthenticated loopback API, including a read-only one, remains
-        // reachable through DNS rebinding without a Host check.
-        if enforce_loopback_host {
-            main_router = main_router.layer(axum::middleware::from_fn(require_loopback_host));
-        }
-
         let app = main_router
+            .layer(axum::middleware::from_fn(
+                qbittorrent::auth::require_same_origin,
+            ))
+            .layer(axum::middleware::from_fn(security_headers))
             .layer(cors_layer)
             .layer(
                 tower_http::trace::TraceLayer::new_for_http()
@@ -429,6 +439,273 @@ mod tests {
 
     use super::{HttpApi, HttpApiOptions, compile_cors_allow_regex};
     use crate::{Api, Session, SessionOptions};
+
+    const TEST_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn bearer_credentials_are_exact_unambiguous_and_fail_closed() {
+        use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+        let mut headers = HeaderMap::new();
+        assert!(!super::credentials_match_bearer(Some(TEST_KEY), &headers));
+        for value in [
+            "Bearer ".to_owned(),
+            "Bearer short".to_owned(),
+            format!("Bearer {TEST_KEY}x"),
+            format!("Bearer {}", &TEST_KEY[..63]),
+            format!("Bearer  {TEST_KEY}"),
+            format!("Basic {TEST_KEY}"),
+            format!("Bearer {TEST_KEY},other"),
+            format!("Bearer {TEST_KEY}="),
+        ] {
+            headers.insert(AUTHORIZATION, HeaderValue::from_str(&value).unwrap());
+            assert!(!super::credentials_match_bearer(Some(TEST_KEY), &headers));
+        }
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("bEaReR {TEST_KEY}")).unwrap(),
+        );
+        assert!(super::credentials_match_bearer(Some(TEST_KEY), &headers));
+        assert!(!super::credentials_match_bearer(None, &headers));
+        assert!(!super::credentials_match_bearer(Some(""), &headers));
+        headers.append(AUTHORIZATION, HeaderValue::from_static("Bearer wrong"));
+        assert!(!super::credentials_match_bearer(Some(TEST_KEY), &headers));
+        assert!(!super::credentials_match_basic(None, &HeaderMap::new()));
+    }
+
+    #[tokio::test]
+    async fn every_listener_requires_credentials_and_rejects_weak_tokens() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for read_only in [false, true] {
+            for ip in [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED] {
+                for credentials in [
+                    None,
+                    Some((String::new(), "secret".into())),
+                    Some(("user".into(), String::new())),
+                ] {
+                    let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+                        (ip, 0).into(),
+                        Default::default(),
+                    )
+                    .unwrap();
+                    let error = HttpApi::new(
+                        Api::new(session.clone(), None, None),
+                        Some(HttpApiOptions {
+                            read_only,
+                            basic_auth: credentials,
+                            ..Default::default()
+                        }),
+                    )
+                    .make_http_api_and_run(listener, None)
+                    .await
+                    .unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("requires a non-empty username and password")
+                    );
+                }
+            }
+        }
+        for key in [
+            "".to_owned(),
+            "short".to_owned(),
+            "a=".repeat(32),
+            "a".repeat(257),
+            format!("{} ", "a".repeat(32)),
+            format!("a{}", "=".repeat(32)),
+        ] {
+            let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                Default::default(),
+            )
+            .unwrap();
+            let error = HttpApi::new(
+                Api::new(session.clone(), None, None),
+                Some(HttpApiOptions {
+                    basic_auth: Some(("user".into(), "secret".into())),
+                    qbittorrent_api_key: Some(key),
+                    ..Default::default()
+                }),
+            )
+            .make_http_api_and_run(listener, None)
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("API key must contain"));
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_routes_include_upnp_and_reject_token_scope_and_query_bypasses() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let html_path = downloads.path().join("untrusted.html");
+        std::fs::write(&html_path, "<script>fetch('/torrents')</script>").unwrap();
+        let torrent = crate::create_torrent(
+            &html_path,
+            crate::CreateTorrentOptions::default(),
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let handle = session
+            .add_torrent(
+                crate::AddTorrent::TorrentFileBytes(torrent.as_bytes().unwrap()),
+                Some(crate::AddTorrentOptions {
+                    overwrite: true,
+                    paused: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        let stream_path = format!("/torrents/{}/stream/0", handle.info_hash().as_string());
+        let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+        let base = format!("http://{}", listener.bind_addr());
+        let upnp = axum::Router::new().route(
+            "/description.xml",
+            axum::routing::get(|| async { "private UPnP data" }),
+        );
+        let server = tokio::spawn(
+            HttpApi::new(
+                Api::new(session, None, None),
+                Some(HttpApiOptions {
+                    basic_auth: Some(("user".into(), "secret".into())),
+                    enable_qbittorrent_api: true,
+                    qbittorrent_api_key: Some(TEST_KEY.into()),
+                    ..Default::default()
+                }),
+            )
+            .make_http_api_and_run(listener, Some(upnp)),
+        );
+        let client = reqwest::Client::new();
+        for path in [
+            "/",
+            "/stats",
+            "/torrents",
+            "/stream_logs",
+            "/dht/table",
+            "/upnp/description.xml",
+            "/torrents/0/stream/0",
+        ] {
+            let response = client.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+        let response = client
+            .get(format!(
+                "{base}/api/v2/app/version?token={TEST_KEY}&api_key={TEST_KEY}&SID={TEST_KEY}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        let response = client
+            .get(format!("{base}/api/v2/app/version"))
+            .bearer_auth(TEST_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let response = client
+            .get(format!("{base}/stats"))
+            .bearer_auth(TEST_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let response = client
+            .get(format!("{base}/upnp/description.xml"))
+            .basic_auth("user", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        for path in [
+            "/stats",
+            "/torrents",
+            "/upnp/description.xml",
+            "/api/v2/app/version",
+        ] {
+            let response = client
+                .get(format!("{base}{path}"))
+                .basic_auth("user", Some("secret"))
+                .header("Origin", "https://attacker.invalid")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        }
+        let response = client
+            .get(format!("{base}{stream_path}"))
+            .basic_auth("user", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert_eq!(response.headers()["content-disposition"], "attachment");
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("sandbox")
+        );
+        assert_eq!(
+            response.text().await.unwrap(),
+            "<script>fetch('/torrents')</script>"
+        );
+        let response = client
+            .get(format!("{base}{stream_path}"))
+            .basic_auth("user", Some("secret"))
+            .header("Range", "bytes=0-7")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("sandbox")
+        );
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"<script>");
+        server.abort();
+    }
 
     #[test]
     fn debug_output_redacts_basic_auth_credentials() {
@@ -510,13 +787,20 @@ mod tests {
         )
         .unwrap();
         let address = listener.bind_addr();
-        let server =
-            HttpApi::new(Api::new(session, None, None), None).make_http_api_and_run(listener, None);
+        let server = HttpApi::new(
+            Api::new(session, None, None),
+            Some(HttpApiOptions {
+                basic_auth: Some(("test-user".into(), "secret".into())),
+                ..Default::default()
+            }),
+        )
+        .make_http_api_and_run(listener, None);
         let task = tokio::spawn(async move { server.await.unwrap() });
         let client = reqwest::Client::new();
 
         let response = client
             .post(format!("http://{address}/torrents/limits"))
+            .basic_auth("test-user", Some("secret"))
             .header("Origin", "https://attacker.example")
             .json(&serde_json::json!({"upload_bps": null, "download_bps": null}))
             .send()
@@ -526,8 +810,9 @@ mod tests {
 
         let response = client
             .post(format!("http://{address}/torrents/limits"))
+            .basic_auth("test-user", Some("secret"))
             .header("Host", "attacker.example")
-            .header("Origin", "http://attacker.example")
+            .header("Origin", "http://different-attacker.example")
             .json(&serde_json::json!({"upload_bps": null, "download_bps": null}))
             .send()
             .await
@@ -536,6 +821,7 @@ mod tests {
 
         let response = client
             .post(format!("http://{address}/torrents/limits"))
+            .basic_auth("test-user", Some("secret"))
             .json(&serde_json::json!({"upload_bps": null, "download_bps": null}))
             .send()
             .await
@@ -545,7 +831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_loopback_api_rejects_dns_rebinding_and_log_changes() {
+    async fn read_only_api_requires_authentication_and_rejects_log_changes() {
         let downloads = tempfile::tempdir().unwrap();
         let session = Session::new_with_opts(
             downloads.path().to_path_buf(),
@@ -568,6 +854,7 @@ mod tests {
             Api::new(session, None, None),
             Some(HttpApiOptions {
                 read_only: true,
+                basic_auth: Some(("test-user".into(), "secret".into())),
                 ..Default::default()
             }),
         )
@@ -581,10 +868,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
         let response = client
             .get(format!("http://{address}/torrents"))
+            .basic_auth("test-user", Some("secret"))
             .send()
             .await
             .unwrap();
@@ -711,6 +999,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(
+            response.headers()["Set-Cookie"]
+                .to_str()
+                .unwrap()
+                .contains("; Secure")
+        );
         let cookie = response
             .headers()
             .get("Set-Cookie")
@@ -796,7 +1090,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-        for _ in 0..5 {
+        // The two revoked-cookie requests above also count as failed credentials.
+        for _ in 0..3 {
             let response = client
                 .get(format!("{base}/stats"))
                 .basic_auth("test-user", Some("wrong"))

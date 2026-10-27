@@ -1653,6 +1653,23 @@ mod tests {
         spawn_utils::BlockingSpawner,
     };
 
+    fn authenticated_test_client() -> reqwest::Client {
+        use base64::Engine;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("test:secret")
+            ))
+            .unwrap(),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap()
+    }
+
     async fn start_server(router: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2093,7 +2110,7 @@ mod tests {
             Api::new(session.clone(), None, None),
             Some(HttpApiOptions {
                 enable_qbittorrent_api: enabled,
-                basic_auth: enabled.then(|| ("test".to_owned(), "secret".to_owned())),
+                basic_auth: Some(("test".to_owned(), "secret".to_owned())),
                 ..Default::default()
             }),
         )
@@ -2121,7 +2138,9 @@ mod tests {
             Some(HttpApiOptions {
                 read_only: false,
                 basic_auth: Some(("client".to_owned(), "password".to_owned())),
-                qbittorrent_api_key: Some("test-api-key".to_owned()),
+                qbittorrent_api_key: Some(
+                    "test-api-key-0123456789abcdef0123456789abcdef".to_owned(),
+                ),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
@@ -2165,7 +2184,7 @@ mod tests {
             assert_eq!(
                 client
                     .post(format!("{base}/app/setPreferences"))
-                    .bearer_auth("test-api-key")
+                    .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
                     .header("Origin", origin)
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .body("json=%7B%7D")
@@ -2179,7 +2198,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base}/app/setPreferences"))
-                .bearer_auth("test-api-key")
+                .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(form_body(&[(
                     "json",
@@ -2194,7 +2213,7 @@ mod tests {
 
         let response = client
             .post(format!("{base}/app/setPreferences"))
-            .bearer_auth("test-api-key")
+            .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_body(&[(
                 "json",
@@ -2206,7 +2225,7 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let preferences: Value = client
             .get(format!("{base}/app/preferences"))
-            .bearer_auth("test-api-key")
+            .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
             .send()
             .await
             .unwrap()
@@ -2265,7 +2284,7 @@ mod tests {
         let magnet = format!("magnet:?xt=urn:btih:{hash}&dn=Pending");
         let response = client
             .post(format!("{base}/torrents/add"))
-            .bearer_auth("test-api-key")
+            .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_body(&[("urls", magnet.as_str())]))
             .send()
@@ -2274,7 +2293,7 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let info: Value = client
             .get(format!("{base}/torrents/info?hashes={hash}"))
-            .bearer_auth("test-api-key")
+            .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
             .send()
             .await
             .unwrap()
@@ -2287,7 +2306,7 @@ mod tests {
         assert!(info[0]["added_on"].as_u64().unwrap() > 0);
         let properties: Value = client
             .get(format!("{base}/torrents/properties?hash={hash}"))
-            .bearer_auth("test-api-key")
+            .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
             .send()
             .await
             .unwrap()
@@ -2297,7 +2316,7 @@ mod tests {
         assert_eq!(properties["is_private"], false);
         let files: Value = client
             .get(format!("{base}/torrents/files?hash={hash}"))
-            .bearer_auth("test-api-key")
+            .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
             .send()
             .await
             .unwrap()
@@ -2307,7 +2326,7 @@ mod tests {
         assert!(files.as_array().unwrap().is_empty());
         let response = client
             .post(format!("{base}/torrents/addTags"))
-            .bearer_auth("test-api-key")
+            .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_body(&[
                 ("hashes", hash.as_str()),
@@ -2319,7 +2338,7 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let info: Value = client
             .get(format!("{base}/torrents/info?hashes={hash}"))
-            .bearer_auth("test-api-key")
+            .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
             .send()
             .await
             .unwrap()
@@ -2330,7 +2349,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base}/torrents/addTags"))
-                .bearer_auth("test-api-key")
+                .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(form_body(&[
                     ("hashes", hash.as_str()),
@@ -2344,7 +2363,7 @@ mod tests {
         );
         let response = client
             .post(format!("{base}/torrents/delete"))
-            .bearer_auth("test-api-key")
+            .bearer_auth("test-api-key-0123456789abcdef0123456789abcdef")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_body(&[
                 ("hashes", hash.as_str()),
@@ -3469,7 +3488,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("writable HTTP API on a non-loopback address requires")
+                .contains("HTTP API requires")
         );
     }
 
@@ -3634,12 +3653,15 @@ mod tests {
         let state = Arc::new(HttpApi::new(
             Api::new(restored.clone(), None, None),
             Some(HttpApiOptions {
+                basic_auth: Some(("test".into(), "secret".into())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
         ));
         let (base, server) = start_server(make_api_router(state)).await;
-        let torrents: Value = reqwest::get(format!("{base}/torrents/info?category=test-category"))
+        let torrents: Value = authenticated_test_client()
+            .get(format!("{base}/torrents/info?category=test-category"))
+            .send()
             .await
             .unwrap()
             .json()
@@ -3770,12 +3792,13 @@ mod tests {
         let state = Arc::new(HttpApi::new(
             Api::new(session.clone(), None, None),
             Some(HttpApiOptions {
+                basic_auth: Some(("test".into(), "secret".into())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
         ));
         let (base, server) = start_server(make_api_router(state)).await;
-        let client = reqwest::Client::new();
+        let client = authenticated_test_client();
         add_fixture(&client, &base, "", "controls.torrent", &torrent_bytes).await;
         let listed: Value = client
             .get(format!("{base}/torrents/info?category=test-category"))
@@ -3983,12 +4006,13 @@ mod tests {
         let state = Arc::new(HttpApi::new(
             Api::new(session.clone(), None, None),
             Some(HttpApiOptions {
+                basic_auth: Some(("test".into(), "secret".into())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
         ));
         let (base, server) = start_server(make_api_router(state)).await;
-        let client = reqwest::Client::new();
+        let client = authenticated_test_client();
         let info_hash = "0101010101010101010101010101010101010101";
         let magnet =
             format!("magnet:?xt=urn:btih:{info_hash}&dn=Pending%20Fixture&tr={tracker_url}");
@@ -4066,6 +4090,7 @@ mod tests {
         let state = Arc::new(HttpApi::new(
             Api::new(session.clone(), None, None),
             Some(HttpApiOptions {
+                basic_auth: Some(("test".into(), "secret".into())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
@@ -4075,7 +4100,7 @@ mod tests {
         let magnet =
             format!("magnet:?xt=urn:btih:{info_hash}&dn=Multipart%20Fixture&tr={tracker_url}");
         let boundary = "rqbit-multipart-magnet-boundary";
-        let client = reqwest::Client::new();
+        let client = authenticated_test_client();
 
         let response = client
             .post(format!("{base}/torrents/add"))
@@ -4138,12 +4163,13 @@ mod tests {
         let state = Arc::new(HttpApi::new(
             Api::new(session.clone(), None, None),
             Some(HttpApiOptions {
+                basic_auth: Some(("test".into(), "secret".into())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
         ));
         let (base, server) = start_server(make_api_router(state)).await;
-        let client = reqwest::Client::new();
+        let client = authenticated_test_client();
         add_fixture(&client, &base, "", filename, &torrent_bytes).await;
 
         let torrents: Value = client
@@ -4298,6 +4324,7 @@ mod tests {
         let state = Arc::new(HttpApi::new(
             Api::new(session, None, None),
             Some(HttpApiOptions {
+                basic_auth: Some(("test".into(), "secret".into())),
                 enable_qbittorrent_api: true,
                 ..Default::default()
             }),
@@ -4305,7 +4332,7 @@ mod tests {
         let (base, server) = start_server(make_api_router(state)).await;
         let malicious = b"d4:infod5:filesld6:lengthi1e4:pathl2:..10:escape.mkveee4:name4:root12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
         let boundary = "rqbit-path-traversal-boundary";
-        let response = reqwest::Client::new()
+        let response = authenticated_test_client()
             .post(format!("{base}/torrents/add"))
             .header(
                 "Content-Type",

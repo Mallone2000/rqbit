@@ -146,6 +146,13 @@ struct Opts {
     #[arg(long = "http-api-allow-create", env = "RQBIT_HTTP_API_ALLOW_CREATE")]
     http_api_allow_create: bool,
 
+    /// Allow session cookies over plaintext HTTP. Use only on a trusted network.
+    #[arg(
+        long = "http-api-insecure-cookies",
+        env = "RQBIT_HTTP_API_INSECURE_COOKIES"
+    )]
+    http_api_insecure_cookies: bool,
+
     /// Upload body size limit in bytes.
     #[arg(
         long = "http-api-max-upload-size",
@@ -763,6 +770,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             None
         },
         qbittorrent_api_key: std::env::var("RQBIT_QBITTORRENT_API_KEY").ok(),
+        insecure_session_cookies: opts.http_api_insecure_cookies,
         allow_create: opts.http_api_allow_create,
         max_upload_body_size: opts.http_api_max_upload_size,
         enable_qbittorrent_api: opts.qbittorrent_api_enable,

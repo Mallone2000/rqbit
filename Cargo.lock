@@ -98,7 +98,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -109,7 +109,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1110,9 +1110,9 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "fe3e9d21d39e6f39ff46e03d5b621424f88ee23d8a1672c6bfc9ccc7f2da4f6a"
 dependencies = [
  "cmov",
 ]
@@ -1306,7 +1306,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1501,7 +1501,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3008,7 +3008,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3065,6 +3065,7 @@ dependencies = [
  "size_format",
  "socket2",
  "sqlx",
+ "subtle",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -3084,7 +3085,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-bencode"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -3099,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-buffers"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "bytes",
  "librqbit-clone-to-owned",
@@ -3109,14 +3110,14 @@ dependencies = [
 
 [[package]]
 name = "librqbit-clone-to-owned"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "librqbit-core"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3145,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-dht"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "backon",
@@ -3192,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-lsd"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "atoi 3.1.0",
@@ -3211,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-peer-protocol"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -3231,7 +3232,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-sha1-wrapper"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "assert_cfg",
  "aws-lc-rs",
@@ -3241,7 +3242,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-tracker-comms"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3268,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-upnp"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "bstr",
@@ -3289,7 +3290,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-upnp-serve"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -3592,7 +3593,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.20",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3714,7 +3715,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4493,9 +4494,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -4525,7 +4526,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4808,7 +4809,7 @@ dependencies = [
 
 [[package]]
 name = "rqbit"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4841,7 +4842,7 @@ dependencies = [
 
 [[package]]
 name = "rqbit-desktop"
-version = "9.0.1-servarr.8"
+version = "9.0.1-servarr.9"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4894,14 +4895,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -4951,7 +4952,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4962,9 +4963,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.14"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0527518605e68109d875e248ea259b6758801cf165e4b2c2733ae3b51f12535a"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -5457,7 +5458,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6112,10 +6113,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6243,9 +6244,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -6649,7 +6650,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.20",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7047,9 +7048,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -7118,7 +7119,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

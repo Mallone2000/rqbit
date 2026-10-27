@@ -87,7 +87,15 @@ async fn api_from_config(
 
     let mut http_api_opts = librqbit::http_api::HttpApiOptions {
         read_only: config.http_api.read_only,
-        basic_auth: None,
+        basic_auth: std::env::var("RQBIT_HTTP_BASIC_AUTH_USERPASS")
+            .ok()
+            .map(|credentials| {
+                let (user, password) = credentials
+                    .split_once(':')
+                    .context("HTTP credentials must be username:password")?;
+                Ok::<_, anyhow::Error>((user.to_owned(), password.to_owned()))
+            })
+            .transpose()?,
         ..Default::default()
     };
 
