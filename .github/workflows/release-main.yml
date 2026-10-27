@@ -1,4 +1,4 @@
-name: Build and release main
+name: Build and publish Docker image
 
 on:
   push:
@@ -18,7 +18,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
-      msi-version: ${{ steps.version.outputs.msi-version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -66,80 +65,9 @@ jobs:
               if "source" not in package and package["version"] != version:
                   raise SystemExit(f"{package['name']} has a mismatched lockfile version")
 
-          # MSI versions cannot contain the fork's textual prerelease suffix.
-          msi_parts = tuple(map(int, match.groups()))
-          if any(part > limit for part, limit in zip(msi_parts, (255, 255, 65535, 65535))):
-              raise SystemExit(f"Version exceeds MSI limits: {version}")
-          msi_version = ".".join(map(str, msi_parts))
-
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               print(f"tag=v{version}", file=output)
-              print(f"msi-version={msi_version}", file=output)
           PY
-
-      - name: Reject an existing release tag
-        env:
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG"; then
-            echo "Release tag $RELEASE_TAG already exists" >&2
-            exit 1
-          else
-            status=$?
-            if [ "$status" -ne 2 ]; then
-              exit "$status"
-            fi
-          fi
-
-  release-linux:
-    needs: check-version
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            arch: amd64
-          - os: ubuntu-24.04-arm
-            arch: arm64
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Install tauri dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-
-      - name: install Tauri
-        run: cargo install tauri-cli --locked --version 2.8.4
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Install frontend workspace dependencies
-        run: npm ci
-
-      - name: cargo tauri build
-        working-directory: desktop
-        run: cargo tauri build --ci
-
-      - name: Move files
-        run: |
-          mkdir -p builds
-          find target/ -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.rpm" \) -print0 |
-          while IFS= read -r -d '' file; do
-              mv "$file" ${{ github.workspace }}/builds/
-          done
-          mv target/release/rqbit-desktop ${{ github.workspace }}/builds/rqbit-desktop-linux-${{ matrix.arch }}
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-desktop-linux-${{ matrix.arch }}
-          path: |
-            ${{ github.workspace }}/builds/*
-          if-no-files-found: error
 
   build-docker-cross:
     needs: check-version
@@ -200,109 +128,11 @@ jobs:
         run: |
           echo "key=$(echo ${{ matrix.platform }} | tr '/' '-')" >> "$GITHUB_OUTPUT"
 
-      - name: copy binary for release
-        run: |
-          cd target/cross
-          cp -l ${{ matrix.platform }}/rqbit rqbit-${{ steps.gen_artifact_key.outputs.key }}
-
       - name: Archive target/cross/
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.gen_artifact_key.outputs.key }}
           path: target/cross/${{ matrix.platform }}/
-
-      - name: Archive release binary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-cli-${{ steps.gen_artifact_key.outputs.key }}
-          path: target/cross/rqbit-${{ steps.gen_artifact_key.outputs.key }}
-          if-no-files-found: error
-
-  release-windows:
-    needs: check-version
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: install Tauri
-        run: cargo install tauri-cli --locked --version 2.8.4
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Install frontend workspace dependencies
-        run: npm ci
-
-      - name: cargo tauri build
-        working-directory: desktop
-        env:
-          MSI_VERSION: ${{ needs.check-version.outputs.msi-version }}
-        run: |
-          $config = @{ bundle = @{ windows = @{ wix = @{ version = $env:MSI_VERSION } } } }
-          $configPath = Join-Path $env:RUNNER_TEMP "tauri-windows.json"
-          $config | ConvertTo-Json -Depth 4 | Set-Content -Path $configPath
-          cargo tauri build --ci --config $configPath
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-desktop-windows
-          path: target/release/bundle/msi/rqbit-desktop_*_x64_en-US.msi
-          if-no-files-found: error
-
-      - name: Build release
-        run: cargo build --profile release-github
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-cli-windows
-          path: target/release-github/rqbit.exe
-          if-no-files-found: error
-
-  release-macos:
-    needs: check-version
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: install Tauri
-        run: cargo install tauri-cli --locked --version 2.8.4
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Install frontend workspace dependencies
-        run: npm ci
-
-      - name: cargo tauri build
-        working-directory: desktop
-        run: |
-          rustup target add aarch64-apple-darwin && rustup target add x86_64-apple-darwin &&
-          cargo tauri build --target universal-apple-darwin --ci
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-desktop-macos
-          path: target/universal-apple-darwin/release/bundle/dmg/rqbit-desktop_*_universal.dmg
-          if-no-files-found: error
-
-      - name: Make a directory for output artifacts
-        run: mkdir -p target/artifacts
-
-      - name: Build release OSX universal binary
-        run: |
-          rustup target install aarch64-apple-darwin &&
-          cargo build --profile release-github --target x86_64-apple-darwin &&
-          cargo build --profile release-github --target aarch64-apple-darwin &&
-          lipo ./target/x86_64-apple-darwin/release-github/rqbit ./target/aarch64-apple-darwin/release-github/rqbit -create -output ./target/artifacts/rqbit-osx-universal
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-cli-macos
-          path: target/artifacts/rqbit-osx-universal
           if-no-files-found: error
 
   build-push-docker-multiarch:
@@ -409,43 +239,3 @@ jobs:
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           context: target/cross/
           file: docker/Dockerfile
-
-  publish-release:
-    needs:
-      - check-version
-      - release-linux
-      - release-windows
-      - release-macos
-      - build-push-docker-multiarch
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: release-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Publish compiled packages as latest release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.check-version.outputs.tag }}
-        run: |
-          test -f release-assets/rqbit-linux-amd64
-          test -f release-assets/rqbit-linux-arm64
-          test -f release-assets/rqbit-linux-arm-v7
-          test -f release-assets/rqbit.exe
-          test -f release-assets/rqbit-osx-universal
-          current_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
-          if [ "$current_sha" = "$GITHUB_SHA" ]; then
-            latest_flag=--latest
-          else
-            latest_flag=--latest=false
-          fi
-          gh release create "$RELEASE_TAG" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$RELEASE_TAG" \
-            --generate-notes \
-            "$latest_flag"

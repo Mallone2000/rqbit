@@ -116,13 +116,13 @@ current `main`; bump it again if another change used that version first.
 - Update `[workspace.package].version` and every internal dependency version in
   the root `Cargo.toml`, then refresh `Cargo.lock`. The desktop crate inherits
   the workspace version. Keep all workspace packages on the same version.
-- The release tag `v<workspace version>` must identify the exact `main` commit
-  used to build the packages. Publish those compiled packages in that tag's
-  GitHub release and make it the newest release. A draft release or a moving
-  Docker `latest` tag does not satisfy this requirement.
-- Verify the version and release workflow before considering a `main` push
-  complete. If the workflow cannot publish the built packages, fix it as part
-  of the change; do not report the release as complete until GitHub shows it.
+- The primary deployment target is a Linux home server running Docker. Pushes
+  to `main` build and publish the multi-architecture Docker image, tagged with
+  `v<workspace version>` and, for the current main commit, `main` and `latest`.
+- Keep the image publication path free of desktop installers, Windows/macOS
+  builds, and GitHub binary releases. Those are not required deployment outputs.
+- Verify the Docker workflow and published image before considering a `main`
+  push complete. A GitHub release is not required for Docker publication.
 
 ## Rust
 
