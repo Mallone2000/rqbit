@@ -50,7 +50,9 @@ export interface PendingTorrent {
   info_hash: string;
   name: string | null;
   category: string;
-  state: "resolving_metadata" | "paused" | "error";
+  state: "resolving_metadata" | "paused" | "error" | "queued";
+  queue_position?: number | null;
+  force_start?: boolean;
   metadata_attempts: number;
   error_code:
     | "metadata_timeout"
@@ -187,6 +189,10 @@ export const STATE_LIVE = "live";
 export const STATE_ERROR = "error";
 
 export interface TorrentStats {
+  queued?: boolean;
+  queue_position?: number | null;
+  force_start?: boolean;
+  stopped_by_share_limit?: boolean;
   state: "initializing" | "paused" | "live" | "error";
   error: string | null;
   file_progress: number[];
@@ -271,6 +277,10 @@ export interface JSONLogLine {
 }
 
 export interface RqbitAPI {
+  getQueue?: () => Promise<QueueConfig>;
+  setQueue?: (config: QueueConfig) => Promise<void>;
+  reorderQueue?: (hashes: string[], operation: QueueOperation) => Promise<void>;
+  setForceStart?: (hash: string, value: boolean) => Promise<void>;
   getPlaylistUrl: (index: number) => string | null;
   getStreamLogsUrl: () => string | null;
   listTorrents: (opts?: {
@@ -306,3 +316,15 @@ export interface RqbitAPI {
   createCategory?: (name: string) => Promise<void>;
   removeCategories?: (names: string[]) => Promise<void>;
 }
+
+export interface QueueConfig {
+  enabled: boolean;
+  max_active_downloads: number;
+  max_active_uploads: number;
+  max_active_torrents: number;
+  dont_count_slow_torrents: boolean;
+  slow_torrent_dl_rate_threshold: number;
+  slow_torrent_ul_rate_threshold: number;
+  slow_torrent_inactive_timer: number;
+}
+export type QueueOperation = "top" | "bottom" | "up" | "down";

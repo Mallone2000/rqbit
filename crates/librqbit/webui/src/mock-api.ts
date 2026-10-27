@@ -286,6 +286,10 @@ function generateTorrentStats(id: number): TorrentStats {
     .map(() => (finished ? 1 : rand() * (progressBytes / totalBytes)));
 
   return {
+    queued: false,
+    queue_position: null,
+    force_start: false,
+    stopped_by_share_limit: false,
     state: finished && state === "live" ? "live" : state,
     error: state === "error" ? "Connection timed out" : null,
     file_progress: fileProgress,

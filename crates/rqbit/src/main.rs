@@ -70,6 +70,45 @@ fn parse_cli_duration(value: &str) -> Result<Duration, humantime::DurationError>
 #[derive(Parser)]
 #[command(version, author, about)]
 struct Opts {
+    /// Optional queue setting override; stored settings apply when omitted.
+    #[arg(long = "queueing-enabled", env = "RQBIT_QUEUEING_ENABLED", action = clap::ArgAction::Set)]
+    queueing_enabled: Option<bool>,
+    #[arg(
+        long = "max-active-downloads",
+        env = "RQBIT_MAX_ACTIVE_DOWNLOADS",
+        allow_hyphen_values = true
+    )]
+    max_active_downloads: Option<i32>,
+    #[arg(
+        long = "max-active-uploads",
+        env = "RQBIT_MAX_ACTIVE_UPLOADS",
+        allow_hyphen_values = true
+    )]
+    max_active_uploads: Option<i32>,
+    #[arg(
+        long = "max-active-torrents",
+        env = "RQBIT_MAX_ACTIVE_TORRENTS",
+        allow_hyphen_values = true
+    )]
+    max_active_torrents: Option<i32>,
+    #[arg(long = "dont-count-slow-torrents", env = "RQBIT_DONT_COUNT_SLOW_TORRENTS", action = clap::ArgAction::Set)]
+    dont_count_slow_torrents: Option<bool>,
+    #[arg(
+        long = "slow-torrent-dl-rate-threshold",
+        env = "RQBIT_SLOW_TORRENT_DL_RATE_THRESHOLD"
+    )]
+    slow_torrent_dl_rate_threshold: Option<u32>,
+    #[arg(
+        long = "slow-torrent-ul-rate-threshold",
+        env = "RQBIT_SLOW_TORRENT_UL_RATE_THRESHOLD"
+    )]
+    slow_torrent_ul_rate_threshold: Option<u32>,
+    #[arg(
+        long = "slow-torrent-inactive-timer",
+        env = "RQBIT_SLOW_TORRENT_INACTIVE_TIMER"
+    )]
+    slow_torrent_inactive_timer: Option<u32>,
+
     /// The console loglevel
     #[arg(value_enum, short = 'v', env = "RQBIT_LOG_LEVEL_CONSOLE")]
     log_level: Option<LogLevel>,
@@ -651,6 +690,16 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
     };
 
     let mut sopts = SessionOptions {
+        queue: Some(librqbit::QueueConfigPatch {
+            enabled: opts.queueing_enabled,
+            max_active_downloads: opts.max_active_downloads,
+            max_active_uploads: opts.max_active_uploads,
+            max_active_torrents: opts.max_active_torrents,
+            dont_count_slow_torrents: opts.dont_count_slow_torrents,
+            slow_torrent_dl_rate_threshold: opts.slow_torrent_dl_rate_threshold,
+            slow_torrent_ul_rate_threshold: opts.slow_torrent_ul_rate_threshold,
+            slow_torrent_inactive_timer: opts.slow_torrent_inactive_timer,
+        }),
         dht,
         // This will be overridden by "server start" below if needed.
         persistence: None,

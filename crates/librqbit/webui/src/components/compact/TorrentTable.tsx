@@ -9,6 +9,7 @@ import { isTorrentVisible, SortDirection } from "../../helper/torrentFilters";
 
 // Extended sort columns for table view (includes columns not in card view)
 export type TableSortColumn =
+  | "queue"
   | "id"
   | "name"
   | "size"
@@ -28,6 +29,8 @@ function getTableSortValue(
   column: TableSortColumn,
 ): number | string {
   switch (column) {
+    case "queue":
+      return t.stats?.queue_position ?? Number.MAX_SAFE_INTEGER;
     case "id":
       return t.id;
     case "name":
@@ -245,6 +248,15 @@ export const TorrentTable: React.FC<TorrentTableProps> = ({
               sortDirection={sortDirection}
               onSort={handleSort}
               className="w-12"
+              align="center"
+            />
+            <TableHeader
+              column="queue"
+              label="Queue"
+              sortColumn={sortColumn}
+              sortDirection={sortDirection}
+              onSort={handleSort}
+              className="w-16"
               align="center"
             />
             <TableHeader

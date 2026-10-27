@@ -152,6 +152,12 @@ export const API: RqbitAPI & {
   logout: (): Promise<void> => {
     return makeRequest("POST", "/web/auth/logout");
   },
+  getQueue: () => makeRequest("GET", "/torrents/queue"),
+  setQueue: (config) => makeRequest("POST", "/torrents/queue", config, true),
+  reorderQueue: (hashes, operation) =>
+    makeRequest("POST", "/torrents/queue/reorder", { hashes, operation }, true),
+  setForceStart: (hash, value) =>
+    makeRequest("POST", `/torrents/${hash}/force_start`, { value }, true),
   getStreamLogsUrl: () => apiUrl + "/stream_logs",
   listTorrents: (opts?: {
     withStats?: boolean;

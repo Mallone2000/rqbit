@@ -8,6 +8,16 @@ use serde::{Deserialize, Serialize};
 pub struct TorrentAutomationMetadata {
     #[serde(default)]
     pub category: String,
+    #[serde(default)]
+    pub active_seconds: u64,
+    #[serde(default)]
+    pub payload_downloaded_bytes: u64,
+    #[serde(default)]
+    pub stopped_by_share_limit: bool,
+    #[serde(default)]
+    pub queue_last_known_seeds: Option<u64>,
+    #[serde(default)]
+    pub queue_last_known_leechers: Option<u64>,
     /// qBittorrent tags attached to this torrent. Stored with pending magnets too.
     #[serde(default)]
     pub tags: std::collections::BTreeSet<String>,

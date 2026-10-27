@@ -111,6 +111,14 @@ impl std::fmt::Debug for SerializedPendingTorrent {
 // TODO: make this info_hash first, ID-second.
 #[async_trait]
 pub trait SessionPersistenceStore: core::fmt::Debug + Send + Sync + BitVFactory {
+    async fn store_queue_and_exclusions(
+        &self,
+        snapshot: &crate::QueueSnapshot,
+        enabled: bool,
+        patterns: &str,
+    ) -> anyhow::Result<()>;
+    async fn load_queue(&self) -> anyhow::Result<crate::QueueSnapshot>;
+    async fn store_queue(&self, snapshot: &crate::QueueSnapshot) -> anyhow::Result<()>;
     async fn load_excluded_file_names(&self) -> anyhow::Result<(bool, String)>;
     async fn store_excluded_file_names(&self, enabled: bool, patterns: &str) -> anyhow::Result<()>;
     async fn load_pending(&self) -> anyhow::Result<Vec<SerializedPendingTorrent>>;
@@ -145,6 +153,24 @@ where
     D: Deserializer<'de>,
 {
     Id20::deserialize(deserializer)
+}
+
+/// Wait for an in-flight atomic rename before installing a write-failure fixture.
+#[cfg(test)]
+pub(crate) async fn block_json_writes(path: &std::path::Path) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match tokio::fs::create_dir(path).await {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    tokio::task::yield_now().await
+                }
+                Err(error) => panic!("could not install write-failure fixture: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("atomic write did not finish before fault injection");
 }
 
 #[cfg(test)]

@@ -73,11 +73,62 @@ The temporary `RQBIT_SONARR_*` and `RQBIT_RADARR_*` settings from the direct rec
 
 Torrent-add boolean fields (`paused`, `sequentialDownload`, and `firstLastPiecePrio`) accept case-insensitive `true`/`false` and `1`/`0` in both URL-encoded and multipart forms, including Radarr's `True`/`False` values. Invalid boolean values are rejected.
 
-The compatibility profile advertises Web API 2.9.2. It supports sequential downloading, first/last 1% piece priority, `Original`/`Subfolder` content layout, and per-torrent inactive seeding limits. Force Start bypasses share limits until paused or explicitly cleared. These settings survive pending metadata resolution and restart. Queueing remains disabled, so queue-priority requests return 409 as in qBittorrent with queueing disabled. See the [source-based compatibility matrix and validation limits](AUTOMATION-COMPATIBILITY.md).
+The compatibility profile advertises Web API 2.9.2. It supports sequential downloading, first/last 1% piece priority, `Original`/`Subfolder` content layout, and per-torrent inactive seeding limits. Force Start bypasses queue and share limits until paused or explicitly cleared. These settings survive pending metadata resolution and restart. Queueing is opt in: enable it in the web UI, CLI or API. Priority requests return 409 only while queueing is disabled. See the [source-based compatibility matrix and validation limits](AUTOMATION-COMPATIBILITY.md).
+
+### Torrent queueing
+
+Queueing applies to all managed torrents, independently of the qBittorrent API.
+Existing installations retain unlimited activity until it is enabled. Defaults
+are 3 active downloads, 3 active seeds and 5 total automatic torrents. Downloads
+take precedence; seeds use libtorrent 2.0’s swarm and activity ranking rules.
+
+Configure it in **Configure → Queueing**, or use optional startup overrides.
+Boolean CLI options take an explicit `true` or `false` value.
+
+| CLI option | Environment variable | Default |
+| --- | --- | --- |
+| `--queueing-enabled` | `RQBIT_QUEUEING_ENABLED` | `false` |
+| `--max-active-downloads` | `RQBIT_MAX_ACTIVE_DOWNLOADS` | `3` |
+| `--max-active-uploads` | `RQBIT_MAX_ACTIVE_UPLOADS` | `3` |
+| `--max-active-torrents` | `RQBIT_MAX_ACTIVE_TORRENTS` | `5` |
+| `--dont-count-slow-torrents` | `RQBIT_DONT_COUNT_SLOW_TORRENTS` | `false` |
+| `--slow-torrent-dl-rate-threshold` | `RQBIT_SLOW_TORRENT_DL_RATE_THRESHOLD` | `2` KiB/s |
+| `--slow-torrent-ul-rate-threshold` | `RQBIT_SLOW_TORRENT_UL_RATE_THRESHOLD` | `2` KiB/s |
+| `--slow-torrent-inactive-timer` | `RQBIT_SLOW_TORRENT_INACTIVE_TIMER` | `60` seconds |
+
+Limits accept `-1` for unlimited and `0` for no counted slots. Slow-torrent
+exclusion uses sustained low download speed for downloads, upload speed for
+seeds, and a grace period for both transitions. Slow torrents still count toward
+the total limit. Forced torrents bypass all queue limits and consume no automatic
+slots. Pause clears forced mode.
+
+Precedence is built-in defaults, persisted settings, then explicitly supplied
+CLI/environment overrides. Runtime settings and order survive restart with JSON
+or PostgreSQL persistence; explicit startup overrides apply again on restart.
+Without persistence, changes last only for the current session. Disabling the
+queue releases automatic holds while preserving manual and share-limit stops.
+
+The native API exposes `GET`/`POST /torrents/queue`. Its configuration fields are
+`enabled`, the three `max_active_*` limits, `dont_count_slow_torrents`, and the
+three `slow_torrent_*` settings above. POST replaces the configuration; omitted
+fields use built-in defaults. `POST /torrents/queue/reorder` accepts
+`{"hashes":["<40-character hash>"],"operation":"top"}` with `top`, `bottom`,
+`up` or `down` and at most 128 hashes. `POST /torrents/{id_or_hash}/force_start`
+accepts `{"value":true}` or `false`. Native stats include `queued`,
+`queue_position`, `force_start` and `stopped_by_share_limit`. All mutations retain
+authentication/origin checks and are absent in read-only mode.
+
+The qBittorrent API exposes queue preferences, all four priority operations,
+`queuedDL`/`queuedUP`, one-based download priorities and force-start status.
+Priority is `-1` for seeds or disabled queueing under the advertised 2.9.2 profile.
+Multi-torrent moves preserve relative order. Pending magnets remain visible while
+waiting for admission; queue waiting does not spend their metadata timeout budget.
+Automatic displacement cancels the current discovery attempt before replacement
+work starts. The separate eight-worker discovery and file-check limits remain.
 
 For a production-oriented Gluetun, Sonarr, and Radarr configuration with shared `/data` paths and hardlinks, use the [automation stack deployment guide](docker/compose-examples/automation-stack.md).
 
-Automation magnets remain visible immediately while metadata is discovered. Failed peer discovery is retried within the five-minute deadline, starting after 30 seconds and doubling the delay up to five minutes. Backoff releases the shared eight-worker discovery limit; deleting a pending torrent cancels discovery and retries without deleting existing files. A timed-out job remains visible as `error`; exhausted peer discovery remains `metaDL` while retrying. Invalid metadata, unavailable discovery configuration, and failures adding the torrent also remain `error`.
+Automation magnets remain visible immediately while metadata is discovered. Once queue admission is granted, failed peer discovery is retried within the five-minute deadline, starting after 30 seconds and doubling the delay up to five minutes. Backoff releases the shared eight-worker discovery limit; deleting a pending torrent cancels discovery and retries without deleting existing files. A timed-out job remains visible as `error`; exhausted peer discovery remains `metaDL` while retrying. Invalid metadata, unavailable discovery configuration, and failures adding the torrent also remain `error`.
 
 The authenticated native `GET /torrents` response includes an additive `pending_torrents` collection with the hash, name, category, state, attempt count, sanitized error code/message, and next retry timestamp. The Web UI shows these jobs above the managed torrent list using its existing polling, with Pause, Resume, Retry, and Remove (keep files) controls. You can select individual pending jobs or all of them for bulk actions; Pause affects only active discovery, while Resume/Retry affects only paused or errored jobs. It does not expose magnet URLs or tracker credentials. Pausing stops metadata discovery and reports `pausedDL` through the compatibility API; resuming starts discovery again. The existing hash-based native and qBittorrent pause/resume/delete routes also support pending jobs.
 

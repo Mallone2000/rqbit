@@ -2,6 +2,7 @@ import { TorrentListItem, STATE_INITIALIZING } from "../../api-types";
 import { StatusIcon } from "../StatusIcon";
 import { formatBytes } from "../../helper/formatBytes";
 import { getCompletionETA } from "../../helper/getCompletionETA";
+import { QueueActions } from "../buttons/QueueActions";
 import { memo } from "react";
 
 interface TorrentTableRowProps {
@@ -91,10 +92,28 @@ const TorrentTableRowUnmemoized: React.FC<TorrentTableRowProps> = ({
           >
             {torrent.id}
           </td>
+          <td className={`w-16 ${cellBase} text-center`}>
+            {stats?.queue_position ?? "—"}
+          </td>
           <td className={cellBase}>
             <div className="truncate" title={name}>
               {name || "Loading..."}
+              {stats?.queued && (
+                <span className="ml-2 text-secondary">
+                  {finished ? "Queued for seeding" : "Queued for download"}
+                </span>
+              )}
+              {stats?.queue_position != null && (
+                <span className="ml-2 text-secondary">
+                  Queue #{stats.queue_position}
+                </span>
+              )}
             </div>
+            <QueueActions
+              hash={torrent.info_hash}
+              position={stats?.queue_position}
+              forced={stats?.force_start}
+            />
             {error && (
               <div className="truncate text-sm text-error" title={error}>
                 {error}

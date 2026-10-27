@@ -103,7 +103,8 @@ pub fn make_api_router(state: ApiState) -> Router {
             "/torrents/{id}/stream/{file_id}/{*filename}",
             get(streaming::h_torrent_stream_file),
         )
-        .route("/torrents/limits", get(configure::h_get_session_ratelimits));
+        .route("/torrents/limits", get(configure::h_get_session_ratelimits))
+        .route("/torrents/queue", get(configure::h_get_queue));
 
     let utility_post_router = Router::new()
         .route("/torrents/resolve_magnet", post(other::h_resolve_magnet))
@@ -115,6 +116,9 @@ pub fn make_api_router(state: ApiState) -> Router {
     if !state.opts.read_only {
         let write_router = Router::new()
             .route("/rust_log", post(logging::h_set_rust_log))
+            .route("/torrents/queue", post(configure::h_set_queue))
+            .route("/torrents/queue/reorder", post(configure::h_reorder_queue))
+            .route("/torrents/{id}/force_start", post(configure::h_force_start))
             .route("/torrents", post(torrents::h_torrents_post))
             .route(
                 "/torrents/limits",

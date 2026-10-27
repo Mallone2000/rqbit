@@ -55,6 +55,16 @@ export const TorrentCardContent: React.FC<{
             </div>
             <div className="text-left text-sm sm:text-base lg:text-lg text-ellipsis break-all line-clamp-2 sm:line-clamp-none">
               {torrent.name}
+              {statsResponse?.queued && (
+                <span className="ml-2 text-secondary">
+                  {finished ? "Queued for seeding" : "Queued for download"}
+                </span>
+              )}
+              {statsResponse?.queue_position != null && (
+                <span className="ml-2 text-secondary">
+                  Queue #{statsResponse.queue_position}
+                </span>
+              )}
             </div>
           </div>
           {error ? (

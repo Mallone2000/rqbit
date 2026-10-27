@@ -4,16 +4,24 @@ import { TorrentListItem } from "../api-types";
 
 // Sort types
 export type TorrentSortColumn =
-  "id" | "name" | "size" | "progress" | "downSpeed" | "upSpeed" | "eta";
+  | "queue"
+  | "id"
+  | "name"
+  | "size"
+  | "progress"
+  | "downSpeed"
+  | "upSpeed"
+  | "eta";
 
 export type SortDirection = "asc" | "desc";
 
 // Status filter types
 export type StatusFilter =
-  "all" | "downloading" | "seeding" | "paused" | "error";
+  "queued" | "all" | "downloading" | "seeding" | "paused" | "error";
 
 // Sort column display labels
 export const SORT_COLUMN_LABELS: Record<TorrentSortColumn, string> = {
+  queue: "Queue position",
   id: "ID",
   name: "Name",
   size: "Size",
@@ -25,6 +33,7 @@ export const SORT_COLUMN_LABELS: Record<TorrentSortColumn, string> = {
 
 // Status filter display labels
 export const STATUS_FILTER_LABELS: Record<StatusFilter, string> = {
+  queued: "Queued",
   all: "All",
   downloading: "Downloading",
   seeding: "Seeding",
@@ -38,6 +47,8 @@ export function getSortValue(
   column: TorrentSortColumn,
 ): number | string {
   switch (column) {
+    case "queue":
+      return t.stats?.queue_position ?? Number.MAX_SAFE_INTEGER;
     case "id":
       return t.id;
     case "name":
@@ -100,8 +111,10 @@ export function matchesStatus(
       return state === "live" && !finished;
     case "seeding":
       return state === "live" && !!finished;
+    case "queued":
+      return !!t.stats?.queued;
     case "paused":
-      return state === "paused";
+      return state === "paused" && !t.stats?.queued;
     case "error":
       return state === "error";
   }

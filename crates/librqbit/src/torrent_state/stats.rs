@@ -75,6 +75,10 @@ pub struct TorrentStats {
     // the `initializing` variant.
     #[serde(flatten)]
     pub state: TorrentStatsState,
+    pub queued: bool,
+    pub queue_position: Option<usize>,
+    pub force_start: bool,
+    pub stopped_by_share_limit: bool,
     pub file_progress: Vec<u64>,
     pub error: Option<String>,
     pub progress_bytes: u64,
@@ -147,6 +151,10 @@ mod tests {
 
     fn sample(state: TorrentStatsState) -> TorrentStats {
         TorrentStats {
+            queued: false,
+            queue_position: None,
+            force_start: false,
+            stopped_by_share_limit: false,
             state,
             file_progress: vec![],
             error: None,

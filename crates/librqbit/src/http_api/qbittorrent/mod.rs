@@ -136,6 +136,9 @@ pub(super) fn make_api_router(state: ApiState) -> Router {
             .route("/torrents/start", post(resume_torrents))
             .route("/torrents/filePrio", post(set_file_priority))
             .route("/torrents/topPrio", post(top_priority))
+            .route("/torrents/bottomPrio", post(bottom_priority))
+            .route("/torrents/increasePrio", post(increase_priority))
+            .route("/torrents/decreasePrio", post(decrease_priority))
             .route("/torrents/setForceStart", post(set_force_start));
     }
 
@@ -176,7 +179,8 @@ async fn preferences(State(state): State<ApiState>) -> Json<Preferences> {
             .to_string_lossy()
             .into_owned(),
         dht: state.api.session().is_dht_enabled(),
-        queueing_enabled: false,
+        queueing_enabled: state.api.session().queue_config().enabled,
+        queue: state.api.session().queue_config().into(),
         max_ratio_enabled: false,
         max_ratio: -1.0,
         max_ratio_act: 0,
@@ -220,17 +224,62 @@ async fn set_preferences(
                 .ok_or_else(|| QbitError::bad_request("excluded_file_names must be a string"))
         })
         .transpose()?;
+    let mut queue_values = serde_json::Map::new();
+    let mut validated = serde_json::to_value(state.api.session().queue_config())
+        .map_err(|_| QbitError::bad_request("invalid queue configuration"))?;
+    for key in [
+        "queueing_enabled",
+        "max_active_downloads",
+        "max_active_uploads",
+        "max_active_torrents",
+        "dont_count_slow_torrents",
+        "slow_torrent_dl_rate_threshold",
+        "slow_torrent_ul_rate_threshold",
+        "slow_torrent_inactive_timer",
+    ] {
+        if let Some(value) = object.get(key) {
+            let key = if key == "queueing_enabled" {
+                "enabled"
+            } else {
+                key
+            };
+            validated[key] = value.clone();
+            queue_values.insert(key.to_owned(), value.clone());
+        }
+    }
+    let config: crate::QueueConfig = serde_json::from_value(validated)
+        .map_err(|_| QbitError::bad_request("invalid queue settings"))?;
+    config
+        .validate()
+        .map_err(|_| QbitError::bad_request("invalid queue limits"))?;
+    if queue_values.is_empty() {
+        if enabled.is_some() || patterns.is_some() {
+            state
+                .api
+                .session()
+                .set_excluded_file_names(enabled, patterns)
+                .await
+                .map_err(|e| {
+                    QbitError::internal(StatusCode::BAD_REQUEST, "invalid excluded file names", e)
+                })?;
+        }
+        return Ok(StatusCode::OK);
+    }
+    let patch: crate::QueueConfigPatch = serde_json::from_value(queue_values.into())
+        .map_err(|_| QbitError::bad_request("invalid queue settings"))?;
+    let old_filter = state.api.session().excluded_file_names();
+    crate::session::ExcludedFileNames::new(
+        enabled.unwrap_or(old_filter.0),
+        patterns.clone().unwrap_or(old_filter.1),
+    )
+    .map_err(|_| QbitError::bad_request("invalid excluded file names"))?;
     state
         .api
         .session()
-        .set_excluded_file_names(enabled, patterns)
+        .patch_queue_preferences(patch, enabled, patterns)
         .await
-        .map_err(|error| {
-            QbitError::internal(
-                StatusCode::BAD_REQUEST,
-                "invalid excluded file names",
-                error,
-            )
+        .map_err(|e| {
+            QbitError::internal(StatusCode::CONFLICT, "could not persist preferences", e)
         })?;
     Ok(StatusCode::OK)
 }
@@ -326,9 +375,25 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                         "forcedDL"
                     };
                 }
+                if torrent.is_queued() {
+                    state_name = if stats.finished {
+                        "queuedUP"
+                    } else {
+                        "queuedDL"
+                    };
+                }
                 let category = automation.category;
 
                 Some(TorrentInfo {
+                    priority: if stats.finished {
+                        -1
+                    } else {
+                        stats
+                            .queue_position
+                            .and_then(|p| i64::try_from(p).ok())
+                            .unwrap_or(-1)
+                    },
+                    force_start: automation.force_start,
                     hash,
                     name: torrent
                         .name()
@@ -391,6 +456,11 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
         }
         let category = pending.automation.category;
         torrents.push(TorrentInfo {
+            priority: session
+                .queue_position(pending.info_hash)
+                .and_then(|p| i64::try_from(p).ok())
+                .unwrap_or(-1),
+            force_start: pending.automation.force_start,
             hash,
             name: pending
                 .name
@@ -412,6 +482,13 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                 .join(", "),
             state: if pending.paused {
                 "pausedDL"
+            } else if !session.queue_allows(pending.info_hash)
+                && matches!(
+                    pending.state,
+                    PendingAutomationTorrentState::ResolvingMetadata
+                )
+            {
+                "queuedDL"
             } else {
                 match pending.state {
                     PendingAutomationTorrentState::ResolvingMetadata
@@ -1377,9 +1454,66 @@ async fn resume_torrents(
     Ok(StatusCode::OK)
 }
 
-async fn top_priority(Form(form): Form<TorrentActionForm>) -> QbitResult<StatusCode> {
-    parse_hashes(&form.hashes)?;
-    Err(QbitError::conflict("torrent queueing is disabled"))
+async fn change_priority(
+    state: ApiState,
+    form: TorrentActionForm,
+    operation: crate::QueueOperation,
+) -> QbitResult<StatusCode> {
+    let session = state.api.session();
+    let hashes = if form.hashes == "all" {
+        let mut hashes = session.with_torrents(|ts| {
+            ts.filter(|(_, t)| !t.stats().finished)
+                .map(|(_, t)| t.info_hash())
+                .collect::<Vec<_>>()
+        });
+        hashes.extend(
+            session
+                .pending_automation_torrents()
+                .into_iter()
+                .map(|p| p.info_hash),
+        );
+        hashes
+    } else {
+        parse_hashes(&form.hashes)?
+            .into_iter()
+            .filter_map(|id| match id {
+                TorrentIdOrHash::Hash(h) => Some(h),
+                TorrentIdOrHash::Id(id) => session.get(id.into()).map(|t| t.info_hash()),
+            })
+            .collect()
+    };
+    if !session.queue_config().enabled {
+        return Err(QbitError::conflict("torrent queueing is disabled"));
+    }
+    session
+        .reorder_queue(hashes, operation)
+        .await
+        .map_err(|e| QbitError::internal(StatusCode::CONFLICT, "failed to reorder queue", e))?;
+    Ok(StatusCode::OK)
+}
+async fn top_priority(
+    State(s): State<ApiState>,
+    Form(f): Form<TorrentActionForm>,
+) -> QbitResult<StatusCode> {
+    change_priority(s, f, crate::QueueOperation::Top).await
+}
+async fn bottom_priority(
+    State(s): State<ApiState>,
+    Form(f): Form<TorrentActionForm>,
+) -> QbitResult<StatusCode> {
+    change_priority(s, f, crate::QueueOperation::Bottom).await
+}
+async fn increase_priority(
+    State(s): State<ApiState>,
+    Form(f): Form<TorrentActionForm>,
+) -> QbitResult<StatusCode> {
+    change_priority(s, f, crate::QueueOperation::Up).await
+}
+async fn decrease_priority(
+    State(s): State<ApiState>,
+    Form(f): Form<TorrentActionForm>,
+) -> QbitResult<StatusCode> {
+    change_priority(s, f, crate::QueueOperation::Down).await
 }
 
 #[derive(Deserialize)]
@@ -1405,13 +1539,19 @@ async fn set_force_start(
     }
     if form.value {
         resume_torrents(
-            State(state),
+            State(state.clone()),
             Form(TorrentActionForm {
                 hashes: form.hashes,
             }),
         )
         .await?;
     }
+    state
+        .api
+        .session()
+        .reconcile_queue()
+        .await
+        .map_err(|e| QbitError::internal(StatusCode::CONFLICT, "could not reconcile queue", e))?;
     Ok(StatusCode::OK)
 }
 
@@ -2218,9 +2358,18 @@ mod tests {
     }
 
     fn multipart_body(boundary: &str, category: &str, filename: &str, torrent: &[u8]) -> Vec<u8> {
+        multipart_body_with_pause(boundary, category, filename, torrent, true)
+    }
+    fn multipart_body_with_pause(
+        boundary: &str,
+        category: &str,
+        filename: &str,
+        torrent: &[u8],
+        paused: bool,
+    ) -> Vec<u8> {
         let mut body = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"category\"\r\n\r\n{category}\r\n\
-             --{boundary}\r\nContent-Disposition: form-data; name=\"paused\"\r\n\r\ntrue\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"paused\"\r\n\r\n{paused}\r\n\
              --{boundary}\r\nContent-Disposition: form-data; name=\"torrents\"; filename=\"{filename}\"\r\n\
              Content-Type: application/x-bittorrent\r\n\r\n"
         )
@@ -3220,6 +3369,10 @@ mod tests {
             ("torrents/addTags", "hashes=all&tags=blocked"),
             ("torrents/stop", "hashes=all"),
             ("torrents/start", "hashes=all"),
+            ("torrents/topPrio", "hashes=all"),
+            ("torrents/bottomPrio", "hashes=all"),
+            ("torrents/increasePrio", "hashes=all"),
+            ("torrents/decreasePrio", "hashes=all"),
         ] {
             let response = reqwest::Client::new()
                 .post(format!("{base}/{path}"))
@@ -3457,7 +3610,7 @@ mod tests {
             Some(12345)
         );
         let blocked = persistence.path().join("session.json.tmp");
-        tokio::fs::create_dir(&blocked).await.unwrap();
+        crate::session_persistence::block_json_writes(&blocked).await;
         let id = TorrentIdOrHash::Hash(torrent.info_hash());
         assert!(
             restored
@@ -4471,7 +4624,7 @@ mod tests {
         );
         // An unavailable persistence target must not acknowledge or queue the submission.
         let blocked = persistence.path().join("session.json.tmp");
-        tokio::fs::create_dir(&blocked).await.unwrap();
+        crate::session_persistence::block_json_writes(&blocked).await;
         let response = client
             .post(format!("{base}/torrents/add"))
             .basic_auth("test", Some("secret"))
@@ -4493,5 +4646,458 @@ mod tests {
         session.stop().await;
         server.abort();
         tracker.abort();
+    }
+    // reqwest's optional form feature is deliberately not required by this crate.
+    trait QueueTestForm {
+        fn form<T: serde::Serialize + ?Sized>(self, value: &T) -> Self;
+    }
+    impl QueueTestForm for reqwest::RequestBuilder {
+        fn form<T: serde::Serialize + ?Sized>(self, value: &T) -> Self {
+            self.header("Content-Type", "application/x-www-form-urlencoded")
+                .body(serde_urlencoded::to_string(value).unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_http_contract_schedules_arr_priority_and_preserves_security() {
+        let downloads = tempfile::tempdir().unwrap();
+        let fixtures = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                disable_trackers: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (base, server) = start_full_http_api(session.clone(), true).await;
+        let native = base.strip_suffix("/api/v2").unwrap();
+        let client = reqwest::Client::new();
+        for route in ["topPrio", "bottomPrio", "increasePrio", "decreasePrio"] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/torrents/{route}"))
+                    .form(&[("hashes", "all")])
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                403
+            );
+            assert_eq!(
+                client
+                    .post(format!("{base}/torrents/{route}"))
+                    .basic_auth("test", Some("secret"))
+                    .form(&[("hashes", "all")])
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                409
+            );
+        }
+        let settings = serde_json::json!({"queueing_enabled":true,"max_active_downloads":0,"max_active_uploads":1,"max_active_torrents":1});
+        assert_eq!(
+            client
+                .post(format!("{base}/app/setPreferences"))
+                .basic_auth("test", Some("secret"))
+                .form(&[("json", settings.to_string())])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let mut hashes = Vec::new();
+        for name in ["arr-first.bin", "arr-second.bin"] {
+            let source = fixtures.path().join(name);
+            std::fs::write(&source, vec![7; 16384]).unwrap();
+            let file = create_torrent(
+                &source,
+                CreateTorrentOptions::default(),
+                &BlockingSpawner::new(1),
+            )
+            .await
+            .unwrap();
+            hashes.push(file.info_hash().as_string());
+            let bytes = file.as_bytes().unwrap();
+            assert_eq!(
+                client
+                    .post(format!("{base}/torrents/add"))
+                    .basic_auth("test", Some("secret"))
+                    .header(
+                        "Content-Type",
+                        "multipart/form-data; boundary=queue-contract"
+                    )
+                    .body(multipart_body_with_pause(
+                        "queue-contract",
+                        "",
+                        name,
+                        &bytes,
+                        false
+                    ))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        for t in session.with_torrents(|ts| ts.map(|(_, t)| t.clone()).collect::<Vec<_>>()) {
+            t.wait_until_initialized().await.unwrap();
+        }
+        for route in ["bottomPrio", "increasePrio", "decreasePrio", "topPrio"] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/torrents/{route}"))
+                    .basic_auth("test", Some("secret"))
+                    .form(&[("hashes", hashes[1].clone())])
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        let listed: Value = client
+            .get(format!("{base}/torrents/info"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["state"] == "queuedDL")
+        );
+        assert_eq!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["hash"] == hashes[1])
+                .unwrap()["priority"],
+            1
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/app/setPreferences"))
+                .basic_auth("test", Some("secret"))
+                .form(&[("json", r#"{"max_active_downloads":1}"#)])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let a = session
+            .get(TorrentIdOrHash::parse(&hashes[0]).unwrap())
+            .unwrap();
+        let b = session
+            .get(TorrentIdOrHash::parse(&hashes[1]).unwrap())
+            .unwrap();
+        assert!(a.is_queued());
+        assert!(b.live().is_some());
+        for (value, both_live) in [(true, true), (false, false)] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/torrents/setForceStart"))
+                    .basic_auth("test", Some("secret"))
+                    .form(&[("hashes", hashes[0].clone()), ("value", value.to_string())])
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+            assert_eq!(a.live().is_some(), both_live);
+            assert!(b.live().is_some());
+        }
+        for invalid in [
+            serde_json::json!({"max_active_downloads":-2}),
+            serde_json::json!({"max_active_torrents":1.5}),
+            serde_json::json!({"queueing_enabled":"true"}),
+            serde_json::json!({"max_active_downloads":null}),
+            serde_json::json!({"max_active_downloads":10,"excluded_file_names_enabled":"true"}),
+        ] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/app/setPreferences"))
+                    .basic_auth("test", Some("secret"))
+                    .form(&[("json", invalid.to_string())])
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                400
+            );
+            assert_eq!(session.queue_config().max_active_downloads, 1);
+        }
+        assert_eq!(
+            client
+                .get(format!("{native}/torrents/queue"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        let native_config: Value = client
+            .get(format!("{native}/torrents/queue"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(native_config["enabled"], true);
+        let mut invalid_native = native_config.clone();
+        invalid_native["max_active_downloads"] = (-2).into();
+        assert_eq!(
+            client
+                .post(format!("{native}/torrents/queue"))
+                .basic_auth("test", Some("secret"))
+                .json(&invalid_native)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        assert_eq!(
+            client
+                .post(format!("{native}/torrents/queue"))
+                .basic_auth("test", Some("secret"))
+                .json(&native_config)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let reorder = serde_json::json!({"hashes":[hashes[0]],"operation":"top"});
+        assert_eq!(
+            client
+                .post(format!("{native}/torrents/queue/reorder"))
+                .basic_auth("test", Some("secret"))
+                .json(&reorder)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert!(a.live().is_some());
+        assert!(b.is_queued());
+        for value in [true, false] {
+            assert_eq!(
+                client
+                    .post(format!("{native}/torrents/{}/force_start", hashes[1]))
+                    .basic_auth("test", Some("secret"))
+                    .json(&serde_json::json!({"value":value}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+            assert_eq!(b.live().is_some(), value);
+        }
+        for route in ["/torrents/queue", "/torrents/queue/reorder"] {
+            assert_eq!(
+                client
+                    .post(format!("{native}{route}"))
+                    .json(&reorder)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                401
+            );
+            assert_eq!(
+                client
+                    .post(format!("{native}{route}"))
+                    .basic_auth("test", Some("secret"))
+                    .header("Origin", "https://untrusted.invalid")
+                    .json(&reorder)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                403
+            );
+        }
+        let info: Value = client
+            .get(format!("{native}/torrents?with_stats=true"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            info["torrents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["stats"]["queued"] == true)
+        );
+        server.abort();
+        session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn queue_pending_magnets_wait_without_attempts_and_can_be_cancelled() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                disable_trackers: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        session
+            .set_queue_config(crate::QueueConfig {
+                enabled: true,
+                max_active_downloads: 0,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (base, server) = start_full_http_api(session.clone(), true).await;
+        let client = reqwest::Client::new();
+        let hash = "ab".repeat(20);
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/add"))
+                .basic_auth("test", Some("secret"))
+                .form(&[("urls", format!("magnet:?xt=urn:btih:{hash}"))])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let pending = session.pending_automation_torrents().pop().unwrap();
+        assert_eq!(pending.metadata_attempts, 0);
+        assert!(!pending.paused);
+        let listed: Value = client
+            .get(format!("{base}/torrents/info"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["state"], "queuedDL");
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/topPrio"))
+                .basic_auth("test", Some("secret"))
+                .form(&[("hashes", hash.clone())])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/pause"))
+                .basic_auth("test", Some("secret"))
+                .form(&[("hashes", hash.clone())])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert!(session.pending_automation_torrents()[0].paused);
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/delete"))
+                .basic_auth("test", Some("secret"))
+                .form(&[("hashes", hash), ("deleteFiles", "false".to_owned())])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert!(session.pending_automation_torrents().is_empty());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(session.pending_automation_torrents().is_empty());
+        server.abort();
+        session.stop().await;
+    }
+    #[tokio::test]
+    async fn native_queue_mutations_are_absent_in_read_only_mode() {
+        let output = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            output.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(HttpApi::new(
+            Api::new(session.clone(), None, None),
+            Some(HttpApiOptions {
+                read_only: true,
+                ..Default::default()
+            }),
+        ));
+        let (base, server) = start_server(crate::http_api::handlers::make_api_router(state)).await;
+        let client = reqwest::Client::new();
+        assert_eq!(
+            client
+                .get(format!("{base}/torrents/queue"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        for path in [
+            "torrents/queue",
+            "torrents/queue/reorder",
+            "torrents/1/force_start",
+        ] {
+            let status = client
+                .post(format!("{base}/{path}"))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert!(
+                status == 404 || status == 405,
+                "unexpected mutation status {status}"
+            );
+        }
+        server.abort();
+        session.stop().await;
     }
 }

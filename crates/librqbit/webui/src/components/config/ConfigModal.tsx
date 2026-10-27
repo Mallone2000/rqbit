@@ -7,6 +7,8 @@ import { ErrorWithLabel } from "../../rqbit-web";
 import { Spinner } from "../Spinner";
 import { Modal } from "../modal/Modal";
 import { ModalBody } from "../modal/ModalBody";
+import { QueueingTab } from "./QueueingTab";
+import { QueueConfig } from "../../api-types";
 import { CategoriesTab } from "./CategoriesTab";
 
 export interface ConfigModalProps {
@@ -22,6 +24,7 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
     upload_bps: null,
     download_bps: null,
   });
+  const [queue, setQueue] = useState<QueueConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<ErrorWithLabel | null>(null);
@@ -32,12 +35,13 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
     if (isOpen) {
       setLoading(true);
       setError(null);
-      API.getLimits()
-        .then((config) => {
+      Promise.all([API.getLimits(), API.getQueue?.()])
+        .then(([config, queueConfig]) => {
           setLimits(config);
+          setQueue(queueConfig ?? null);
         })
         .catch((e: ErrorDetails) => {
-          setError({ text: "Error loading limits", details: e });
+          setError({ text: "Error loading configuration", details: e });
         })
         .finally(() => setLoading(false));
     }
@@ -47,10 +51,21 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
     setSaving(true);
     setError(null);
     try {
+      if (queue && API.setQueue) {
+        const numbers = Object.values(queue).filter(
+          (value): value is number => typeof value === "number",
+        );
+        if (numbers.some((value) => !Number.isSafeInteger(value)))
+          throw { text: "Queue settings must use whole numbers." };
+        await API.setQueue(queue);
+      }
       await API.setLimits(limits);
       onClose();
     } catch (e) {
-      setError({ text: "Error saving limits", details: e as ErrorDetails });
+      setError({
+        text: "Error saving configuration",
+        details: e as ErrorDetails,
+      });
     } finally {
       setSaving(false);
     }
@@ -99,6 +114,15 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
             />
           ),
         },
+        ...(queue && API.setQueue
+          ? [
+              {
+                id: "queueing",
+                label: "Queueing",
+                content: <QueueingTab config={queue} onChange={setQueue} />,
+              },
+            ]
+          : []),
         ...(categoryApi
           ? [
               {

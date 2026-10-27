@@ -3,6 +3,7 @@ import { APIContext } from "../context";
 import { useTorrentStore } from "../stores/torrentStore";
 import { useErrorStore } from "../stores/errorStore";
 import type { PendingTorrent, RqbitAPI } from "../api-types";
+import { QueueActions } from "./buttons/QueueActions";
 import { Button } from "./buttons/Button";
 
 type PendingAction = "pause" | "start" | "forget";
@@ -55,10 +56,12 @@ export const PendingMetadata = ({
   );
   const allSelected = selectedTorrents.length === torrents.length;
   const pauseTargets = selectedTorrents.filter(
-    (torrent) => torrent.state === "resolving_metadata",
+    (torrent) =>
+      torrent.state === "resolving_metadata" || torrent.state === "queued",
   );
   const startTargets = selectedTorrents.filter(
-    (torrent) => torrent.state !== "resolving_metadata",
+    (torrent) =>
+      torrent.state !== "resolving_metadata" && torrent.state !== "queued",
   );
 
   useEffect(() => {
@@ -183,16 +186,20 @@ export const PendingMetadata = ({
             </span>
             {torrent.category && <span> ({torrent.category})</span>}
             <p>
-              {torrent.state === "paused"
-                ? "Paused while waiting for metadata"
-                : torrent.state === "error"
-                  ? "Could not add torrent"
-                  : "Waiting for metadata"}
+              {torrent.state === "queued"
+                ? "Queued for metadata"
+                : torrent.state === "paused"
+                  ? "Paused while waiting for metadata"
+                  : torrent.state === "error"
+                    ? "Could not add torrent"
+                    : "Waiting for metadata"}
               .{" "}
-              {torrent.state === "paused"
-                ? "Metadata discovery is stopped until you resume."
-                : (torrent.message ??
-                  "Discovering peers and requesting torrent metadata.")}
+              {torrent.state === "queued"
+                ? "Waiting for a download slot; metadata discovery is suspended."
+                : torrent.state === "paused"
+                  ? "Metadata discovery is stopped until you resume."
+                  : (torrent.message ??
+                    "Discovering peers and requesting torrent metadata.")}
             </p>
             <p className="text-secondary">
               Attempts: {torrent.metadata_attempts}
@@ -206,6 +213,11 @@ export const PendingMetadata = ({
                 </>
               )}
             </p>
+            <QueueActions
+              hash={torrent.info_hash}
+              position={torrent.queue_position}
+              forced={torrent.force_start}
+            />
             {API.pendingAction && (
               <div className="flex gap-3 mt-1">
                 <button
@@ -215,13 +227,15 @@ export const PendingMetadata = ({
                   onClick={() =>
                     act(
                       [torrent],
-                      torrent.state === "resolving_metadata"
+                      torrent.state === "resolving_metadata" ||
+                        torrent.state === "queued"
                         ? "pause"
                         : "start",
                     )
                   }
                 >
-                  {torrent.state === "resolving_metadata"
+                  {torrent.state === "resolving_metadata" ||
+                  torrent.state === "queued"
                     ? "Pause"
                     : torrent.state === "error"
                       ? "Retry"

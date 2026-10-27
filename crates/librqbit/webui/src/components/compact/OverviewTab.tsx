@@ -61,6 +61,11 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({ torrent }) => {
   const peers = statsResponse.live?.snapshot.peer_stats;
 
   const stateDisplay = (() => {
+    if (statsResponse.queued)
+      return {
+        text: finished ? "Queued for seeding" : "Queued for download",
+        color: "text-secondary",
+      };
     if (error) return { text: "Error", color: "text-error" };
     if (state === STATE_INITIALIZING)
       return {

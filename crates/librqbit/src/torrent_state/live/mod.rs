@@ -745,6 +745,21 @@ impl TorrentStateLive {
         }
     }
 
+    pub(crate) fn queue_peer_counts(&self) -> (u64, u64) {
+        let mut seeds = 0;
+        let mut downloaders = 0;
+        for peer in self.peers.states.iter() {
+            if let Some(live) = peer.get_live() {
+                if live.has_full_torrent(self.lengths.total_pieces() as usize) {
+                    seeds += 1;
+                } else {
+                    downloaders += 1;
+                }
+            }
+        }
+        (seeds, downloaders)
+    }
+
     pub fn per_peer_stats_snapshot(&self, filter: PeerStatsFilter) -> PeerStatsSnapshot {
         PeerStatsSnapshot {
             peers: self

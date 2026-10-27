@@ -31,6 +31,8 @@ use super::{SerializedPendingTorrent, SerializedTorrent, SessionPersistenceStore
 struct SerializedSessionDatabase {
     torrents: HashMap<usize, SerializedTorrent>,
     #[serde(default)]
+    queue: crate::QueueSnapshot,
+    #[serde(default)]
     pending_torrents: HashMap<String, SerializedPendingTorrent>,
     #[serde(default)]
     automation_categories: BTreeMap<String, AutomationCategory>,
@@ -301,6 +303,43 @@ impl BitVFactory for JsonSessionPersistenceStore {
 
 #[async_trait]
 impl SessionPersistenceStore for JsonSessionPersistenceStore {
+    async fn store_queue_and_exclusions(
+        &self,
+        snapshot: &crate::QueueSnapshot,
+        enabled: bool,
+        patterns: &str,
+    ) -> anyhow::Result<()> {
+        let mut db = self.db_content.write().await;
+        let previous = (
+            db.queue.clone(),
+            db.excluded_file_names_enabled,
+            db.excluded_file_names.clone(),
+        );
+        db.queue = snapshot.clone();
+        db.excluded_file_names_enabled = enabled;
+        db.excluded_file_names = patterns.to_owned();
+        if let Err(e) = self.flush_db(&db).await {
+            db.queue = previous.0;
+            db.excluded_file_names_enabled = previous.1;
+            db.excluded_file_names = previous.2;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    async fn load_queue(&self) -> anyhow::Result<crate::QueueSnapshot> {
+        Ok(self.db_content.read().await.queue.clone())
+    }
+    async fn store_queue(&self, snapshot: &crate::QueueSnapshot) -> anyhow::Result<()> {
+        let mut db = self.db_content.write().await;
+        let old = std::mem::replace(&mut db.queue, snapshot.clone());
+        if let Err(error) = self.flush_db(&db).await {
+            db.queue = old;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn load_excluded_file_names(&self) -> anyhow::Result<(bool, String)> {
         let db = self.db_content.read().await;
         Ok((

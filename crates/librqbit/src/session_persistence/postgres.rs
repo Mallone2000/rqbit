@@ -95,12 +95,47 @@ impl PostgresSessionStorage {
         exec!(
             "CREATE TABLE IF NOT EXISTS pending_torrents (info_hash BYTEA PRIMARY KEY, submission TEXT NOT NULL)"
         );
+        exec!(
+            "CREATE TABLE IF NOT EXISTS torrent_queue (id INTEGER PRIMARY KEY CHECK (id = 1), snapshot TEXT NOT NULL)"
+        );
         Ok(Self { pool })
     }
 }
 
 #[async_trait::async_trait]
 impl SessionPersistenceStore for PostgresSessionStorage {
+    async fn store_queue_and_exclusions(
+        &self,
+        snapshot: &crate::QueueSnapshot,
+        enabled: bool,
+        patterns: &str,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO torrent_queue (id, snapshot) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET snapshot=EXCLUDED.snapshot")
+            .bind(serde_json::to_string(snapshot)?).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO automation_preferences (id, excluded_file_names_enabled, excluded_file_names) VALUES (1, $1, $2) ON CONFLICT (id) DO UPDATE SET excluded_file_names_enabled=EXCLUDED.excluded_file_names_enabled, excluded_file_names=EXCLUDED.excluded_file_names")
+            .bind(enabled).bind(patterns).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn load_queue(&self) -> anyhow::Result<crate::QueueSnapshot> {
+        let value =
+            sqlx::query_scalar::<_, String>("SELECT snapshot FROM torrent_queue WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        value
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map(|v| v.unwrap_or_default())
+            .context("invalid queue snapshot")
+    }
+    async fn store_queue(&self, snapshot: &crate::QueueSnapshot) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO torrent_queue (id, snapshot) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET snapshot = EXCLUDED.snapshot")
+            .bind(serde_json::to_string(snapshot)?).execute(&self.pool).await?;
+        Ok(())
+    }
+
     async fn load_excluded_file_names(&self) -> anyhow::Result<(bool, String)> {
         Ok(sqlx::query_as::<_, (bool, String)>(
             "SELECT excluded_file_names_enabled, excluded_file_names FROM automation_preferences WHERE id = 1",
@@ -509,5 +544,40 @@ mod automation_tests {
                 .into_serialized_torrent()
                 .is_err()
         );
+    }
+    #[tokio::test]
+    #[ignore = "requires a dedicated RQBIT_TEST_POSTGRES_URL database"]
+    async fn queue_postgres_atomic_preferences_survive_reconnection() {
+        use super::{PostgresSessionStorage, SessionPersistenceStore};
+        let url =
+            std::env::var("RQBIT_TEST_POSTGRES_URL").expect("dedicated test database is required");
+        let store = PostgresSessionStorage::new(&url).await.unwrap();
+        let old = store.load_queue().await.unwrap();
+        let old_filter = store.load_excluded_file_names().await.unwrap();
+        let queue = crate::QueueSnapshot {
+            config: crate::QueueConfig {
+                enabled: true,
+                max_active_downloads: 2,
+                ..Default::default()
+            },
+            order: vec![librqbit_core::Id20::new([17; 20])],
+        };
+        store
+            .store_queue_and_exclusions(&queue, true, "*.exe")
+            .await
+            .unwrap();
+        drop(store);
+        let restored = PostgresSessionStorage::new(&url).await.unwrap();
+        let result = restored.load_queue().await.unwrap();
+        assert_eq!(result.config, queue.config);
+        assert_eq!(result.order, queue.order);
+        assert_eq!(
+            restored.load_excluded_file_names().await.unwrap(),
+            (true, "*.exe".to_owned())
+        );
+        restored
+            .store_queue_and_exclusions(&old, old_filter.0, &old_filter.1)
+            .await
+            .unwrap();
     }
 }

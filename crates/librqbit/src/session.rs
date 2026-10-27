@@ -1,3 +1,5 @@
+pub(crate) mod queue;
+
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
@@ -217,6 +219,10 @@ impl SessionDatabase {
 pub struct Session {
     // Core state and services
     pub(crate) db: RwLock<SessionDatabase>,
+    queue: RwLock<queue::QueueRuntime>,
+    queue_mutation: tokio::sync::Mutex<()>,
+    queue_notify: Arc<tokio::sync::Notify>,
+    queue_stopping: std::sync::atomic::AtomicBool,
     next_id: AtomicUsize,
     pub(crate) bitv_factory: Arc<dyn BitVFactory>,
     spawner: BlockingSpawner,
@@ -269,14 +275,14 @@ pub struct Session {
 }
 
 #[derive(Default)]
-struct ExcludedFileNames {
+pub(crate) struct ExcludedFileNames {
     enabled: bool,
     patterns: String,
     compiled: Vec<regex::Regex>,
 }
 
 impl ExcludedFileNames {
-    fn new(enabled: bool, patterns: String) -> anyhow::Result<Self> {
+    pub(crate) fn new(enabled: bool, patterns: String) -> anyhow::Result<Self> {
         anyhow::ensure!(
             patterns.len() <= 64 * 1024,
             "excluded file names are too long"
@@ -628,6 +634,8 @@ impl Default for DhtSessionConfig {
 }
 
 pub struct SessionOptions {
+    /// Explicit startup overrides, applied after persisted queue settings.
+    pub queue: Option<queue::QueueConfigPatch>,
     /// DHT configuration. Set to None to disable DHT entirely.
     /// Defaults to DHT enabled with persistence.
     pub dht: Option<DhtSessionConfig>,
@@ -696,6 +704,7 @@ pub struct SessionOptions {
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
+            queue: None,
             dht: Some(DhtSessionConfig::default()),
             bind_device_name: None,
             disable_trackers: false,
@@ -1017,8 +1026,11 @@ impl Session {
         id: TorrentIdOrHash,
         value: bool,
     ) -> anyhow::Result<()> {
+        let _guard = self.queue_mutation.lock().await;
         self.update_automation_settings(id, |metadata| metadata.force_start = value)
-            .await
+            .await?;
+        self.queue_notify.notify_one();
+        Ok(())
     }
 
     pub(crate) async fn set_torrent_automation_share_limits(
@@ -1262,7 +1274,17 @@ impl Session {
             } else {
                 ExcludedFileNames::default()
             };
+            let mut queue_snapshot = match persistence.as_ref() {
+                Some(store) => store.load_queue().await?,
+                None => queue::QueueSnapshot::default(),
+            };
+            if let Some(config) = opts.queue { config.apply(&mut queue_snapshot.config); }
+            queue_snapshot.config.validate()?;
             let session = Arc::new(Self {
+                queue: RwLock::new(queue::QueueRuntime::new(queue_snapshot)),
+                queue_mutation: tokio::sync::Mutex::new(()),
+                queue_notify: Arc::new(tokio::sync::Notify::new()),
+                queue_stopping: std::sync::atomic::AtomicBool::new(false),
                 persistence,
                 excluded_file_names: RwLock::new(excluded_file_names),
                 excluded_file_names_mutation: tokio::sync::Mutex::new(()),
@@ -1405,6 +1427,9 @@ impl Session {
                 }
             }
 
+            session.reconcile_queue().await?;
+            let snapshot=session.queue.read().snapshot.clone();
+            session.persist_queue(&snapshot).await?;
             session.start_speed_estimator_updater();
             session.start_automation_updater();
 
@@ -1570,6 +1595,8 @@ impl Session {
 
     /// Stop the session and all managed tasks.
     pub async fn stop(&self) {
+        let _guard = self.queue_mutation.lock().await;
+        self.queue_stopping.store(true, Ordering::Relaxed);
         let torrents = self
             .db
             .read()
@@ -1581,8 +1608,11 @@ impl Session {
             torrent.refresh_automation_stats(unix_time_seconds());
             if torrent.is_paused() {
                 self.try_update_persistence_metadata(&torrent).await;
-            } else if let Err(e) = self.pause(&torrent).await {
-                debug!("error pausing torrent: {e:#}");
+            } else {
+                if let Err(e) = torrent.hold_for_queue() {
+                    debug!("error pausing torrent: {e:#}");
+                }
+                self.try_update_persistence_metadata(&torrent).await;
             }
         }
         self.cancellation_token.cancel();
@@ -1707,6 +1737,7 @@ impl Session {
         {
             self.spawn_pending_automation_resolution(pending);
         }
+        self.queue_notify.notify_one();
         Ok(true)
     }
 
@@ -1737,6 +1768,13 @@ impl Session {
                 }
             }
             let mut options: AddTorrentOptions = serde_json::from_value(pending.submission.options.clone())?;
+            loop {
+                if session.queue_allows(info_hash) { break; }
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
             options.paused = false;
             options.automation = pending.automation;
             let delay = AUTOMATION_METADATA_RETRY_DELAY.saturating_mul(1u32 << pending.metadata_attempts.min(4))
@@ -1886,6 +1924,9 @@ impl Session {
         }
         let old_token = pending.cancellation_token.clone();
         pending.paused = paused;
+        if paused {
+            pending.automation.force_start = false;
+        }
         pending.next_retry_at_unix_seconds = None;
         if !paused {
             pending.state = PendingAutomationTorrentState::ResolvingMetadata;
@@ -1902,6 +1943,7 @@ impl Session {
         if !paused {
             self.spawn_pending_automation_resolution(pending);
         }
+        self.queue_notify.notify_one();
         Ok(true)
     }
 
@@ -2147,7 +2189,7 @@ impl Session {
             match metadata {
                 Some(metadata) => {
                     let mut peer_rx = None;
-                    if !opts.paused && !opts.list_only {
+                    if !opts.paused && !opts.list_only && self.queue_allows(info_hash) {
                         peer_rx = make_peer_rx();
                     }
                     (metadata, peer_rx)
@@ -2378,6 +2420,7 @@ impl Session {
             .start(peer_rx, opts.paused)
             .context(PendingAutomationError::TorrentStartFailed)?;
 
+        self.queue_notify.notify_one();
         if let Some(name) = metadata.info.name() {
             info!(?name, "added torrent");
         }
@@ -2399,6 +2442,7 @@ impl Session {
     }
 
     pub async fn delete(&self, id: TorrentIdOrHash, delete_files: bool) -> anyhow::Result<()> {
+        let _queue_guard = self.queue_mutation.lock().await;
         let _guard = self.pending_automation_mutations.lock().await;
         if let TorrentIdOrHash::Hash(hash) = id {
             let pending_exists = self
@@ -2608,14 +2652,44 @@ impl Session {
     }
 
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        self.pause_with_reason(handle, false).await
+    }
+
+    async fn pause_with_reason(
+        &self,
+        handle: &ManagedTorrentHandle,
+        share_limit: bool,
+    ) -> anyhow::Result<()> {
+        let _guard = self.queue_mutation.lock().await;
         handle.refresh_automation_stats(unix_time_seconds());
+        anyhow::ensure!(
+            !matches!(handle.stats().state, crate::TorrentStatsState::Error),
+            "cannot pause torrent in error state"
+        );
+        let old_paused = handle.is_paused();
+        let old_metadata = handle.automation_metadata();
+        handle.locked.write().paused = true;
+        {
+            let mut metadata = handle.shared.automation.write();
+            metadata.force_start = false;
+            metadata.stopped_by_share_limit = share_limit;
+        }
+        if let Err(error) = self.update_persistence_metadata(handle).await {
+            handle.locked.write().paused = old_paused;
+            let mut metadata = handle.shared.automation.write();
+            metadata.force_start = old_metadata.force_start;
+            metadata.stopped_by_share_limit = old_metadata.stopped_by_share_limit;
+            return Err(error);
+        }
         handle.pause()?;
-        self.update_persistence_metadata(handle).await?;
+        self.queue.write().admitted.remove(&handle.info_hash());
+        self.queue_notify.notify_one();
         Ok(())
     }
 
     fn start_automation_updater(self: &Arc<Self>) {
         let session = Arc::downgrade(self);
+        let queue_notify = self.queue_notify.clone();
         self.spawn(
             debug_span!(parent: self.rs(), "automation_limits"),
             "automation_limits",
@@ -2623,17 +2697,20 @@ impl Session {
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
                 let mut ticks = 0_u8;
                 loop {
-                    interval.tick().await;
+                    tokio::select! { _ = interval.tick() => {}, _ = queue_notify.notified() => {} }
                     let session = session.upgrade().context("session is dead")?;
                     let torrents = session.with_torrents(|torrents| {
                         torrents.map(|(_, torrent)| torrent.clone()).collect::<Vec<_>>()
                     });
                     let now = unix_time_seconds();
+                    if let Err(_error) = session.reconcile_queue().await {
+                        warn!("could not reconcile torrent queue");
+                    }
                     ticks = ticks.wrapping_add(1);
                     for torrent in torrents {
                         let (_, _, limit_reached) = torrent.refresh_automation_stats(now);
                         if limit_reached && !torrent.is_paused() {
-                            if let Err(error) = session.pause(&torrent).await {
+                            if let Err(error) = session.pause_with_reason(&torrent, true).await {
                                 warn!(id = torrent.id(), error = ?error, "could not enforce automation seed limit");
                             }
                         } else if ticks.is_multiple_of(30) {
@@ -2646,10 +2723,30 @@ impl Session {
     }
 
     pub async fn unpause(self: &Arc<Self>, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
-        let peer_rx = self.make_peer_rx_managed_torrent(handle, true);
-        handle.start(peer_rx, false)?;
-        self.update_persistence_metadata(handle).await?;
-        Ok(())
+        {
+            let _guard = self.queue_mutation.lock().await;
+            handle.refresh_automation_stats(unix_time_seconds());
+            let old = handle.automation_metadata().stopped_by_share_limit;
+            handle.shared.automation.write().stopped_by_share_limit = false;
+            let was_paused = handle.is_paused();
+            handle.locked.write().paused = false;
+            if let Err(error) = self.update_persistence_metadata(handle).await {
+                handle.locked.write().paused = was_paused;
+                handle.shared.automation.write().stopped_by_share_limit = old;
+                return Err(error);
+            }
+            if (!self.queue_config().enabled && handle.live().is_none())
+                || matches!(
+                    handle.stats().state,
+                    crate::TorrentStatsState::Error | crate::TorrentStatsState::Initializing { .. }
+                )
+            {
+                let peers = self
+                    .make_peer_rx_managed_torrent(handle, self.queue_allows(handle.info_hash()));
+                handle.start(peers, false)?;
+            }
+        }
+        self.reconcile_queue().await
     }
 
     pub async fn update_only_files(
@@ -2657,9 +2754,12 @@ impl Session {
         handle: &ManagedTorrentHandle,
         only_files: &HashSet<usize>,
     ) -> anyhow::Result<()> {
-        handle.update_only_files(only_files)?;
-        self.update_persistence_metadata(handle).await?;
-        Ok(())
+        {
+            let _guard = self.queue_mutation.lock().await;
+            handle.update_only_files(only_files)?;
+            self.update_persistence_metadata(handle).await?;
+        }
+        self.reconcile_queue().await
     }
 
     pub fn listen_addr(&self) -> Option<SocketAddr> {
@@ -2683,8 +2783,16 @@ impl Session {
         Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
         let mut retry_delay = control.retry_delay;
-        let deadline = tokio::time::Instant::now() + control.timeout;
+        let mut deadline = tokio::time::Instant::now() + control.timeout;
         loop {
+            let waiting_since = tokio::time::Instant::now();
+            while !self.queue_allows(info_hash) {
+                tokio::select! {
+                    _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+            }
+            deadline += waiting_since.elapsed();
             let permit = tokio::select! {
                 biased;
                 _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
@@ -2695,13 +2803,37 @@ impl Session {
                     .map_err(|_| PendingAutomationError::MetadataTimeout)?
                     .context("automation resolution semaphore is closed")?,
             };
+            if !self.queue_allows(info_hash) {
+                drop(permit);
+                continue;
+            }
             self.update_pending_metadata_diagnostics(info_hash, control, None)
                 .await?;
+            struct ResolutionLease(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for ResolutionLease {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let cancelled = CancellationToken::new();
+            let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            {
+                let mut queue = self.queue.write();
+                if queue.snapshot.config.enabled && !queue.admitted.contains(&info_hash) {
+                    continue;
+                }
+                queue
+                    .resolving
+                    .insert(info_hash, (cancelled.clone(), active.clone()));
+            }
+            let lease = ResolutionLease(active);
             let result = tokio::select! {
                 biased;
                 _ = control.cancellation_token.cancelled() => bail!("magnet metadata resolution was cancelled"),
+                _ = cancelled.cancelled() => { drop(lease); continue; },
                 result = tokio::time::timeout_at(deadline, resolve()) => result,
             };
+            drop(lease);
             drop(permit);
             let reason = match result {
                 Ok(Ok(metadata)) => return Ok(metadata),
@@ -3504,7 +3636,8 @@ mod tests {
         );
         assert!(pending.automation.sequential_download);
         assert!(pending.automation.first_last_piece_priority);
-        assert!(pending.automation.force_start);
+        // Explicit Pause clears forced mode, including across restoration.
+        assert!(!pending.automation.force_start);
         assert!(pending.automation.use_subfolder);
         assert!(pending.next_retry_at_unix_seconds.is_none());
         let record = pending.serialized().unwrap();
@@ -3595,7 +3728,7 @@ mod tests {
             .cancellation_token
             .clone();
         let blocked = state.path().join("session.json.tmp");
-        tokio::fs::create_dir(&blocked).await.unwrap();
+        crate::session_persistence::block_json_writes(&blocked).await;
         assert!(
             session
                 .set_pending_automation_paused(hash, false)
@@ -3774,7 +3907,7 @@ mod tests {
                 state.join(format!("{}.torrent.tmp", hash.as_string())),
                 state.join("session.json.tmp"),
             ] {
-                tokio::fs::create_dir(&blocked).await.unwrap();
+                crate::session_persistence::block_json_writes(&blocked).await;
                 let error = session
                     .add_torrent_with_resolution_control(
                         crate::AddTorrent::TorrentFileBytes(bytes.clone()),

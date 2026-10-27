@@ -7,6 +7,7 @@ import { FaCog, FaPause, FaPlay, FaTrash } from "react-icons/fa";
 import { useErrorStore } from "../../stores/errorStore";
 import { useTorrentStore } from "../../stores/torrentStore";
 import { useUIStore } from "../../stores/uiStore";
+import { QueueActions } from "./QueueActions";
 import { PlaylistIconButton } from "./PlaylistButton";
 
 export const TorrentActions: React.FC<{
@@ -21,8 +22,8 @@ export const TorrentActions: React.FC<{
   const refreshTorrents = useTorrentStore((state) => state.refreshTorrents);
   const openDetailsModal = useUIStore((state) => state.openDetailsModal);
 
-  const canPause = state == "live";
-  const canUnpause = state == "paused" || state == "error";
+  const canPause = state == "live" || !!stats.queued;
+  const canUnpause = (state == "paused" && !stats.queued) || state == "error";
   const canConfigure = state == "paused" || state == "live";
 
   const setCloseableError = useErrorStore((state) => state.setCloseableError);
@@ -74,7 +75,7 @@ export const TorrentActions: React.FC<{
   };
 
   return (
-    <div className="flex w-full justify-center gap-1 sm:gap-2 dark:text-slate-300">
+    <div className="flex flex-wrap w-full justify-center gap-1 sm:gap-2 dark:text-slate-300">
       {canUnpause && (
         <IconButton onClick={unpause} disabled={disabled}>
           <FaPlay className="hover:text-green-600" />
@@ -93,6 +94,11 @@ export const TorrentActions: React.FC<{
       <IconButton onClick={startDeleting} disabled={disabled}>
         <FaTrash className="hover:text-red-500" />
       </IconButton>
+      <QueueActions
+        hash={torrent.info_hash}
+        position={stats.queue_position}
+        forced={stats.force_start}
+      />
       <PlaylistIconButton torrentId={id} disabled={disabled} />
       <DeleteTorrentModal
         show={deleting}

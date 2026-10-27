@@ -26,9 +26,10 @@ apply to reads as well as writes. Mutations are absent in read-only mode.
 | Workflow | Routes / fields | Behavior |
 | --- | --- | --- |
 | Connection and authentication | `auth/login`, `auth/logout`, `app/webapiVersion`, `app/version` | Cookie login/logout, Basic credentials, optional Bearer key scoped to this API; advertised API version 2.9.2 |
-| Client configuration | `app/preferences` | Real download directory and DHT configuration; queueing and global share limits disabled |
+| Client configuration | `app/preferences` | Real download directory and DHT configuration; real persisted queue settings; global share limits disabled |
 | Add torrents | `torrents/add` | Multipart torrent files or magnets; URL-encoded magnets; case-insensitive boolean forms |
-| Initial state | `paused`, `torrents/setForceStart` | Start, pause, or force start; forced mode bypasses share limits and is cleared by Pause |
+| Initial state | `paused`, `torrents/setForceStart` | Start, pause, or force start; forced mode bypasses queue and share limits and is cleared by Pause |
+| Torrent queue | preferences, `topPrio`, `bottomPrio`, `increasePrio`, `decreasePrio` | Opt-in download/seed/total limits; durable order; seed ranking; force-start bypass; slow-torrent accounting; queued states |
 | Download order | `sequentialDownload`, `firstLastPiecePrio` | Sequential piece order; prioritize the first and last 1% of every wanted file using qBittorrent's edge-size calculation; preserve file exclusions |
 | Content layout | `contentLayout=Original` / `Subfolder` | Original rqbit layout, or require a folder for single-file torrents too; validate folder paths |
 | Share limits | `ratioLimit`, `seedingTimeLimit`, `inactiveSeedingTimeLimit`, `torrents/setShareLimits` | Per-torrent limits, minutes converted to seconds; apply to pending and managed torrents; omitted fields preserve existing settings |
@@ -56,10 +57,30 @@ magnets carry these settings through metadata resolution. Persistence failures
 must not report a successful settings change. Malformed PostgreSQL automation
 metadata now causes a restoration error instead of silently resetting settings.
 
-Queueing remains disabled. `topPrio` deliberately returns 409, matching
-qBittorrent with queueing disabled; both reviewed Arr clients handle that status.
-Thus Arr's queue-position preference has no scheduling effect. There is no
-concurrency-limited torrent queue in this fork.
+Queueing is disabled by default and configurable through the native API,
+qBittorrent preferences, CLI/environment and web interface. Defaults when enabled
+are 3 downloads, 3 seeds and 5 total. JSON/PostgreSQL store settings and ordered
+hashes atomically. Combined queue/exclusion preference writes use one atomic file
+update or SQL transaction. Automatic holds never become manual pauses. Startup
+configuration loads before restoration; explicit overrides apply after it.
+
+The algorithm was checked against the qBittorrent revision above and
+[libtorrent 2.0.11 admission control](https://github.com/arvidn/libtorrent/blob/v2.0.11/src/session_impl.cpp)
+and [seed ranking / inactive transitions](https://github.com/arvidn/libtorrent/blob/v2.0.11/src/torrent.cpp).
+Downloads take precedence. Seeds use share-target flags, swarm scarcity and
+startup protection with stable hash tie-breaking. Unknown scrape counts fall
+back to peer observations, retained while held. Slow-state changes use the
+corresponding direction’s threshold and a monotonic debounce timer. Only the
+separate download/seed limits exempt slow torrents; the total remains binding.
+Forced torrents consume no automatic slots. rqbit’s peer discovery and transfer
+rate estimation remain engine-specific.
+
+Priority routes return 409 while disabled and perform stable moves otherwise,
+including `hashes=all`. Priorities are one-based for downloads and -1 for seeds
+or disabled queueing under the advertised 2.9.2 profile. Pending magnets remain
+visible as queued before discovery. Queue waiting does not spend their timeout
+budget. Displacement cancels discovery before replacements are admitted;
+pause/deletion cancel the whole job. See README for settings and native routes.
 
 HTTP torrent-URL fetching is deliberately unavailable through the compatibility
 API. The reviewed Arr adapters fetch torrent files themselves and submit bytes;
@@ -83,6 +104,10 @@ in logs. Compatibility error logs contain operation names, without arbitrary
 backend error chains. Malformed browser-origin headers fail closed. Existing
 login throttling, same-origin checks, bounded uploads, and symlink protections
 remain in effect.
+
+Queue regressions cover admission limits, stable reordering, forced mode, slow-state
+debouncing, concurrent preference patches, queued pending visibility, manual and
+share-limit stops, restart ordering and failed-write rollback.
 
 Regression coverage includes realistic form/multipart requests, unauthorized
 requests, read-only mode, bad limits, pending-state persistence, managed-state

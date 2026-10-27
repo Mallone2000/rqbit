@@ -1,3 +1,26 @@
+#[derive(serde::Serialize)]
+pub(super) struct QueuePreferences {
+    pub max_active_downloads: i32,
+    pub max_active_uploads: i32,
+    pub max_active_torrents: i32,
+    pub dont_count_slow_torrents: bool,
+    pub slow_torrent_dl_rate_threshold: u32,
+    pub slow_torrent_ul_rate_threshold: u32,
+    pub slow_torrent_inactive_timer: u32,
+}
+impl From<crate::QueueConfig> for QueuePreferences {
+    fn from(q: crate::QueueConfig) -> Self {
+        Self {
+            max_active_downloads: q.max_active_downloads,
+            max_active_uploads: q.max_active_uploads,
+            max_active_torrents: q.max_active_torrents,
+            dont_count_slow_torrents: q.dont_count_slow_torrents,
+            slow_torrent_dl_rate_threshold: q.slow_torrent_dl_rate_threshold,
+            slow_torrent_ul_rate_threshold: q.slow_torrent_ul_rate_threshold,
+            slow_torrent_inactive_timer: q.slow_torrent_inactive_timer,
+        }
+    }
+}
 use std::collections::BTreeMap;
 
 use serde::Serialize;
@@ -7,6 +30,8 @@ pub(super) struct Preferences {
     pub save_path: String,
     pub dht: bool,
     pub queueing_enabled: bool,
+    #[serde(flatten)]
+    pub queue: QueuePreferences,
     pub max_ratio_enabled: bool,
     pub max_ratio: f64,
     pub max_ratio_act: u8,
@@ -38,6 +63,8 @@ pub(super) struct TorrentInfo {
     pub completion_on: u64,
     pub num_complete: i64,
     pub tags: String,
+    pub priority: i64,
+    pub force_start: bool,
     pub state: &'static str,
     pub label: String,
     pub category: String,

@@ -202,6 +202,7 @@ pub struct ManagedTorrentShared {
 
 pub(crate) struct TorrentAutomationRuntime {
     pub(crate) last_seed_tick: Instant,
+    last_active_tick: Instant,
     last_observed_uploaded: u64,
     last_observed_live_progress: Option<u64>,
 }
@@ -210,6 +211,7 @@ impl TorrentAutomationRuntime {
     pub(crate) fn new() -> Self {
         Self {
             last_seed_tick: Instant::now(),
+            last_active_tick: Instant::now(),
             last_observed_uploaded: 0,
             last_observed_live_progress: None,
         }
@@ -300,6 +302,7 @@ impl ManagedTorrent {
             }
         };
         // Verification of existing files after startup is not payload activity.
+        let previous_progress = runtime.last_observed_live_progress;
         let downloaded = matches!(stats.state, TorrentStatsState::Live)
             && runtime
                 .last_observed_live_progress
@@ -308,6 +311,22 @@ impl ManagedTorrent {
             matches!(stats.state, TorrentStatsState::Live).then_some(stats.progress_bytes);
 
         let mut automation = self.shared.automation.write();
+        let now = Instant::now();
+        if matches!(stats.state, TorrentStatsState::Live) {
+            let elapsed = now.duration_since(runtime.last_active_tick).as_secs();
+            automation.active_seconds = automation.active_seconds.saturating_add(elapsed);
+            runtime.last_active_tick += Duration::from_secs(elapsed);
+        } else {
+            runtime.last_active_tick = now;
+        }
+        if downloaded {
+            automation.payload_downloaded_bytes =
+                automation.payload_downloaded_bytes.saturating_add(
+                    stats
+                        .progress_bytes
+                        .saturating_sub(previous_progress.unwrap_or(stats.progress_bytes)),
+                );
+        }
         automation.uploaded_bytes = automation.uploaded_bytes.saturating_add(uploaded_delta);
         if uploaded_delta > 0 || downloaded {
             automation.last_activity_unix_seconds = Some(now_unix_seconds);
@@ -454,7 +473,6 @@ impl ManagedTorrent {
         fn _start<'a>(
             t: &'a Arc<ManagedTorrent>,
             peer_rx: Option<PeerStream>,
-            start_paused: bool,
             session: Arc<Session>,
             g: Option<parking_lot::RwLockWriteGuard<'a, ManagedTorrentLocked>>,
             token: CancellationToken,
@@ -518,7 +536,7 @@ impl ManagedTorrent {
 
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
-                                    _start(&t, peer_rx, start_paused, session, Some(g), token)
+                                    _start(&t, peer_rx, session, Some(g), token)
                                 }
                                 Err(err) => {
                                     if init.is_pause_requested() {
@@ -538,7 +556,7 @@ impl ManagedTorrent {
                     Ok(())
                 }
                 ManagedTorrentState::Paused(_) => {
-                    if start_paused {
+                    if g.paused || !session.queue_allows(t.info_hash()) {
                         return Ok(());
                     }
                     let paused = g.state.take().assert_paused();
@@ -568,7 +586,7 @@ impl ManagedTorrent {
                     t.state_change_notify.notify_waiters();
 
                     // Recurse.
-                    _start(t, peer_rx, start_paused, session, Some(g), token)
+                    _start(t, peer_rx, session, Some(g), token)
                 }
                 ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
             }
@@ -579,22 +597,40 @@ impl ManagedTorrent {
             .session
             .upgrade()
             .context("session is dead, cannot start torrent")?;
+        {
+            let mut runtime = self.shared.automation_runtime.lock();
+            runtime.last_seed_tick = Instant::now();
+            runtime.last_active_tick = Instant::now();
+        }
         let mut g = self.locked.write();
         g.paused = start_paused;
         let cancellation_token = session.cancellation_token().child_token();
 
-        _start(
-            self,
-            peer_rx,
-            start_paused,
-            session,
-            Some(g),
-            cancellation_token,
-        )
+        _start(self, peer_rx, session, Some(g), cancellation_token)
     }
 
     pub fn is_paused(&self) -> bool {
         self.locked.read().paused
+    }
+
+    /// Suspend the engine without changing durable user intent.
+    pub(crate) fn hold_for_queue(&self) -> anyhow::Result<()> {
+        let mut g = self.locked.write();
+        if let ManagedTorrentState::Live(live) = &g.state {
+            g.state = ManagedTorrentState::Paused(live.pause()?);
+            self.state_change_notify.notify_waiters();
+        }
+        Ok(())
+    }
+
+    pub fn is_queued(&self) -> bool {
+        !self.is_paused()
+            && self
+                .shared
+                .session
+                .upgrade()
+                .is_some_and(|s| !s.queue_allows(self.info_hash()))
+            && matches!(self.locked.read().state, ManagedTorrentState::Paused(_))
     }
 
     /// Pause the torrent if it's live.
@@ -616,7 +652,8 @@ impl ManagedTorrent {
                 Ok(())
             }
             ManagedTorrentState::Paused(_) => {
-                bail!("torrent is already paused");
+                g.paused = true;
+                Ok(())
             }
             ManagedTorrentState::Error(_) => {
                 bail!("can't pause torrent in error state")
@@ -635,6 +672,10 @@ impl ManagedTorrent {
                 .as_ref()
                 .map(|r| r.info.lengths().total_length())
                 .unwrap_or_default(),
+            queued: false,
+            queue_position: None,
+            force_start: self.automation_metadata().force_start,
+            stopped_by_share_limit: self.automation_metadata().stopped_by_share_limit,
             file_progress: Vec::new(),
             state: S::Error,
             error: None,
@@ -686,6 +727,14 @@ impl ManagedTorrent {
             }
         }
 
+        resp.queued = self.is_queued();
+        if !resp.finished {
+            resp.queue_position = self
+                .shared
+                .session
+                .upgrade()
+                .and_then(|s| s.queue_position(self.info_hash()));
+        }
         resp
     }
 

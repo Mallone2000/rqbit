@@ -241,11 +241,20 @@ impl Api {
             .pending_automation_torrents()
             .into_iter()
             .map(|pending| PendingTorrentResponse {
+                queue_position: self.session.queue_position(pending.info_hash),
+                force_start: pending.automation.force_start,
                 info_hash: pending.info_hash.as_string(),
                 name: pending.name,
                 category: pending.automation.category,
                 state: if pending.paused {
                     "paused"
+                } else if !self.session.queue_allows(pending.info_hash)
+                    && matches!(
+                        pending.state,
+                        crate::session::PendingAutomationTorrentState::ResolvingMetadata
+                    )
+                {
+                    "queued"
                 } else {
                     match pending.state {
                         crate::session::PendingAutomationTorrentState::ResolvingMetadata => {
@@ -570,6 +579,8 @@ pub struct TorrentListResponse {
 
 #[derive(Serialize)]
 pub struct PendingTorrentResponse {
+    pub queue_position: Option<usize>,
+    pub force_start: bool,
     pub info_hash: String,
     pub name: Option<String>,
     pub category: String,
