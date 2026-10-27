@@ -57,6 +57,7 @@ RQBIT_HTTP_API_LISTEN_ADDR=0.0.0.0:3030 \
 ```
 
 Connect clients using the qBittorrent Web API with the same host, port, and credentials. Categories retain rqbit's global download directory rather than moving content.
+For multi-file torrents stored in their own folder, the compatibility API reports the parent directory as `save_path` and the torrent folder as `content_path`. This lets Sonarr and Radarr import the torrent folder without scanning the shared download directory.
 
 Cleanuparr can use those username/password credentials or an optional Bearer key. Set `RQBIT_QBITTORRENT_API_KEY` to a non-empty secret and enter the same value as Cleanuparr's qBittorrent API key. Username/password configuration remains required to enable the compatibility API and protects rqbit's native API; the Bearer key is accepted only on `/api/v2/` routes. Keep the key out of logs and deployment manifests.
 

@@ -47,6 +47,21 @@ fn path_for_qbittorrent(path: &Path) -> String {
         .into_owned()
 }
 
+fn torrent_save_path<'a>(
+    output_folder: &'a Path,
+    session_output_folder: &Path,
+    file_count: usize,
+) -> &'a Path {
+    // rqbit's output folder is the content folder for multi-file torrents.
+    // qBittorrent reports its parent as save_path so Servarr can import only
+    // the torrent's content_path, rather than the shared download directory.
+    if file_count > 1 && output_folder != session_output_folder {
+        output_folder.parent().unwrap_or(output_folder)
+    } else {
+        output_folder
+    }
+}
+
 #[derive(Debug)]
 struct QbitError {
     status: StatusCode,
@@ -329,7 +344,13 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                     state: state_name,
                     label: category.clone(),
                     category,
-                    save_path: path_for_qbittorrent(torrent.output_folder()),
+                    save_path: path_for_qbittorrent(torrent_save_path(
+                        torrent.output_folder(),
+                        session.output_folder(),
+                        metadata
+                            .as_ref()
+                            .map_or(0, |metadata| metadata.file_infos.len()),
+                    )),
                     content_path: path_for_qbittorrent(
                         &content_path.unwrap_or_else(|| torrent.output_folder().to_path_buf()),
                     ),
@@ -532,7 +553,11 @@ async fn torrent_properties(
     let share_ratio = share_ratio(automation.uploaded_bytes, stats.progress_bytes);
 
     Ok(Json(TorrentProperties {
-        save_path: path_for_qbittorrent(torrent.output_folder()),
+        save_path: path_for_qbittorrent(torrent_save_path(
+            torrent.output_folder(),
+            state.api.session().output_folder(),
+            metadata.file_infos.len(),
+        )),
         total_size: stats.total_bytes,
         total_downloaded: stats.progress_bytes,
         total_uploaded: automation.uploaded_bytes,
@@ -2615,14 +2640,9 @@ mod tests {
         let torrents = torrents.as_array().unwrap();
         assert_eq!(torrents.len(), 2);
         for torrent in torrents {
-            let expected_save_path = if torrent["name"] == single_name {
-                downloads.path().to_path_buf()
-            } else {
-                downloads.path().join("Show Name")
-            };
             assert_eq!(
                 torrent["save_path"],
-                expected_save_path.to_string_lossy().as_ref()
+                downloads.path().to_string_lossy().as_ref()
             );
             let expected_content_path = if torrent["name"] == single_name {
                 downloads.path().join(single_name)
@@ -2633,9 +2653,7 @@ mod tests {
                 torrent["content_path"],
                 expected_content_path.to_string_lossy().as_ref()
             );
-            if torrent["name"] == single_name {
-                assert_ne!(torrent["content_path"], torrent["save_path"]);
-            }
+            assert_ne!(torrent["content_path"], torrent["save_path"]);
         }
 
         let inspected_hash = torrents[0]["hash"].as_str().unwrap();
