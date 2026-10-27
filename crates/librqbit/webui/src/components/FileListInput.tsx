@@ -169,7 +169,10 @@ const FileTreeComponent: React.FC<{
   return (
     <>
       <div className="flex items-center">
-        <IconButton onClick={() => setExpanded(!expanded)}>
+        <IconButton
+          title={expanded ? "Collapse folder" : "Expand folder"}
+          onClick={() => setExpanded(!expanded)}
+        >
           {expanded ? <CiSquareMinus /> : <CiSquarePlus />}
         </IconButton>
         <FormCheckbox

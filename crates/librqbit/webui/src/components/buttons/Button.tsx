@@ -9,13 +9,13 @@ export const Button: React.FC<{
   children: ReactNode;
 }> = ({ onClick, children, className, disabled, variant, size }) => {
   const sizeClassNames = {
-    sm: "text-sm px-2 py-1",
-    default: "px-3 py-1.5",
+    sm: "min-h-11 text-sm px-3 py-2",
+    default: "min-h-12 px-5 py-3",
   }[size ?? "default"];
 
   const variantClassNames = {
     secondary:
-      "bg-surface-raised border-divider hover:bg-primary hover:text-white transition-colors",
+      "bg-surface-raised border-divider hover:bg-primary-bg hover:text-white transition-colors",
     danger:
       "bg-error-bg text-white border-transparent hover:bg-red-600 transition-colors",
     primary:
@@ -27,12 +27,13 @@ export const Button: React.FC<{
 
   return (
     <button
+      type="button"
       disabled={disabled}
       onClick={(e) => {
         e.preventDefault();
         onClick();
       }}
-      className={`inline-flex items-center gap-1 border rounded font-medium cursor-pointer disabled:cursor-not-allowed ${sizeClassNames} ${variantClassNames} ${className ?? ""}`}
+      className={`inline-flex items-center gap-2 border rounded-xl font-semibold cursor-pointer disabled:cursor-not-allowed ${sizeClassNames} ${variantClassNames} ${className ?? ""}`}
     >
       {children}
     </button>

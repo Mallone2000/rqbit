@@ -5,6 +5,7 @@ import { ProgressBar } from "./ProgressBar";
 import { Speed } from "./Speed";
 import { formatBytes } from "../helper/formatBytes";
 import { getCompletionETA } from "../helper/getCompletionETA";
+import { torrentStatusLabel } from "../helper/torrentStatusLabel";
 import { StatusIcon } from "./StatusIcon";
 
 export const TorrentCardContent: React.FC<{
@@ -43,17 +44,17 @@ export const TorrentCardContent: React.FC<{
   };
 
   return (
-    <div className="flex flex-col border p-1.5 sm:p-2 border-divider rounded-xl shadow-xs hover:drop-shadow-sm bg-surface-raised">
-      <section className="flex flex-col lg:flex-row items-center gap-1.5 sm:gap-2">
+    <div className="flex flex-col border p-5 border-divider rounded-2xl bg-surface-raised">
+      <section className="flex flex-col lg:flex-row items-start gap-4">
         {/* Icon */}
         <div className="hidden md:block">{statusIcon("w-10 h-10")}</div>
         {/* Name, progress, stats */}
         <div className="w-full flex flex-col gap-1 sm:gap-2">
-          <div className="flex items-center gap-1.5 sm:gap-2">
+          <div className="flex items-start gap-4">
             <div className="md:hidden">
               {statusIcon("w-4 h-4 sm:w-5 sm:h-5")}
             </div>
-            <div className="text-left text-sm sm:text-base lg:text-lg text-ellipsis break-all line-clamp-2 sm:line-clamp-none">
+            <div className="text-left text-lg font-semibold text-ellipsis break-all line-clamp-2 sm:line-clamp-none">
               {torrent.name}
               {statsResponse?.queued && (
                 <span className="ml-2 text-secondary">
@@ -66,6 +67,9 @@ export const TorrentCardContent: React.FC<{
                 </span>
               )}
             </div>
+          </div>
+          <div className="text-sm font-semibold text-secondary">
+            {torrentStatusLabel(statsResponse)}
           </div>
           {error ? (
             <p className="text-error">
@@ -86,7 +90,7 @@ export const TorrentCardContent: React.FC<{
                   }
                 />
               </div>
-              <div className="flex flex-wrap gap-x-3 gap-y-0.5 sm:gap-x-4 sm:gap-y-1 items-center text-nowrap text-xs sm:text-sm font-medium text-secondary">
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 sm:gap-x-4 sm:gap-y-1 items-center text-nowrap text-base tabular-nums font-medium text-secondary">
                 <div className="flex gap-1 sm:gap-2 items-center">
                   <GoPeople className="w-3 h-3 sm:w-4 sm:h-4" />{" "}
                   {formatPeersString().toString()}
@@ -114,7 +118,7 @@ export const TorrentCardContent: React.FC<{
         </div>
         {/* Actions */}
         {statsResponse && (
-          <div className="">
+          <div className="w-full lg:w-auto border-t lg:border-t-0 border-divider pt-3 lg:pt-0">
             <TorrentActions torrent={{ ...torrent, stats: statsResponse }} />
           </div>
         )}

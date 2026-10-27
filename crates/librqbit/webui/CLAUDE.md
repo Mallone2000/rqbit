@@ -247,3 +247,13 @@ For more complex cases, consider a small component or use template literal compo
 const cellBase = "px-2 align-middle";
 const numericCell = `w-20 ${cellBase} text-right text-secondary whitespace-nowrap`;
 ```
+
+## Accessible workspace design
+
+The UI uses warm neutral light surfaces and charcoal dark surfaces with semantic colors in `src/globals.css`. Keep body text at 16px, controls at least 44px tall, and focus indicators visible. The login screen alone uses the subtle grid background. Respect reduced motion and use text labels as well as colors for torrent states.
+
+`SessionSummary` reads the existing session/torrent stores without adding polling. Counts describe the complete list, independent of search. Active means live and not queued; paused excludes queued torrents. Completed is an overlapping `finished` count, including paused torrents. Missing stats display an em dash. `TorrentFilters` owns the shared debounced search and status controls; keep filters ahead of virtualization.
+
+The focused desktop table leaves ID, received/sent bytes, queue position and queue actions in Overview. Its collapsible details panel has pointer and keyboard resizing (arrows, Home, End). Mobile uses larger virtualized cards. Keep desktop custom menu slots and authentication semantics intact.
+
+For isolated login visual/error testing, open `/mock.html?login=401`, `?login=429`, `?login=500` or `?login=expired`. These modes use mock failures only and are excluded from production. Existing mock torrent mode still uses `/mock.html`.

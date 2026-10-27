@@ -1,7 +1,5 @@
 import { useContext, useState, useCallback, useMemo } from "react";
 import { FaPause, FaPlay, FaTrash } from "react-icons/fa";
-import { GoSearch, GoX } from "react-icons/go";
-import debounce from "lodash.debounce";
 import { APIContext } from "../../context";
 import { useUIStore } from "../../stores/uiStore";
 import { useTorrentStore } from "../../stores/torrentStore";
@@ -15,22 +13,18 @@ import {
   TorrentListItem,
 } from "../../api-types";
 import { Button } from "../buttons/Button";
-import {
-  StatusFilter,
-  STATUS_FILTER_LABELS,
-} from "../../helper/torrentFilters";
 
 interface ActionBarProps {
   // When true, hides search/filter/selection count (for use in modal)
   hideFilters?: boolean;
+  children?: React.ReactNode;
 }
 
-export const ActionBar: React.FC<ActionBarProps> = ({ hideFilters }) => {
+export const ActionBar: React.FC<ActionBarProps> = ({
+  hideFilters,
+  children,
+}) => {
   const selectedTorrentIds = useUIStore((state) => state.selectedTorrentIds);
-  const searchQuery = useUIStore((state) => state.searchQuery);
-  const setSearchQuery = useUIStore((state) => state.setSearchQuery);
-  const statusFilter = useUIStore((state) => state.statusFilter);
-  const setStatusFilter = useUIStore((state) => state.setStatusFilter);
   const torrents = useTorrentStore((state) => state.torrents);
   const refreshTorrents = useTorrentStore((state) => state.refreshTorrents);
   const setCloseableError = useErrorStore((state) => state.setCloseableError);
@@ -40,26 +34,6 @@ export const ActionBar: React.FC<ActionBarProps> = ({ hideFilters }) => {
   const [torrentsToDelete, setTorrentsToDelete] = useState<
     Pick<TorrentListItem, "id" | "name">[]
   >([]);
-  const [localSearch, setLocalSearch] = useState(searchQuery);
-
-  // Debounced update to store
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const debouncedSetSearch = useCallback(
-    debounce((value: string) => setSearchQuery(value), 150),
-    [setSearchQuery],
-  );
-
-  const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
-    setLocalSearch(value);
-    debouncedSetSearch(value);
-  };
-
-  const clearSearch = () => {
-    setLocalSearch("");
-    setSearchQuery("");
-  };
-
   const API = useContext(APIContext);
 
   const selectedCount = selectedTorrentIds.size;
@@ -118,7 +92,7 @@ export const ActionBar: React.FC<ActionBarProps> = ({ hideFilters }) => {
     runBulkAction((id) => API.start(id), STATE_LIVE, "starting");
 
   return (
-    <div className="flex items-center gap-1.5 px-3 py-1.5 bg-surface-raised border-b border-divider">
+    <div className="flex shrink-0 flex-wrap items-center gap-2 px-4 py-3 bg-surface-raised border-b border-divider">
       <Button
         onClick={resumeSelected}
         disabled={disabled || !hasSelection}
@@ -151,48 +125,10 @@ export const ActionBar: React.FC<ActionBarProps> = ({ hideFilters }) => {
               {selectedCount} selected
             </span>
           )}
-
-          {/* Spacer */}
-          <div className="flex-1" />
-
-          {/* Status filter */}
-          <select
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
-            className="py-1 px-2 text-sm bg-surface border border-divider rounded focus:outline-none focus:border-primary"
-          >
-            {(Object.keys(STATUS_FILTER_LABELS) as StatusFilter[]).map(
-              (status) => (
-                <option key={status} value={status}>
-                  {STATUS_FILTER_LABELS[status]}
-                </option>
-              ),
-            )}
-          </select>
-
-          {/* Search input */}
-          <div className="relative">
-            <GoSearch className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-tertiary" />
-            <input
-              type="text"
-              data-search-input
-              value={localSearch}
-              onChange={handleSearchChange}
-              placeholder="Search..."
-              className="pl-7 pr-7 py-1 w-48 text-sm bg-surface border border-divider rounded focus:outline-none focus:border-primary placeholder:text-tertiary"
-            />
-            {localSearch && (
-              <button
-                onClick={clearSearch}
-                className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 text-tertiary hover:text-secondary rounded cursor-pointer"
-              >
-                <GoX className="w-3.5 h-3.5" />
-              </button>
-            )}
-          </div>
         </>
       )}
 
+      {children && <div className="ml-auto">{children}</div>}
       <DeleteTorrentModal
         show={showDeleteModal}
         onHide={() => setShowDeleteModal(false)}

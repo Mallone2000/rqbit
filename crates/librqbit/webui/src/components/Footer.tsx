@@ -11,7 +11,7 @@ export const Footer: React.FC<{ publicIp?: string | null }> = ({
 }) => {
   let stats = useStatsStore((stats) => stats.stats);
   return (
-    <div className="sticky bottom-0 bg-surface-raised/80 backdrop-blur text-nowrap text-sm font-medium text-secondary flex gap-x-1 lg:gap-x-5 justify-evenly flex-wrap">
+    <div className="shrink-0 border-t border-divider bg-surface text-sm font-medium text-secondary flex gap-x-4 px-4 py-2 justify-between flex-wrap">
       <FooterPiece>
         ↓ {stats.download_speed.human_readable} (
         {formatBytes(stats.counters.fetched_bytes)})

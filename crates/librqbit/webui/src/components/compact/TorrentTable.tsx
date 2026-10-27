@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useEffect, useState, useRef } from "react";
+import { useMemo, useCallback, useEffect, useRef } from "react";
 import { Virtuoso } from "react-virtuoso";
 import { TorrentListItem } from "../../api-types";
 import { TorrentTableRow } from "./TorrentTableRow";
@@ -21,8 +21,19 @@ export type TableSortColumn =
   | "eta"
   | "peers";
 
-const DEFAULT_SORT_COLUMN: TableSortColumn = "id";
-const DEFAULT_SORT_DIRECTION: SortDirection = "desc";
+export const TABLE_SORT_LABELS: Record<TableSortColumn, string> = {
+  queue: "Queue position",
+  id: "ID",
+  name: "Name",
+  size: "Size",
+  progress: "Progress",
+  downloadedBytes: "Received",
+  downSpeed: "Download speed",
+  upSpeed: "Upload speed",
+  uploadedBytes: "Sent",
+  eta: "ETA",
+  peers: "Peers",
+};
 
 function getTableSortValue(
   t: TorrentListItem,
@@ -65,11 +76,17 @@ function getTableSortValue(
 interface TorrentTableProps {
   torrents: TorrentListItem[] | null;
   loading: boolean;
+  sortColumn: TableSortColumn;
+  sortDirection: SortDirection;
+  onSort: (column: TableSortColumn) => void;
 }
 
 export const TorrentTable: React.FC<TorrentTableProps> = ({
   torrents,
   loading,
+  sortColumn,
+  sortDirection,
+  onSort,
 }) => {
   const selectedTorrentIds = useUIStore((state) => state.selectedTorrentIds);
   const selectTorrent = useUIStore((state) => state.selectTorrent);
@@ -82,24 +99,6 @@ export const TorrentTable: React.FC<TorrentTableProps> = ({
   const statusFilter = useUIStore((state) => state.statusFilter);
 
   const normalizedQuery = searchQuery.toLowerCase().trim();
-
-  // Local sorting state
-  const [sortColumn, setSortColumnState] =
-    useState<TableSortColumn>(DEFAULT_SORT_COLUMN);
-  const [sortDirection, setSortDirectionState] = useState<SortDirection>(
-    DEFAULT_SORT_DIRECTION,
-  );
-
-  const setSortColumn = useCallback((column: TableSortColumn) => {
-    setSortColumnState((prevColumn) => {
-      setSortDirectionState((prevDir) => {
-        const newDir: SortDirection =
-          prevColumn === column ? (prevDir === "asc" ? "desc" : "asc") : "desc";
-        return newDir;
-      });
-      return column;
-    });
-  }, []);
 
   // Sort and filter torrents for virtualization
   const filteredTorrents = useMemo(() => {
@@ -141,7 +140,7 @@ export const TorrentTable: React.FC<TorrentTableProps> = ({
   };
 
   const handleSort = (column: TableSortColumn) => {
-    setSortColumn(column);
+    onSort(column);
   };
 
   // Store orderedIds in a ref so handleRowClick doesn't need it as a dependency
@@ -206,7 +205,7 @@ export const TorrentTable: React.FC<TorrentTableProps> = ({
     [filteredTorrents, selectedTorrentIds, handleRowClick, toggleSelection],
   );
 
-  if (loading) {
+  if (loading && !torrents) {
     return (
       <div className="flex justify-center items-center h-64">
         <Spinner />
@@ -223,42 +222,34 @@ export const TorrentTable: React.FC<TorrentTableProps> = ({
     );
   }
 
+  if (filteredTorrents?.length === 0)
+    return (
+      <div className="p-8 text-center text-secondary">
+        <p className="text-xl font-bold text-text">No matching torrents</p>
+        <p className="mt-2">Try another search or status filter.</p>
+      </div>
+    );
+
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full min-w-[1050px]">
       {/* Header */}
-      <table className="w-full table-fixed">
+      <table className="w-full table-fixed shrink-0">
         <thead className="bg-surface-raised text-sm">
           <tr className="border-b border-divider">
-            <th className="w-8 px-2 py-3">
-              <input
-                type="checkbox"
-                checked={allSelected}
-                ref={(el) => {
-                  if (el) el.indeterminate = someSelected && !allSelected;
-                }}
-                onChange={handleHeaderCheckbox}
-                className="w-4 h-4 rounded border-divider-strong bg-surface text-primary focus:ring-primary"
-              />
+            <th className="w-14 px-1 py-2">
+              <label className="inline-flex min-h-11 min-w-11 items-center justify-center">
+                <input
+                  aria-label="Select all visible torrents"
+                  type="checkbox"
+                  checked={allSelected}
+                  ref={(el) => {
+                    if (el) el.indeterminate = someSelected && !allSelected;
+                  }}
+                  onChange={handleHeaderCheckbox}
+                  className="w-4 h-4 rounded border-divider-strong bg-surface text-primary focus:ring-primary"
+                />
+              </label>
             </th>
-            <th className="w-8 px-1 py-3"></th>
-            <TableHeader
-              column="id"
-              label="ID"
-              sortColumn={sortColumn}
-              sortDirection={sortDirection}
-              onSort={handleSort}
-              className="w-12"
-              align="center"
-            />
-            <TableHeader
-              column="queue"
-              label="Queue"
-              sortColumn={sortColumn}
-              sortDirection={sortDirection}
-              onSort={handleSort}
-              className="w-16"
-              align="center"
-            />
             <TableHeader
               column="name"
               label="Name"
@@ -273,7 +264,7 @@ export const TorrentTable: React.FC<TorrentTableProps> = ({
               sortColumn={sortColumn}
               sortDirection={sortDirection}
               onSort={handleSort}
-              className="w-20"
+              className="w-28"
               align="right"
             />
             <TableHeader
@@ -282,25 +273,17 @@ export const TorrentTable: React.FC<TorrentTableProps> = ({
               sortColumn={sortColumn}
               sortDirection={sortDirection}
               onSort={handleSort}
-              className="w-24"
+              className="w-36"
               align="center"
             />
-            <TableHeader
-              column="downloadedBytes"
-              label="Recv"
-              sortColumn={sortColumn}
-              sortDirection={sortDirection}
-              onSort={handleSort}
-              className="w-20"
-              align="right"
-            />
+
             <TableHeader
               column="downSpeed"
               label="↓ Speed"
               sortColumn={sortColumn}
               sortDirection={sortDirection}
               onSort={handleSort}
-              className="w-20"
+              className="w-28"
               align="right"
             />
             <TableHeader
@@ -309,25 +292,17 @@ export const TorrentTable: React.FC<TorrentTableProps> = ({
               sortColumn={sortColumn}
               sortDirection={sortDirection}
               onSort={handleSort}
-              className="w-20"
+              className="w-28"
               align="right"
             />
-            <TableHeader
-              column="uploadedBytes"
-              label="Sent"
-              sortColumn={sortColumn}
-              sortDirection={sortDirection}
-              onSort={handleSort}
-              className="w-20"
-              align="right"
-            />
+
             <TableHeader
               column="eta"
               label="ETA"
               sortColumn={sortColumn}
               sortDirection={sortDirection}
               onSort={handleSort}
-              className="w-20"
+              className="w-28"
               align="center"
             />
             <TableHeader

@@ -10,26 +10,27 @@
  */
 
 :root {
+  color-scheme: light;
   /* Surfaces (backgrounds) */
-  --color-surface: theme(colors.white);
-  --color-surface-raised: theme(colors.slate.50);
-  --color-surface-sunken: theme(colors.slate.100);
+  --color-surface: #fffefa;
+  --color-surface-raised: #f5f4f0;
+  --color-surface-sunken: #eeede9;
 
   /* Text */
-  --color-text: theme(colors.slate.900);
-  --color-secondary: theme(colors.slate.500);
-  --color-tertiary: theme(colors.slate.400);
+  --color-text: #272727;
+  --color-secondary: #676761;
+  --color-tertiary: #686862;
 
   /* Borders / Dividers */
-  --color-border: theme(colors.slate.200);
-  --color-border-strong: theme(colors.slate.300);
-  --color-divider: theme(colors.slate.200);
-  --color-divider-strong: theme(colors.slate.300);
+  --color-border: #deded7;
+  --color-border-strong: #8a8a83;
+  --color-divider: #deded7;
+  --color-divider-strong: #8a8a83;
 
   /* Border colors for Tailwind utilities */
   --border-color-primary: theme(colors.blue.600);
-  --border-color-divider: theme(colors.slate.200);
-  --border-color-divider-strong: theme(colors.slate.300);
+  --border-color-divider: #deded7;
+  --border-color-divider-strong: #8a8a83;
 
   /* Interactive (primary) */
   --color-primary: theme(colors.blue.600);
@@ -38,45 +39,46 @@
   --color-primary-bg-hover: theme(colors.blue.700);
 
   /* Status: Success (softer green) */
-  --color-success: theme(colors.emerald.600);
-  --color-success-bg: theme(colors.emerald.600);
+  --color-success: theme(colors.emerald.700);
+  --color-success-bg: theme(colors.emerald.700);
 
   /* Status: Warning */
-  --color-warning: theme(colors.amber.500);
+  --color-warning: theme(colors.amber.700);
   --color-warning-bg: theme(colors.amber.500);
 
   /* Status: Error (softer red) */
-  --color-error: theme(colors.red.500);
+  --color-error: theme(colors.red.600);
   --color-error-bg: theme(colors.red.600);
 }
 
 .dark {
+  color-scheme: dark;
   /* Surfaces (backgrounds) */
-  --color-surface: theme(colors.slate.900);
-  --color-surface-raised: theme(colors.slate.800);
-  --color-surface-sunken: theme(colors.slate.950);
+  --color-surface: #282828;
+  --color-surface-raised: #333332;
+  --color-surface-sunken: #222221;
 
   /* Text */
-  --color-text: theme(colors.slate.100);
-  --color-secondary: theme(colors.slate.400);
-  --color-tertiary: theme(colors.slate.500);
+  --color-text: #fafaf7;
+  --color-secondary: #c3c3bc;
+  --color-tertiary: #adada6;
 
   /* Borders / Dividers */
-  --color-border: theme(colors.slate.700);
-  --color-border-strong: theme(colors.slate.600);
-  --color-divider: theme(colors.slate.700);
-  --color-divider-strong: theme(colors.slate.600);
+  --color-border: #494948;
+  --color-border-strong: #85857e;
+  --color-divider: #494948;
+  --color-divider-strong: #85857e;
 
   /* Border colors for Tailwind utilities */
   --border-color-primary: theme(colors.blue.400);
-  --border-color-divider: theme(colors.slate.700);
-  --border-color-divider-strong: theme(colors.slate.600);
+  --border-color-divider: #494948;
+  --border-color-divider-strong: #85857e;
 
   /* Interactive (primary) */
   --color-primary: theme(colors.blue.400);
   --color-primary-hover: theme(colors.blue.300);
-  --color-primary-bg: theme(colors.blue.500);
-  --color-primary-bg-hover: theme(colors.blue.400);
+  --color-primary-bg: theme(colors.blue.600);
+  --color-primary-bg-hover: theme(colors.blue.700);
 
   /* Status: Success (softer green) */
   --color-success: theme(colors.emerald.400);
@@ -121,11 +123,108 @@
 
 /* Base styles */
 html {
-  font-size: 14px;
+  font-size: 16px;
 }
 
 /* Default text color and background - needs to be on body since .dark class is on body */
 body {
   color: var(--color-text);
   background-color: var(--color-surface);
+}
+
+/* Shared control geometry keeps secondary screens as usable as the workspace. */
+@layer base {
+  body {
+    font-family:
+      ui-sans-serif,
+      system-ui,
+      -apple-system,
+      BlinkMacSystemFont,
+      "Segoe UI",
+      sans-serif;
+  }
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+  button,
+  select,
+  input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+  textarea {
+    min-height: 44px;
+    border-radius: 12px;
+  }
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    max-width: 100%;
+  }
+  input[type="checkbox"],
+  input[type="radio"] {
+    width: 22px;
+    height: 22px;
+    flex-shrink: 0;
+    accent-color: var(--color-primary);
+  }
+  label:has(input[type="checkbox"]),
+  label:has(input[type="radio"]) {
+    min-height: 44px;
+  }
+  :focus-visible {
+    outline: 3px solid var(--color-primary);
+    outline-offset: 3px;
+  }
+  button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  button,
+  a,
+  input,
+  select {
+    touch-action: manipulation;
+  }
+}
+.login-background {
+  background-image:
+    radial-gradient(
+      ellipse at center,
+      transparent,
+      var(--color-surface-sunken) 75%
+    ),
+    linear-gradient(var(--color-divider) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-divider) 1px, transparent 1px);
+  background-size:
+    100% 100%,
+    56px 56px,
+    56px 56px;
+}
+.stat-value {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.035em;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+button,
+select,
+textarea,
+input:not([type="checkbox"]):not([type="radio"]) {
+  border-radius: 12px;
+}
+
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+  border-color: var(--color-border-strong);
 }

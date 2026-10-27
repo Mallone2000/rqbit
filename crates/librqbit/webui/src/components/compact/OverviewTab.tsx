@@ -7,6 +7,7 @@ import {
 import { formatBytes } from "../../helper/formatBytes";
 import { getCompletionETA } from "../../helper/getCompletionETA";
 import { PlaylistLink } from "../buttons/PlaylistButton";
+import { QueueActions } from "../buttons/QueueActions";
 import { PiecesCanvas } from "./PiecesCanvas";
 
 interface OverviewTabProps {
@@ -82,15 +83,40 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({ torrent }) => {
   })();
 
   return (
-    <div className="p-3 flex flex-col gap-3 text-sm">
+    <div className="p-5 flex flex-col gap-5 text-base">
       {/* Header: Name + Status */}
       <div className="flex items-center gap-3">
-        <span className="truncate font-medium flex-1" title={name}>
+        <span className="break-words min-w-0 font-semibold flex-1" title={name}>
           {name}
         </span>
         <span className={`shrink-0 ${stateDisplay.color}`}>
           {stateDisplay.text}
         </span>
+      </div>
+      <div className="flex flex-wrap items-center gap-4">
+        <span>
+          <LV label="ID" value={torrent.id} />
+        </span>
+        <span>
+          <LV
+            label="Queue position"
+            value={statsResponse.queue_position ?? "—"}
+          />
+        </span>
+        <span>
+          <LV label="Received" value={formatBytes(progressBytes)} />
+        </span>
+        <span>
+          <LV
+            label="Sent"
+            value={statsResponse.live ? formatBytes(totalUploadedBytes) : "—"}
+          />
+        </span>
+        <QueueActions
+          hash={infoHash}
+          position={statsResponse.queue_position}
+          forced={statsResponse.force_start}
+        />
       </div>
       {/* Pieces visualization */}
       {totalPieces > 0 && (
@@ -162,13 +188,13 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({ torrent }) => {
 
       {/* Metadata */}
       <div className="flex flex-col gap-1">
-        <div className="truncate">
+        <div className="break-all">
           <LV label="Hash" value={infoHash} mono />
         </div>
-        <div className="truncate">
+        <div className="break-all">
           <LV label="Output" value={torrent.output_folder} mono />
         </div>
-        <div className="truncate">
+        <div className="break-all">
           <LV
             label="Playlist"
             value={<PlaylistLink torrentId={torrent.id} />}

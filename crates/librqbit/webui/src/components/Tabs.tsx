@@ -13,8 +13,10 @@ export const TabButton: React.FC<TabButtonProps> = ({
   onClick,
 }) => (
   <button
+    type="button"
+    aria-pressed={active}
     onClick={onClick}
-    className={`px-3 py-1.5 font-medium transition-colors cursor-pointer ${
+    className={`min-h-12 px-4 py-3 font-semibold transition-colors cursor-pointer ${
       active
         ? "border-b-2 border-primary text-primary -mb-px"
         : "text-tertiary hover:text-secondary"
@@ -30,7 +32,9 @@ export interface TabListProps {
 }
 
 export const TabList: React.FC<TabListProps> = ({ children, className }) => (
-  <div className={`flex border-b border-divider ${className ?? ""}`}>
+  <div
+    className={`flex shrink-0 overflow-x-auto border-b border-divider ${className ?? ""}`}
+  >
     {children}
   </div>
 );

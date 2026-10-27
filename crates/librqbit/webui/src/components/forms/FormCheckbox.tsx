@@ -27,7 +27,7 @@ export const FormCheckbox: React.FC<{
       <div className="flex">
         <input
           type={inputType || "checkbox"}
-          className="block mt-1"
+          className="block mt-3"
           id={name}
           name={name}
           disabled={disabled}
@@ -45,7 +45,9 @@ export const FormCheckbox: React.FC<{
             {label}
           </a>
         ) : (
-          <label htmlFor={name}>{label}</label>
+          <label className="min-h-11 flex items-center" htmlFor={name}>
+            {label}
+          </label>
         )}
 
         {help && (

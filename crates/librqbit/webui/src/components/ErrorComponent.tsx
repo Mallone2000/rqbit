@@ -7,13 +7,17 @@ const AlertDanger: React.FC<{
   onClose?: () => void;
 }> = ({ title, children, onClose }) => {
   return (
-    <div className="bg-error/10 p-3 rounded-md mb-3">
+    <div
+      role="alert"
+      className="shrink-0 bg-error/10 p-4 rounded-2xl border border-error/30"
+    >
       <div className="flex justify-between mb-2">
         <h2 className="text-lg font-semibold text-error">{title}</h2>
         {onClose && (
           <button
+            aria-label="Dismiss error"
             onClick={onClose}
-            className="text-error hover:text-error/80 transition-colors cursor-pointer"
+            className="min-w-11 flex items-center justify-center text-error hover:text-error/80 transition-colors cursor-pointer"
           >
             <BsX />
           </button>

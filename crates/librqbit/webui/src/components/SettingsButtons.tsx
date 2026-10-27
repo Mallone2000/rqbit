@@ -37,7 +37,7 @@ export const SettingsButtons: React.FC<SettingsButtonsProps> = ({
   const showBuiltInConfigButton = !menuButtons || menuButtons.length === 0;
 
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex flex-wrap items-center gap-1">
       {menuButtons?.map((b, i) => (
         <span key={i}>{b}</span>
       ))}

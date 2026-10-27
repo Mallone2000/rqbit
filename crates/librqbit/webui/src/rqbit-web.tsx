@@ -97,7 +97,7 @@ export const RqbitWebUI = (props: {
   }, []);
 
   return (
-    <div className="bg-surface h-dvh flex flex-col overflow-hidden">
+    <div className="bg-surface-sunken min-h-dvh lg:h-dvh flex flex-col lg:overflow-hidden">
       <Header
         title={props.title}
         version={props.version}

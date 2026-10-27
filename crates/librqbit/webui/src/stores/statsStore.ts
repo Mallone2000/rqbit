@@ -4,10 +4,12 @@ import { SessionStats } from "../api-types";
 
 export interface StatsStore {
   stats: SessionStats;
+  loaded: boolean;
   setStats: (stats: SessionStats) => void;
 }
 
 export const useStatsStore = create<StatsStore>((set) => ({
+  loaded: false,
   stats: {
     counters: {
       fetched_bytes: 0,
@@ -66,6 +68,6 @@ export const useStatsStore = create<StatsStore>((set) => ({
     },
   },
   setStats: (stats) => {
-    set({ stats });
+    set({ stats, loaded: true });
   },
 }));

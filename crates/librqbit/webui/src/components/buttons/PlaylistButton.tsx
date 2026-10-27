@@ -61,7 +61,6 @@ export const PlaylistIconButton: React.FC<PlaylistButtonProps> = ({
 
   return (
     <IconButton
-      href={playlistUrl ?? "#"}
       onClick={copyPlaylistUrlToClipboard}
       disabled={disabled || !playlistUrl}
       title="Copy playlist URL"
@@ -103,15 +102,12 @@ export const PlaylistLink: React.FC<Pick<PlaylistButtonProps, "torrentId">> = ({
   }
 
   return (
-    <a
-      href={playlistUrl}
-      onClick={(e) => {
-        e.preventDefault();
-        copyPlaylistUrlToClipboard();
-      }}
+    <button
+      type="button"
+      onClick={copyPlaylistUrlToClipboard}
       className="text-blue-500 hover:underline cursor-pointer"
     >
       Copy playlist URL
-    </a>
+    </button>
   );
 };

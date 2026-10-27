@@ -1,8 +1,8 @@
 import { TorrentListItem, STATE_INITIALIZING } from "../../api-types";
-import { StatusIcon } from "../StatusIcon";
+
 import { formatBytes } from "../../helper/formatBytes";
 import { getCompletionETA } from "../../helper/getCompletionETA";
-import { QueueActions } from "../buttons/QueueActions";
+import { torrentStatusLabel } from "../../helper/torrentStatusLabel";
 import { memo } from "react";
 
 interface TorrentTableRowProps {
@@ -24,7 +24,6 @@ const TorrentTableRowUnmemoized: React.FC<TorrentTableRowProps> = ({
   const totalBytes = stats?.total_bytes ?? 1;
   const progressBytes = stats?.progress_bytes ?? 0;
   const finished = stats?.finished || false;
-  const live = !!stats?.live;
 
   const progressPercentage = error
     ? 100
@@ -34,7 +33,6 @@ const TorrentTableRowUnmemoized: React.FC<TorrentTableRowProps> = ({
 
   const downloadSpeed = stats?.live?.download_speed?.human_readable ?? "-";
   const uploadSpeed = stats?.live?.upload_speed?.human_readable ?? "-";
-  const uploadedBytes = stats?.live?.snapshot.uploaded_bytes ?? 0;
 
   const peerStats = stats?.live?.snapshot.peer_stats;
   const peersDisplay = peerStats ? `${peerStats.live}/${peerStats.seen}` : "-";
@@ -48,72 +46,52 @@ const TorrentTableRowUnmemoized: React.FC<TorrentTableRowProps> = ({
     onRowClick(torrent.id, e);
   };
 
-  const handleCheckboxClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    onCheckboxChange(torrent.id);
-  };
-
   // Common cell styles to avoid repetition
   const cellBase = "px-2 align-middle";
-  const numericCell = `w-20 ${cellBase} text-right text-secondary whitespace-nowrap`;
-  const centeredCell = `w-20 ${cellBase} text-center text-secondary whitespace-nowrap`;
+  const numericCell = `w-28 ${cellBase} text-right text-secondary whitespace-nowrap`;
+  const centeredCell = `w-28 ${cellBase} text-center text-secondary whitespace-nowrap`;
 
   // Use table-fixed layout to match header column widths
   return (
     <table className="w-full table-fixed">
       <tbody>
         <tr
-          onMouseDown={handleRowClick}
-          className={`cursor-pointer border-b border-divider text-sm h-8 ${
+          onClick={handleRowClick}
+          className={`cursor-pointer border-b border-divider text-base h-16 tabular-nums ${
             isSelected ? "bg-primary/10" : "hover:bg-surface-raised"
           }`}
         >
           <td
-            className={`w-8 ${cellBase} text-center`}
-            onMouseDown={handleCheckboxClick}
+            className="w-14 px-1 text-center align-middle"
+            onClick={(e) => e.stopPropagation()}
           >
-            <input
-              type="checkbox"
-              checked={isSelected}
-              onChange={() => {}}
-              className="w-4 h-4 rounded border-divider-strong bg-surface text-primary focus:ring-primary"
-            />
+            <label className="inline-flex min-h-11 min-w-11 items-center justify-center">
+              <input
+                type="checkbox"
+                checked={isSelected}
+                aria-label={`Select ${name || `torrent ${torrent.id}`}`}
+                onChange={() => onCheckboxChange(torrent.id)}
+                className="w-4 h-4 rounded border-divider-strong bg-surface text-primary focus:ring-primary"
+              />
+            </label>
           </td>
-          <td className="w-8 px-1 align-middle">
-            <StatusIcon
-              className="w-5 h-5"
-              error={!!error}
-              live={live}
-              finished={finished}
-            />
-          </td>
-          <td
-            className={`w-12 ${cellBase} text-center text-tertiary font-mono whitespace-nowrap`}
-          >
-            {torrent.id}
-          </td>
-          <td className={`w-16 ${cellBase} text-center`}>
-            {stats?.queue_position ?? "—"}
-          </td>
-          <td className={cellBase}>
+          <td className={`${cellBase} font-semibold`}>
             <div className="truncate" title={name}>
-              {name || "Loading..."}
-              {stats?.queued && (
-                <span className="ml-2 text-secondary">
-                  {finished ? "Queued for seeding" : "Queued for download"}
-                </span>
-              )}
-              {stats?.queue_position != null && (
-                <span className="ml-2 text-secondary">
-                  Queue #{stats.queue_position}
-                </span>
-              )}
+              <button
+                type="button"
+                className="block w-full text-left truncate"
+                aria-label={`View details for ${name || torrent.id}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleRowClick(e);
+                }}
+              >
+                {name || "Loading..."}
+              </button>
             </div>
-            <QueueActions
-              hash={torrent.info_hash}
-              position={stats?.queue_position}
-              forced={stats?.force_start}
-            />
+            <div className="text-sm text-secondary">
+              {torrentStatusLabel(stats)}
+            </div>
             {error && (
               <div className="truncate text-sm text-error" title={error}>
                 {error}
@@ -121,7 +99,7 @@ const TorrentTableRowUnmemoized: React.FC<TorrentTableRowProps> = ({
             )}
           </td>
           <td className={numericCell}>{formatBytes(totalBytes)}</td>
-          <td className={`w-24 ${cellBase} text-center`}>
+          <td className={`w-36 ${cellBase} text-center`}>
             <div className="flex items-center gap-2">
               <div className="flex-1 h-1.5 bg-divider rounded-full overflow-hidden">
                 <div
@@ -142,12 +120,8 @@ const TorrentTableRowUnmemoized: React.FC<TorrentTableRowProps> = ({
               </span>
             </div>
           </td>
-          <td className={numericCell}>{formatBytes(progressBytes)}</td>
           <td className={numericCell}>{downloadSpeed}</td>
           <td className={numericCell}>{uploadSpeed}</td>
-          <td className={numericCell}>
-            {uploadedBytes > 0 && <>{formatBytes(uploadedBytes)}</>}
-          </td>
           <td className={centeredCell}>{displayEta}</td>
           <td
             className={`w-16 ${cellBase} text-center text-secondary whitespace-nowrap`}
