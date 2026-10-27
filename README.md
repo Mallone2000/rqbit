@@ -137,6 +137,12 @@ cargo build --release
 
 The default build embeds the web UI, so npm is required. The resulting binary is `target/release/rqbit`.
 
+Each push to `main` must advance the workspace version. The release workflow
+builds the CLI and desktop packages for Linux, Windows, and macOS, then publishes
+them as the newest GitHub release under `v<workspace version>` after all builds
+and the Docker image publish succeed. The release tag points to the commit that
+produced those packages.
+
 For development:
 
 ```sh
@@ -161,7 +167,8 @@ cargo tauri build
 
 The repository publishes `ghcr.io/mallone2000/rqbit:latest` from successful
 builds of `main`. The image supports `linux/amd64`, `linux/arm64`, and
-`linux/arm/v7`. Start the included example with:
+`linux/arm/v7`. The same build also receives a version tag matching the GitHub
+release. Start the included example with:
 
 ```sh
 docker compose -f docker/compose-examples/server.yaml pull

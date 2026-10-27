@@ -103,6 +103,27 @@ Do not expand the task into unrelated cleanup.
 
 When requirements are ambiguous but a safe, conventional interpretation exists, prefer implementing that interpretation rather than blocking unnecessarily.
 
+## Main branch version and release
+
+Every change made on `main`, including documentation and CI changes, must increment
+the release version in the same change before it is pushed. When preparing a pull
+request for `main`, ensure its merged result also has a version newer than the
+current `main`; bump it again if another change used that version first.
+
+- Advance the fork's `-servarr.N` suffix for an ordinary change. Change the base
+  version only when deliberately adopting a new upstream version. Never reuse a
+  version or release tag; check existing tags and releases with `gh`.
+- Update `[workspace.package].version` and every internal dependency version in
+  the root `Cargo.toml`, then refresh `Cargo.lock`. The desktop crate inherits
+  the workspace version. Keep all workspace packages on the same version.
+- The release tag `v<workspace version>` must identify the exact `main` commit
+  used to build the packages. Publish those compiled packages in that tag's
+  GitHub release and make it the newest release. A draft release or a moving
+  Docker `latest` tag does not satisfy this requirement.
+- Verify the version and release workflow before considering a `main` push
+  complete. If the workflow cannot publish the built packages, fix it as part
+  of the change; do not report the release as complete until GitHub shows it.
+
 ## Rust
 
 Follow existing Rust style and architecture.
