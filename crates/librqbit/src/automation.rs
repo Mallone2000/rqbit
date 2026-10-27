@@ -17,6 +17,19 @@ pub struct TorrentAutomationMetadata {
     /// expose a different unit.
     #[serde(default)]
     pub seeding_time_limit_seconds: Option<u64>,
+    /// Time since the last payload activity at which a completed torrent stops.
+    #[serde(default)]
+    pub inactive_seeding_time_limit_seconds: Option<u64>,
+    #[serde(default)]
+    pub sequential_download: bool,
+    #[serde(default)]
+    pub first_last_piece_priority: bool,
+    /// Force-started torrents bypass automatic share limits.
+    #[serde(default)]
+    pub force_start: bool,
+    /// Force a content folder even for a single-file torrent.
+    #[serde(default)]
+    pub use_subfolder: bool,
     #[serde(default)]
     pub added_at_unix_seconds: u64,
     #[serde(default)]
@@ -46,6 +59,11 @@ mod tests {
         let metadata: TorrentAutomationMetadata =
             serde_json::from_str(r#"{"category":"sonarr"}"#).unwrap();
         assert!(metadata.tags.is_empty());
+        assert_eq!(metadata.inactive_seeding_time_limit_seconds, None);
+        assert!(!metadata.sequential_download);
+        assert!(!metadata.first_last_piece_priority);
+        assert!(!metadata.force_start);
+        assert!(!metadata.use_subfolder);
         let mut tagged = metadata;
         tagged.tags.insert("cleanup".to_owned());
         assert!(serde_json::to_string(&tagged).unwrap().contains("cleanup"));

@@ -35,7 +35,7 @@ use crate::{
 type ApiState = Arc<HttpApi>;
 type QbitResult<T> = Result<T, QbitError>;
 
-const WEB_API_VERSION: &str = "2.8.1";
+const WEB_API_VERSION: &str = "2.9.2";
 const UNKNOWN_ETA_SECONDS: u64 = 8_640_000;
 const MAX_LOGIN_BODY_SIZE: usize = 8 * 1024;
 const MAX_MAGNET_URL_SIZE: usize = 16 * 1024;
@@ -50,12 +50,12 @@ fn path_for_qbittorrent(path: &Path) -> String {
 fn torrent_save_path<'a>(
     output_folder: &'a Path,
     session_output_folder: &Path,
-    file_count: usize,
+    has_content_folder: bool,
 ) -> &'a Path {
     // rqbit's output folder is the content folder for multi-file torrents.
     // qBittorrent reports its parent as save_path so Servarr can import only
     // the torrent's content_path, rather than the shared download directory.
-    if file_count > 1 && output_folder != session_output_folder {
+    if has_content_folder && output_folder != session_output_folder {
         output_folder.parent().unwrap_or(output_folder)
     } else {
         output_folder
@@ -90,12 +90,9 @@ impl QbitError {
         }
     }
 
-    fn internal(status: StatusCode, message: &'static str, error: impl std::fmt::Debug) -> Self {
-        warn!(
-            ?error,
-            operation = message,
-            "qBittorrent API operation failed"
-        );
+    fn internal(status: StatusCode, message: &'static str, _error: impl std::fmt::Debug) -> Self {
+        // Backend errors can contain tracker URLs or database credentials.
+        warn!(operation = message, "qBittorrent API operation failed");
         Self {
             status,
             message: message.to_owned(),
@@ -135,6 +132,8 @@ pub(super) fn make_api_router(state: ApiState) -> Router {
             .route("/torrents/setShareLimits", post(set_share_limits))
             .route("/torrents/pause", post(pause_torrents))
             .route("/torrents/resume", post(resume_torrents))
+            .route("/torrents/stop", post(pause_torrents))
+            .route("/torrents/start", post(resume_torrents))
             .route("/torrents/filePrio", post(set_file_priority))
             .route("/torrents/topPrio", post(top_priority))
             .route("/torrents/setForceStart", post(set_force_start));
@@ -308,7 +307,7 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                         .and_then(|live| live.time_remaining.as_ref())
                         .map_or(UNKNOWN_ETA_SECONDS, |time| time.as_secs())
                 };
-                let state_name = torrent_state_name(
+                let mut state_name = torrent_state_name(
                     stats.state,
                     stats.finished,
                     stats
@@ -320,6 +319,13 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                         .as_ref()
                         .is_some_and(|live| live.upload_speed.as_bytes() > 0),
                 );
+                if automation.force_start && matches!(stats.state, TorrentStatsState::Live) {
+                    state_name = if stats.finished {
+                        "forcedUP"
+                    } else {
+                        "forcedDL"
+                    };
+                }
                 let category = automation.category;
 
                 Some(TorrentInfo {
@@ -349,7 +355,8 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                         session.output_folder(),
                         metadata
                             .as_ref()
-                            .map_or(0, |metadata| metadata.file_infos.len()),
+                            .is_some_and(|metadata| metadata.file_infos.len() > 1)
+                            || automation.use_subfolder,
                     )),
                     content_path: path_for_qbittorrent(
                         &content_path.unwrap_or_else(|| torrent.output_folder().to_path_buf()),
@@ -361,7 +368,10 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                         .seeding_time_limit_seconds
                         .and_then(|seconds| i64::try_from(seconds / 60).ok())
                         .unwrap_or(-2),
-                    inactive_seeding_time_limit: -2,
+                    inactive_seeding_time_limit: automation
+                        .inactive_seeding_time_limit_seconds
+                        .and_then(|seconds| i64::try_from(seconds / 60).ok())
+                        .unwrap_or(-2),
                     last_activity: automation.last_activity_unix_seconds.unwrap_or_default(),
                 })
             })
@@ -404,6 +414,11 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                 "pausedDL"
             } else {
                 match pending.state {
+                    PendingAutomationTorrentState::ResolvingMetadata
+                        if pending.automation.force_start =>
+                    {
+                        "forcedMetaDL"
+                    }
                     PendingAutomationTorrentState::ResolvingMetadata => "metaDL",
                     PendingAutomationTorrentState::Error => "error",
                 }
@@ -420,7 +435,11 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                 .seeding_time_limit_seconds
                 .and_then(|seconds| i64::try_from(seconds / 60).ok())
                 .unwrap_or(-2),
-            inactive_seeding_time_limit: -2,
+            inactive_seeding_time_limit: pending
+                .automation
+                .inactive_seeding_time_limit_seconds
+                .and_then(|seconds| i64::try_from(seconds / 60).ok())
+                .unwrap_or(-2),
             last_activity: 0,
         });
     }
@@ -556,7 +575,7 @@ async fn torrent_properties(
         save_path: path_for_qbittorrent(torrent_save_path(
             torrent.output_folder(),
             state.api.session().output_folder(),
-            metadata.file_infos.len(),
+            metadata.file_infos.len() > 1 || automation.use_subfolder,
         )),
         total_size: stats.total_bytes,
         total_downloaded: stats.progress_bytes,
@@ -740,15 +759,27 @@ async fn torrent_files(
         .load_full()
         .ok_or_else(|| QbitError::conflict("torrent metadata is not available"))?;
     let only_files = torrent.only_files();
+    let has_content_folder =
+        metadata.file_infos.len() > 1 || torrent.automation_metadata().use_subfolder;
     let files = metadata
         .file_infos
         .iter()
         .enumerate()
         .map(|(index, file)| {
             let downloaded = stats.file_progress.get(index).copied().unwrap_or_default();
-            TorrentFile {
+            Ok(TorrentFile {
                 index,
-                name: file.relative_filename.to_string_lossy().into_owned(),
+                name: torrent
+                    .output_folder()
+                    .join(&file.relative_filename)
+                    .strip_prefix(torrent_save_path(
+                        torrent.output_folder(),
+                        state.api.session().output_folder(),
+                        has_content_folder,
+                    ))
+                    .map_err(|_| QbitError::conflict("file is outside torrent save path"))?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
                 size: file.len,
                 progress: if file.len == 0 {
                     1.0
@@ -761,9 +792,9 @@ async fn torrent_files(
                         .is_none_or(|selected| selected.contains(&index)),
                 ),
                 is_seed: downloaded == file.len,
-            }
+            })
         })
-        .collect();
+        .collect::<QbitResult<Vec<_>>>()?;
     Ok(Json(files))
 }
 
@@ -850,6 +881,7 @@ struct AddForm {
     first_last_piece_prio: Option<bool>,
     ratio_limit: Option<f64>,
     seeding_time_limit: Option<i64>,
+    inactive_seeding_time_limit: Option<i64>,
 }
 
 async fn add_torrent(State(state): State<ApiState>, request: Request) -> QbitResult<Response> {
@@ -890,6 +922,12 @@ async fn add_torrent(State(state): State<ApiState>, request: Request) -> QbitRes
             category,
             ratio_limit: parse_ratio_limit(form.ratio_limit)?,
             seeding_time_limit_seconds: parse_seeding_time_limit(form.seeding_time_limit)?,
+            inactive_seeding_time_limit_seconds: parse_seeding_time_limit(
+                form.inactive_seeding_time_limit,
+            )?,
+            sequential_download: form.sequential_download.unwrap_or(false),
+            first_last_piece_priority: form.first_last_piece_prio.unwrap_or(false),
+            use_subfolder: form.content_layout.as_deref() == Some("Subfolder"),
             ..Default::default()
         },
         ..Default::default()
@@ -988,6 +1026,13 @@ async fn parse_multipart(
                         .map_err(|_| QbitError::bad_request("invalid ratioLimit"))?,
                 )
             }
+            "inactiveSeedingTimeLimit" => {
+                form.inactive_seeding_time_limit = Some(
+                    value
+                        .parse()
+                        .map_err(|_| QbitError::bad_request("invalid inactiveSeedingTimeLimit"))?,
+                );
+            }
             "seedingTimeLimit" => {
                 form.seeding_time_limit = Some(
                     value
@@ -1032,18 +1077,10 @@ where
 }
 
 fn validate_add_form(form: &AddForm) -> QbitResult<()> {
-    if form.sequential_download == Some(true) {
-        return Err(QbitError::conflict("sequential download is unsupported"));
-    }
-    if form.first_last_piece_prio == Some(true) {
-        return Err(QbitError::conflict(
-            "first/last piece priority is unsupported",
-        ));
-    }
     if form
         .content_layout
         .as_deref()
-        .is_some_and(|layout| layout != "Original")
+        .is_some_and(|layout| !matches!(layout, "Original" | "Subfolder"))
     {
         return Err(QbitError::conflict("unsupported content layout"));
     }
@@ -1228,21 +1265,19 @@ async fn set_share_limits(
     State(state): State<ApiState>,
     Form(form): Form<ShareLimitsForm>,
 ) -> QbitResult<StatusCode> {
-    if form
-        .inactive_seeding_time_limit
-        .is_some_and(|limit| limit >= 0)
-    {
-        return Err(QbitError::conflict(
-            "inactive seeding time limits are unsupported",
-        ));
-    }
+    let inactive_limit = parse_seeding_time_limit(form.inactive_seeding_time_limit)?;
     let ratio_limit = parse_ratio_limit(form.ratio_limit)?;
     let seeding_time_limit_seconds = parse_seeding_time_limit(form.seeding_time_limit)?;
     for hash in parse_hashes(&form.hashes)? {
         state
             .api
             .session()
-            .set_torrent_automation_limits(hash, ratio_limit, seeding_time_limit_seconds)
+            .set_torrent_automation_share_limits(
+                hash,
+                form.ratio_limit.map(|_| ratio_limit),
+                form.seeding_time_limit.map(|_| seeding_time_limit_seconds),
+                form.inactive_seeding_time_limit.map(|_| inactive_limit),
+            )
             .await
             .map_err(|error| {
                 QbitError::internal(StatusCode::CONFLICT, "failed to set share limits", error)
@@ -1261,6 +1296,14 @@ async fn pause_torrents(
     Form(form): Form<TorrentActionForm>,
 ) -> QbitResult<StatusCode> {
     for hash in parse_hashes(&form.hashes)? {
+        state
+            .api
+            .session()
+            .set_torrent_force_start(hash, false)
+            .await
+            .map_err(|error| {
+                QbitError::internal(StatusCode::CONFLICT, "failed to clear force start", error)
+            })?;
         if let TorrentIdOrHash::Hash(info_hash) = hash
             && state
                 .api
@@ -1349,19 +1392,25 @@ async fn set_force_start(
     State(state): State<ApiState>,
     Form(form): Form<ForceStartForm>,
 ) -> QbitResult<StatusCode> {
+    let hashes = parse_hashes(&form.hashes)?;
+    for hash in hashes {
+        state
+            .api
+            .session()
+            .set_torrent_force_start(hash, form.value)
+            .await
+            .map_err(|error| {
+                QbitError::internal(StatusCode::CONFLICT, "failed to set force start", error)
+            })?;
+    }
     if form.value {
-        return resume_torrents(
+        resume_torrents(
             State(state),
             Form(TorrentActionForm {
                 hashes: form.hashes,
             }),
         )
-        .await;
-    }
-    for hash in parse_hashes(&form.hashes)? {
-        if state.api.session().get(hash).is_none() {
-            return Err(QbitError::not_found("torrent not found"));
-        }
+        .await?;
     }
     Ok(StatusCode::OK)
 }
@@ -1517,6 +1566,291 @@ mod tests {
             .unwrap();
         });
         (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn servarr_pending_settings_survive_restart_and_reject_invalid_limits() {
+        let downloads = tempfile::tempdir().unwrap();
+        let persistence = tempfile::tempdir().unwrap();
+        let make_session = || {
+            Session::new_with_opts(
+                downloads.path().to_path_buf(),
+                SessionOptions {
+                    dht: None,
+                    listen: None,
+                    disable_local_service_discovery: true,
+                    persistence: Some(SessionPersistenceConfig::Json {
+                        folder: Some(persistence.path().to_path_buf()),
+                    }),
+                    ..Default::default()
+                },
+            )
+        };
+        let session = make_session().await.unwrap();
+        let (base, server) = start_full_http_api(session.clone(), true).await;
+        let client = reqwest::Client::new();
+        let hash = "c7".repeat(20);
+        let magnet = format!("magnet:?xt=urn:btih:{hash}");
+        let add = form_body(&[
+            ("urls", &magnet),
+            ("paused", "True"),
+            ("sequentialDownload", "True"),
+            ("firstLastPiecePrio", "True"),
+            ("contentLayout", "Subfolder"),
+            ("inactiveSeedingTimeLimit", "17"),
+        ]);
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/add"))
+                .basic_auth("test", Some("secret"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(add)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        let body =
+            format!("hashes={hash}&ratioLimit=2&seedingTimeLimit=30&inactiveSeedingTimeLimit=5");
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/setShareLimits"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        for (request_body, status) in [
+            (body, reqwest::StatusCode::OK),
+            (
+                format!("hashes={hash}&inactiveSeedingTimeLimit=-3"),
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("hashes={hash}&inactiveSeedingTimeLimit={}", i64::MAX),
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("hashes={hash}&ratioLimit=NaN"),
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("hashes={hash}&ratioLimit=3"),
+                reqwest::StatusCode::OK,
+            ),
+        ] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/torrents/setShareLimits"))
+                    .basic_auth("test", Some("secret"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(request_body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                status
+            );
+        }
+        let listed: Value = client
+            .get(format!("{base}/torrents/info"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["ratio_limit"], 3.0);
+        assert_eq!(listed[0]["seeding_time_limit"], 30);
+        assert_eq!(listed[0]["inactive_seeding_time_limit"], 5);
+        server.abort();
+        session.stop().await;
+        drop(session);
+        let restored = make_session().await.unwrap();
+        let pending = restored.pending_automation_torrents().pop().unwrap();
+        assert!(pending.paused);
+        assert!(pending.automation.sequential_download);
+        assert!(pending.automation.first_last_piece_priority);
+        assert!(pending.automation.use_subfolder);
+        assert_eq!(pending.automation.ratio_limit, Some(3.0));
+        assert_eq!(pending.automation.seeding_time_limit_seconds, Some(1800));
+        assert_eq!(
+            pending.automation.inactive_seeding_time_limit_seconds,
+            Some(300)
+        );
+        restored.stop().await;
+    }
+
+    #[tokio::test]
+    async fn servarr_subfolder_and_force_start_contract() {
+        let downloads = tempfile::tempdir().unwrap();
+        let fixtures = tempfile::tempdir().unwrap();
+        let source = fixtures.path().join("movie.mkv");
+        std::fs::write(&source, b"legal media").unwrap();
+        let bytes = make_fixture(&source).await;
+        let folder = downloads.path().join("movie.mkv");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::copy(&source, folder.join("movie.mkv")).unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (base, server) = start_full_http_api(session.clone(), true).await;
+        let client = reqwest::Client::new();
+        let boundary = "servarr-options";
+        let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"contentLayout\"\r\n\r\nSubfolder\r\n").into_bytes();
+        body.extend(multipart_body(boundary, "", "fixture.torrent", &bytes));
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/add"))
+                .basic_auth("test", Some("secret"))
+                .header(
+                    "Content-Type",
+                    format!("multipart/form-data; boundary={boundary}")
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        let torrent = session.with_torrents(|torrents| torrents.next().unwrap().1.clone());
+        torrent.wait_until_initialized().await.unwrap();
+        assert!(torrent.stats().finished);
+        assert_eq!(torrent.output_folder(), folder);
+        let hash = torrent.info_hash().as_string();
+        // Forced mode must actually bypass automatic share limits.
+        for (path, body) in [
+            (
+                "torrents/setShareLimits",
+                format!("hashes={hash}&inactiveSeedingTimeLimit=0"),
+            ),
+            (
+                "torrents/setForceStart",
+                format!("hashes={hash}&value=true"),
+            ),
+        ] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/{path}"))
+                    .basic_auth("test", Some("secret"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::OK
+            );
+        }
+        let (_, metadata, reached) = torrent.refresh_automation_stats(unix_time_seconds());
+        assert!(metadata.force_start);
+        assert!(!reached);
+        assert!(!torrent.is_paused());
+        let listed: Value = client
+            .get(format!("{base}/torrents/info"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["state"], "forcedUP");
+        assert_eq!(
+            listed[0]["save_path"],
+            downloads.path().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            listed[0]["content_path"],
+            folder.join("movie.mkv").to_string_lossy().as_ref()
+        );
+        let files: Value = client
+            .get(format!("{base}/torrents/files?hash={hash}"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            Path::new(listed[0]["save_path"].as_str().unwrap())
+                .join(files[0]["name"].as_str().unwrap()),
+            folder.join("movie.mkv")
+        );
+        for path in ["torrents/stop", "torrents/start"] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/{path}"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(format!("hashes={hash}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                client
+                    .post(format!("{base}/{path}"))
+                    .basic_auth("test", Some("secret"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body("hashes=invalid")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                client
+                    .post(format!("{base}/{path}"))
+                    .basic_auth("test", Some("secret"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(format!("hashes={hash}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::OK
+            );
+            assert!(!torrent.automation_metadata().force_start);
+        }
+        assert_eq!(
+            client
+                .post(format!("{base}/torrents/setForceStart"))
+                .basic_auth("test", Some("secret"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(format!("hashes={hash}&value=false"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !torrent.is_paused() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("inactive seed limit was not enforced");
+        session.stop().await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -1684,19 +2018,24 @@ mod tests {
                 .status(),
             reqwest::StatusCode::FORBIDDEN
         );
-        assert_eq!(
-            client
-                .post(format!("{base}/app/setPreferences"))
-                .bearer_auth("test-api-key")
-                .header("Origin", "https://untrusted.example")
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .body("json=%7B%7D")
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            reqwest::StatusCode::FORBIDDEN
-        );
+        for origin in [
+            http::HeaderValue::from_static("https://untrusted.example"),
+            http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        ] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/app/setPreferences"))
+                    .bearer_auth("test-api-key")
+                    .header("Origin", origin)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body("json=%7B%7D")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::FORBIDDEN
+            );
+        }
         assert_eq!(
             client
                 .post(format!("{base}/app/setPreferences"))
@@ -2335,6 +2674,11 @@ mod tests {
             .unwrap();
         assert_eq!(files_response.status(), reqwest::StatusCode::OK);
         let files: Value = files_response.json().await.unwrap();
+        for file in files.as_array().unwrap() {
+            let relative = file["name"].as_str().unwrap();
+            assert!(relative.starts_with("Complete Fixture/"));
+            assert!(downloads.path().join(relative).is_file());
+        }
         let dangerous_ids = files
             .as_array()
             .unwrap()
@@ -2575,7 +2919,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.text().await.unwrap(), "2.8.1");
+        assert_eq!(response.text().await.unwrap(), "2.9.2");
 
         let response = client
             .get(format!("{base}/app/version"))
@@ -2832,7 +3176,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.text().await.unwrap(), "2.8.1");
+        assert_eq!(response.text().await.unwrap(), "2.9.2");
         enabled_server.abort();
     }
 
@@ -2874,6 +3218,8 @@ mod tests {
         for (path, body) in [
             ("app/setPreferences", "json=%7B%7D"),
             ("torrents/addTags", "hashes=all&tags=blocked"),
+            ("torrents/stop", "hashes=all"),
+            ("torrents/start", "hashes=all"),
         ] {
             let response = reqwest::Client::new()
                 .post(format!("{base}/{path}"))
@@ -3062,6 +3408,11 @@ mod tests {
                         seeding_time_limit_seconds: Some(600),
                         uploaded_bytes: 200,
                         seeding_seconds: 42,
+                        inactive_seeding_time_limit_seconds: Some(900),
+                        sequential_download: true,
+                        first_last_piece_priority: true,
+                        force_start: true,
+                        last_activity_unix_seconds: Some(12345),
                         tags: ["cleanup".to_owned()].into_iter().collect(),
                         ..Default::default()
                     },
@@ -3090,8 +3441,42 @@ mod tests {
         assert_eq!(metadata[0].seeding_time_limit_seconds, Some(600));
         assert_eq!(metadata[0].uploaded_bytes, 200);
         assert_eq!(metadata[0].seeding_seconds, 42);
+        assert_eq!(metadata[0].inactive_seeding_time_limit_seconds, Some(900));
+        assert!(metadata[0].sequential_download);
+        assert!(metadata[0].first_last_piece_priority);
+        assert!(metadata[0].force_start);
+        assert_eq!(metadata[0].last_activity_unix_seconds, Some(12345));
         assert!(metadata[0].tags.contains("cleanup"));
         assert_eq!(restored.excluded_file_names(), (true, "*.exe".to_owned()));
+        let torrent = restored.with_torrents(|torrents| torrents.next().unwrap().1.clone());
+        torrent.wait_until_initialized().await.unwrap();
+        // Checking files on startup must preserve the activity timestamp used by inactive limits.
+        torrent.refresh_automation_stats(unix_time_seconds());
+        assert_eq!(
+            torrent.automation_metadata().last_activity_unix_seconds,
+            Some(12345)
+        );
+        let blocked = persistence.path().join("session.json.tmp");
+        tokio::fs::create_dir(&blocked).await.unwrap();
+        let id = TorrentIdOrHash::Hash(torrent.info_hash());
+        assert!(
+            restored
+                .set_torrent_automation_share_limits(
+                    id,
+                    Some(Some(99.0)),
+                    Some(Some(99)),
+                    Some(Some(99))
+                )
+                .await
+                .is_err()
+        );
+        assert!(restored.set_torrent_force_start(id, false).await.is_err());
+        let after_failure = torrent.automation_metadata();
+        assert_eq!(after_failure.ratio_limit, Some(1.5));
+        assert_eq!(after_failure.seeding_time_limit_seconds, Some(600));
+        assert_eq!(after_failure.inactive_seeding_time_limit_seconds, Some(900));
+        assert!(after_failure.force_start);
+        tokio::fs::remove_dir(&blocked).await.unwrap();
 
         let state = Arc::new(HttpApi::new(
             Api::new(restored.clone(), None, None),
@@ -3379,7 +3764,6 @@ mod tests {
                         .unwrap();
                     let expected = match parsed {
                         None => reqwest::StatusCode::BAD_REQUEST,
-                        Some(true) if field != "paused" => reqwest::StatusCode::CONFLICT,
                         _ => reqwest::StatusCode::OK,
                     };
                     assert_eq!(

@@ -203,6 +203,7 @@ pub struct ManagedTorrentShared {
 pub(crate) struct TorrentAutomationRuntime {
     pub(crate) last_seed_tick: Instant,
     last_observed_uploaded: u64,
+    last_observed_live_progress: Option<u64>,
 }
 
 impl TorrentAutomationRuntime {
@@ -210,6 +211,7 @@ impl TorrentAutomationRuntime {
         Self {
             last_seed_tick: Instant::now(),
             last_observed_uploaded: 0,
+            last_observed_live_progress: None,
         }
     }
 }
@@ -297,14 +299,25 @@ impl ManagedTorrent {
                 0
             }
         };
-        drop(runtime);
+        // Verification of existing files after startup is not payload activity.
+        let downloaded = matches!(stats.state, TorrentStatsState::Live)
+            && runtime
+                .last_observed_live_progress
+                .is_some_and(|previous| stats.progress_bytes > previous);
+        runtime.last_observed_live_progress =
+            matches!(stats.state, TorrentStatsState::Live).then_some(stats.progress_bytes);
 
         let mut automation = self.shared.automation.write();
         automation.uploaded_bytes = automation.uploaded_bytes.saturating_add(uploaded_delta);
-        if uploaded_delta > 0 {
+        if uploaded_delta > 0 || downloaded {
             automation.last_activity_unix_seconds = Some(now_unix_seconds);
         }
         if stats.finished {
+            // A completed torrent restored from disk has no new payload activity.
+            // Completion supplies the baseline until the first upload.
+            automation
+                .last_activity_unix_seconds
+                .get_or_insert(now_unix_seconds);
             automation
                 .completed_at_unix_seconds
                 .get_or_insert(now_unix_seconds);
@@ -319,10 +332,18 @@ impl ManagedTorrent {
             automation.uploaded_bytes as f64 / stats.total_bytes as f64
         };
         let limit_reached = stats.finished
+            && !automation.force_start
             && (automation.ratio_limit.is_some_and(|limit| ratio >= limit)
                 || automation
                     .seeding_time_limit_seconds
-                    .is_some_and(|limit| automation.seeding_seconds >= limit));
+                    .is_some_and(|limit| automation.seeding_seconds >= limit)
+                || automation
+                    .inactive_seeding_time_limit_seconds
+                    .is_some_and(|limit| {
+                        automation
+                            .last_activity_unix_seconds
+                            .is_some_and(|last| now_unix_seconds.saturating_sub(last) >= limit)
+                    }));
         (stats, automation.clone(), limit_reached)
     }
 

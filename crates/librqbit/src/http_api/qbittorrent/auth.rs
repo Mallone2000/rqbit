@@ -159,7 +159,7 @@ pub(super) async fn login(State(state): State<ApiState>, request: Request) -> Re
         &login.password,
     ) {
         state.qbittorrent_sessions.record_login_failure(client_ip);
-        // Web API 2.8.1 predates the 2.14 change to a 401 response.
+        // Web API 2.9.2 predates the 2.14 change to a 401 response.
         return (StatusCode::OK, "Fails.").into_response();
     }
 
@@ -385,8 +385,11 @@ pub(in crate::http_api) async fn require_same_origin(
 
 fn request_source_matches_host(headers: &HeaderMap) -> bool {
     let source = headers.get(ORIGIN).or_else(|| headers.get(REFERER));
-    let Some(source) = source.and_then(|value| value.to_str().ok()) else {
+    let Some(source) = source else {
         return true;
+    };
+    let Ok(source) = source.to_str() else {
+        return false;
     };
     let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
         return false;
@@ -486,6 +489,9 @@ mod tests {
             super::ORIGIN,
             HeaderValue::from_str("https://attacker.example").unwrap(),
         );
+        assert!(!request_source_matches_host(&headers));
+
+        headers.insert(super::ORIGIN, HeaderValue::from_bytes(b"\xff").unwrap());
         assert!(!request_source_matches_host(&headers));
 
         headers.insert(

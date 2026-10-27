@@ -57,7 +57,7 @@ RQBIT_HTTP_API_LISTEN_ADDR=0.0.0.0:3030 \
 ```
 
 Connect clients using the qBittorrent Web API with the same host, port, and credentials. Categories retain rqbit's global download directory rather than moving content.
-For multi-file torrents stored in their own folder, the compatibility API reports the parent directory as `save_path` and the torrent folder as `content_path`. This lets Sonarr and Radarr import the torrent folder without scanning the shared download directory.
+For multi-file torrents stored in their own folder, the compatibility API reports the parent directory as `save_path` and the torrent folder as `content_path`. This lets Sonarr and Radarr import the torrent folder without scanning the shared download directory. File names from `/api/v2/torrents/files` are relative to the reported `save_path`, including the content folder, so Cleanuparr can address the same files.
 
 Cleanuparr can use those username/password credentials or an optional Bearer key. Set `RQBIT_QBITTORRENT_API_KEY` to a non-empty secret and enter the same value as Cleanuparr's qBittorrent API key. Username/password configuration remains required to enable the compatibility API and protects rqbit's native API; the Bearer key is accepted only on `/api/v2/` routes. Keep the key out of logs and deployment manifests.
 
@@ -73,7 +73,7 @@ The temporary `RQBIT_SONARR_*` and `RQBIT_RADARR_*` settings from the direct rec
 
 Torrent-add boolean fields (`paused`, `sequentialDownload`, and `firstLastPiecePrio`) accept case-insensitive `true`/`false` and `1`/`0` in both URL-encoded and multipart forms, including Radarr's `True`/`False` values. Invalid boolean values are rejected.
 
-This is not a full qBittorrent replacement. Queue ordering, sequential downloading, first/last-piece priority, and inactive-seeding-time limits are intentionally unsupported and fail explicitly.
+The compatibility profile advertises Web API 2.9.2. It supports sequential downloading, first/last 1% piece priority, `Original`/`Subfolder` content layout, and per-torrent inactive seeding limits. Force Start bypasses share limits until paused or explicitly cleared. These settings survive pending metadata resolution and restart. Queueing remains disabled, so queue-priority requests return 409 as in qBittorrent with queueing disabled. See the [source-based compatibility matrix and validation limits](AUTOMATION-COMPATIBILITY.md).
 
 For a production-oriented Gluetun, Sonarr, and Radarr configuration with shared `/data` paths and hardlinks, use the [automation stack deployment guide](docker/compose-examples/automation-stack.md).
 

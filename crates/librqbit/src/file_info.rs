@@ -33,6 +33,18 @@ impl FileInfo {
     pub fn iter_piece_priorities(&self) -> impl Iterator<Item = usize> {
         iter_piece_priorities(self.piece_range_usize())
     }
+
+    pub(crate) fn iter_edge_piece_priorities(
+        &self,
+        piece_length: u32,
+    ) -> impl Iterator<Item = usize> {
+        let range = self.piece_range_usize();
+        // qBittorrent prioritizes the first and last 1% of each wanted file.
+        let count = usize::try_from(self.len.div_ceil(u64::from(piece_length) * 100))
+            .unwrap_or(range.len())
+            .min(range.len());
+        (range.start..range.start + count).chain(range.end - count..range.end)
+    }
 }
 
 #[cfg(test)]

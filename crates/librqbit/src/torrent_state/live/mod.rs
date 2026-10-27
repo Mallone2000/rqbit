@@ -1434,12 +1434,15 @@ impl PeerHandler {
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
+                let automation = self.state.shared.automation.read();
                 let result = pieces.acquire_piece(AcquireRequest {
                     peer: self.addr,
                     peer_avg_time: self.counters.average_piece_download_time(),
                     priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                     file_priorities,
                     file_infos: &self.state.metadata.file_infos,
+                    sequential: automation.sequential_download,
+                    first_last: automation.first_last_piece_priority,
                     peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
                     can_steal: |p| {
                         self.state.per_piece_locks[p.get_usize()]

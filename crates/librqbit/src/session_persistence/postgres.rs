@@ -30,11 +30,12 @@ struct TorrentsTableRecord {
 }
 
 impl TorrentsTableRecord {
-    fn into_serialized_torrent(self) -> Option<(TorrentId, SerializedTorrent)> {
-        Some((
+    fn into_serialized_torrent(self) -> anyhow::Result<(TorrentId, SerializedTorrent)> {
+        Ok((
             self.id as TorrentId,
             SerializedTorrent {
-                info_hash: Id20::from_bytes(&self.info_hash).ok()?,
+                info_hash: Id20::from_bytes(&self.info_hash)
+                    .context("invalid stored torrent hash")?,
                 torrent_bytes: self.torrent_bytes.into(),
                 trackers: self.trackers.into_iter().collect(),
                 output_folder: PathBuf::from(self.output_folder),
@@ -42,7 +43,8 @@ impl TorrentsTableRecord {
                     .only_files
                     .map(|v| v.into_iter().map(|v| v as usize).collect()),
                 is_paused: self.is_paused,
-                automation: serde_json::from_str(&self.automation_metadata).unwrap_or_default(),
+                automation: serde_json::from_str(&self.automation_metadata)
+                    .context("invalid stored automation metadata")?,
             },
         ))
     }
@@ -234,7 +236,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .await
             .context("error executing SELECT * FROM torrents")?;
         row.into_serialized_torrent()
-            .context("bug")
+            .context("invalid stored torrent")
             .map(|(_, st)| st)
     }
 
@@ -298,8 +300,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .await
             .context("error executing SELECT * FROM torrents")?
             .into_iter()
-            .filter_map(TorrentsTableRecord::into_serialized_torrent)
-            .map(Ok);
+            .map(TorrentsTableRecord::into_serialized_torrent);
         Ok(futures::stream::iter(torrents).boxed())
     }
 }
@@ -457,5 +458,56 @@ impl BitVFactory for PostgresSessionStorage {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::TorrentsTableRecord;
+    use crate::TorrentAutomationMetadata;
+
+    fn row(automation_metadata: String) -> TorrentsTableRecord {
+        TorrentsTableRecord {
+            id: 1,
+            info_hash: vec![1; 20],
+            torrent_bytes: vec![],
+            trackers: vec![],
+            output_folder: "/downloads".to_owned(),
+            only_files: None,
+            is_paused: true,
+            automation_metadata,
+        }
+    }
+
+    #[test]
+    fn automation_settings_restore_without_silent_data_loss() {
+        let metadata = TorrentAutomationMetadata {
+            sequential_download: true,
+            first_last_piece_priority: true,
+            force_start: true,
+            use_subfolder: true,
+            inactive_seeding_time_limit_seconds: Some(600),
+            ..Default::default()
+        };
+        let (_, stored) = row(serde_json::to_string(&metadata).unwrap())
+            .into_serialized_torrent()
+            .unwrap();
+        let (_, options) = stored.into_add_torrent().unwrap();
+        assert_eq!(options.automation, metadata);
+        let (_, old) = row("{}".to_owned()).into_serialized_torrent().unwrap();
+        assert_eq!(
+            old.into_add_torrent().unwrap().1.automation,
+            TorrentAutomationMetadata::default()
+        );
+        assert!(
+            row("broken JSON".to_owned())
+                .into_serialized_torrent()
+                .is_err()
+        );
+        assert!(
+            row(r#"{"inactive_seeding_time_limit_seconds":"invalid"}"#.to_owned())
+                .into_serialized_torrent()
+                .is_err()
+        );
     }
 }

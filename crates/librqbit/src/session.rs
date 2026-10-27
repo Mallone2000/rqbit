@@ -960,16 +960,86 @@ impl Session {
         ratio_limit: Option<f64>,
         seeding_time_limit_seconds: Option<u64>,
     ) -> anyhow::Result<()> {
-        let torrent = self.get(id).context("no such torrent in db")?;
-        let old = torrent.automation_metadata();
-        torrent.set_automation_limits(ratio_limit, seeding_time_limit_seconds);
-        if let Some(persistence) = self.persistence.as_ref()
-            && let Err(error) = persistence.update_metadata(torrent.id(), &torrent).await
-        {
-            torrent.set_automation_limits(old.ratio_limit, old.seeding_time_limit_seconds);
-            return Err(error).context("error persisting automation limits");
+        self.set_torrent_automation_share_limits(
+            id,
+            Some(ratio_limit),
+            Some(seeding_time_limit_seconds),
+            None,
+        )
+        .await
+    }
+
+    /// Update compatibility settings under the same lock as pending-to-managed handoff.
+    async fn update_automation_settings(
+        &self,
+        id: TorrentIdOrHash,
+        update: impl Fn(&mut TorrentAutomationMetadata),
+    ) -> anyhow::Result<()> {
+        let _guard = self.pending_automation_mutations.lock().await;
+        if let Some(torrent) = self.get(id) {
+            let old = torrent.automation_metadata();
+            update(&mut torrent.shared.automation.write());
+            if let Some(persistence) = self.persistence.as_ref()
+                && let Err(error) = persistence.update_metadata(torrent.id(), &torrent).await
+            {
+                // Restore settings only; payload accounting may advance during the write.
+                let mut current = torrent.shared.automation.write();
+                current.ratio_limit = old.ratio_limit;
+                current.seeding_time_limit_seconds = old.seeding_time_limit_seconds;
+                current.inactive_seeding_time_limit_seconds =
+                    old.inactive_seeding_time_limit_seconds;
+                current.force_start = old.force_start;
+                return Err(error).context("error persisting automation settings");
+            }
+            return Ok(());
         }
+        let TorrentIdOrHash::Hash(hash) = id else {
+            bail!("no such torrent in db")
+        };
+        let mut pending = self
+            .db
+            .read()
+            .pending_automation_torrents
+            .get(&hash)
+            .cloned()
+            .context("no such torrent in db")?;
+        update(&mut pending.automation);
+        self.persist_pending_automation(&pending).await?;
+        self.db
+            .write()
+            .pending_automation_torrents
+            .insert(hash, pending);
         Ok(())
+    }
+
+    pub(crate) async fn set_torrent_force_start(
+        &self,
+        id: TorrentIdOrHash,
+        value: bool,
+    ) -> anyhow::Result<()> {
+        self.update_automation_settings(id, |metadata| metadata.force_start = value)
+            .await
+    }
+
+    pub(crate) async fn set_torrent_automation_share_limits(
+        &self,
+        id: TorrentIdOrHash,
+        ratio: Option<Option<f64>>,
+        total: Option<Option<u64>>,
+        inactive: Option<Option<u64>>,
+    ) -> anyhow::Result<()> {
+        self.update_automation_settings(id, |metadata| {
+            if let Some(value) = ratio {
+                metadata.ratio_limit = value;
+            }
+            if let Some(value) = total {
+                metadata.seeding_time_limit_seconds = value;
+            }
+            if let Some(value) = inactive {
+                metadata.inactive_seeding_time_limit_seconds = value;
+            }
+        })
+        .await
     }
 
     /// Create a new session with options.
@@ -2147,6 +2217,19 @@ impl Session {
         }
 
         let output_folder = match (opts.output_folder, opts.sub_folder) {
+            (None, None)
+                if opts.automation.use_subfolder
+                    && metadata.info.iter_file_details().count() == 1 =>
+            {
+                let folder = metadata
+                    .info
+                    .name()
+                    .context("torrent name is required for a subfolder")?;
+                let folder = Path::new(folder.as_ref());
+                validate_sub_folder(folder)?;
+                anyhow::ensure!(!folder.as_os_str().is_empty(), "empty torrent folder");
+                self.output_folder.join(folder)
+            }
             (None, None) => self.output_folder.join(
                 self.get_default_subfolder_for_torrent(&metadata.info, name.as_deref())?
                     .unwrap_or_default(),
@@ -3360,6 +3443,11 @@ mod tests {
                         category: "pending-tv".to_owned(),
                         ratio_limit: Some(1.5),
                         seeding_time_limit_seconds: Some(600),
+                        inactive_seeding_time_limit_seconds: Some(900),
+                        sequential_download: true,
+                        first_last_piece_priority: true,
+                        force_start: true,
+                        use_subfolder: true,
                         ..Default::default()
                     },
                     ..Default::default()
@@ -3410,6 +3498,14 @@ mod tests {
         assert_eq!(pending.automation.category, "pending-movies");
         assert_eq!(pending.automation.ratio_limit, Some(1.5));
         assert_eq!(pending.automation.seeding_time_limit_seconds, Some(600));
+        assert_eq!(
+            pending.automation.inactive_seeding_time_limit_seconds,
+            Some(900)
+        );
+        assert!(pending.automation.sequential_download);
+        assert!(pending.automation.first_last_piece_priority);
+        assert!(pending.automation.force_start);
+        assert!(pending.automation.use_subfolder);
         assert!(pending.next_retry_at_unix_seconds.is_none());
         let record = pending.serialized().unwrap();
         assert_eq!(record.magnet_url, magnet);
@@ -3530,6 +3626,28 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            session
+                .set_torrent_automation_share_limits(
+                    crate::api::TorrentIdOrHash::Hash(hash),
+                    Some(Some(2.0)),
+                    Some(Some(600)),
+                    Some(Some(300))
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            session
+                .set_torrent_force_start(crate::api::TorrentIdOrHash::Hash(hash), true)
+                .await
+                .is_err()
+        );
+        let metadata = session.pending_automation_torrents()[0].automation.clone();
+        assert_eq!(metadata.ratio_limit, None);
+        assert_eq!(metadata.seeding_time_limit_seconds, None);
+        assert_eq!(metadata.inactive_seeding_time_limit_seconds, None);
+        assert!(!metadata.force_start);
         assert!(!token.is_cancelled());
         let pending = session.pending_automation_torrents();
         assert_eq!(pending.len(), 1);

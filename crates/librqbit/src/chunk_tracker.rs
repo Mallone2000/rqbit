@@ -237,12 +237,27 @@ impl ChunkTracker {
         &'a self,
         file_priorities: &'a FilePriorities,
         file_infos: &'a FileInfos,
+        sequential: bool,
+        first_last: bool,
     ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
-        file_priorities
+        let edges = file_priorities
+            .iter()
+            .filter_map(|id| file_infos.get(*id))
+            .flat_map(|f| f.iter_edge_piece_priorities(self.lengths.default_piece_length()))
+            .take(if first_last { usize::MAX } else { 0 });
+        let normal = file_priorities
             .iter()
             .filter_map(|p| Some((*p, file_infos.get(*p)?)))
             .filter(|(id, f)| self.per_file_bytes[*id] != f.len)
-            .flat_map(|(_id, f)| f.iter_piece_priorities())
+            .flat_map(move |(_id, f)| {
+                if sequential {
+                    itertools::Either::Left(f.piece_range_usize())
+                } else {
+                    itertools::Either::Right(f.iter_piece_priorities())
+                }
+            });
+        edges
+            .chain(normal)
             .filter(|id| self.queue_pieces[*id])
             .filter_map(|id| id.try_into().ok())
             .filter_map(|id| self.lengths.validate_piece_index(id))
