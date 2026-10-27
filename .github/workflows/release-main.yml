@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      msi-version: ${{ steps.version.outputs.msi-version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -65,8 +66,15 @@ jobs:
               if "source" not in package and package["version"] != version:
                   raise SystemExit(f"{package['name']} has a mismatched lockfile version")
 
+          # MSI versions cannot contain the fork's textual prerelease suffix.
+          msi_parts = tuple(map(int, match.groups()))
+          if any(part > limit for part, limit in zip(msi_parts, (255, 255, 65535, 65535))):
+              raise SystemExit(f"Version exceeds MSI limits: {version}")
+          msi_version = ".".join(map(str, msi_parts))
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               print(f"tag=v{version}", file=output)
+              print(f"msi-version={msi_version}", file=output)
           PY
 
       - name: Reject an existing release tag
@@ -229,7 +237,13 @@ jobs:
 
       - name: cargo tauri build
         working-directory: desktop
-        run: cargo tauri build --ci
+        env:
+          MSI_VERSION: ${{ needs.check-version.outputs.msi-version }}
+        run: |
+          $config = @{ bundle = @{ windows = @{ wix = @{ version = $env:MSI_VERSION } } } }
+          $configPath = Join-Path $env:RUNNER_TEMP "tauri-windows.json"
+          $config | ConvertTo-Json -Depth 4 | Set-Content -Path $configPath
+          cargo tauri build --ci --config $configPath
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
