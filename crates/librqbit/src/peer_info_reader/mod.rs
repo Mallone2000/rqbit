@@ -84,8 +84,8 @@ struct HandlerLocked {
 
 impl HandlerLocked {
     fn new(metadata_size: u32) -> anyhow::Result<Self> {
-        if metadata_size > 32 * 1024 * 1024 {
-            anyhow::bail!("metadata size {} is too big", metadata_size);
+        if metadata_size == 0 || metadata_size > 32 * 1024 * 1024 {
+            anyhow::bail!("invalid metadata size {}", metadata_size);
         }
         let buffer = vec![0u8; metadata_size as usize];
         let total_pieces: usize = (metadata_size as u64)
@@ -184,14 +184,19 @@ impl PeerConnectionHandler for Handler {
         trace!("{}: received message: {:?}", self.addr, msg);
 
         if let Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data(utdata))) = msg {
-            let piece_ready = self
-                .locked
-                .write()
-                .as_mut()
-                .unwrap()
-                .record_piece(&utdata, &self.info_hash)?;
-            if piece_ready {
-                let buf = Bytes::from(self.locked.write().take().unwrap().buffer);
+            let completed = {
+                let mut locked = self.locked.write();
+                let inner = locked.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("metadata received without an active metadata handshake")
+                })?;
+                if inner.record_piece(&utdata, &self.info_hash)? {
+                    locked.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(completed) = completed {
+                let buf = Bytes::from(completed.buffer);
                 let info = from_bytes::<TorrentMetaV1Info<ByteBuf>>(&buf)
                     .map(|i| {
                         use clone_to_owned::CloneToOwned;
@@ -235,15 +240,29 @@ impl PeerConnectionHandler for Handler {
             anyhow::bail!("peer does not support ut_metadata");
         }
 
+        let total_pieces = {
+            let mut locked = self.locked.write();
+            if let Some(inner) = locked.as_ref() {
+                // BEP 10 permits repeated handshakes. They must not reset received
+                // pieces or enqueue another complete batch of metadata requests.
+                if inner.metadata_size != metadata_size {
+                    anyhow::bail!("peer changed metadata size during transfer");
+                }
+                return Ok(());
+            }
+            if self.result_tx.lock().is_none() {
+                anyhow::bail!("metadata transfer already completed");
+            }
+            let inner = HandlerLocked::new(metadata_size)?;
+            let total_pieces = inner.total_pieces;
+            *locked = Some(inner);
+            total_pieces
+        };
+
         self.writer_tx
             .send(WriterRequest::Message(Message::Unchoke))?;
         self.writer_tx
             .send(WriterRequest::Message(Message::Interested))?;
-
-        let inner = HandlerLocked::new(metadata_size)?;
-        let total_pieces = inner.total_pieces;
-
-        self.locked.write().replace(inner);
 
         for i in 0..total_pieces {
             self.writer_tx
@@ -260,5 +279,93 @@ impl PeerConnectionHandler for Handler {
 
     fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handler(info: &[u8]) -> (Handler, tokio::sync::mpsc::UnboundedReceiver<WriterRequest>) {
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (result_tx, _) = tokio::sync::oneshot::channel();
+        let mut hash = Sha1::new();
+        hash.update(info);
+        (
+            Handler {
+                addr: "127.0.0.1:1234".parse().unwrap(),
+                info_hash: Id20::new(hash.finish()),
+                writer_tx,
+                result_tx: Mutex::new(Some(result_tx)),
+                locked: RwLock::new(None),
+                client_name_and_version: "test".into(),
+            },
+            writer_rx,
+        )
+    }
+
+    fn data(bytes: &[u8]) -> Message<'_> {
+        Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data(
+            UtMetadataData::from_bytes(0, bytes.len().try_into().unwrap(), ByteBuf(bytes)),
+        )))
+    }
+
+    #[tokio::test]
+    async fn unsolicited_metadata_is_rejected_without_panicking() {
+        let (handler, _writer_rx) = handler(b"x");
+        assert!(handler.on_received_message(data(b"x")).await.is_err());
+    }
+
+    #[test]
+    fn metadata_size_must_be_nonzero_and_bounded() {
+        for size in [0, 32 * 1024 * 1024 + 1, u32::MAX] {
+            assert!(HandlerLocked::new(size).is_err());
+        }
+        assert!(HandlerLocked::new(1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn repeated_handshakes_preserve_progress_and_do_not_queue_more_requests() {
+        let bytes = vec![b'x'; CHUNK_SIZE as usize + 1];
+        let (handler, mut writer_rx) = handler(&bytes);
+        let mut handshake = ExtendedHandshake::new();
+        handshake.metadata_size = Some(bytes.len().try_into().unwrap());
+        handler.on_extended_handshake(&handshake).unwrap();
+        while writer_rx.try_recv().is_ok() {}
+        let piece = UtMetadataData::from_bytes(
+            0,
+            bytes.len().try_into().unwrap(),
+            ByteBuf(&bytes[..CHUNK_SIZE as usize]),
+        );
+        handler
+            .on_received_message(Message::Extended(ExtendedMessage::UtMetadata(
+                UtMetadata::Data(piece),
+            )))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            handler.on_extended_handshake(&handshake).unwrap();
+        }
+        assert!(writer_rx.try_recv().is_err());
+        assert!(handler.locked.read().as_ref().unwrap().received_pieces[0]);
+        handshake.metadata_size = Some(1);
+        assert!(handler.on_extended_handshake(&handshake).is_err());
+        assert!(handler.locked.read().as_ref().unwrap().received_pieces[0]);
+    }
+
+    #[tokio::test]
+    async fn completed_metadata_cannot_be_replayed_or_restarted() {
+        let bytes = b"d6:lengthi1e4:name1:a12:piece lengthi1e6:pieces20:00000000000000000000e";
+        let (handler, _writer_rx) = handler(bytes);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        *handler.result_tx.lock() = Some(result_tx);
+        let mut handshake = ExtendedHandshake::new();
+        handshake.metadata_size = Some(bytes.len().try_into().unwrap());
+        handler.on_extended_handshake(&handshake).unwrap();
+        handler.on_received_message(data(bytes)).await.unwrap();
+        assert!(result_rx.await.unwrap().is_ok());
+        assert!(handler.on_received_message(data(bytes)).await.is_err());
+        assert!(handler.on_extended_handshake(&handshake).is_err());
+        assert!(handler.locked.read().is_none());
     }
 }

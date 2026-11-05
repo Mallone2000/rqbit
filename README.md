@@ -51,6 +51,10 @@ Downloaded active content such as HTML, SVG, scripts, and PDFs is served as an a
 
 Authentication failures remain counted when successful background Basic/Bearer API requests arrive from the same address; a successful form login clears earlier failures.
 
+Both Web UI and qBittorrent login forms must finish uploading within 10 seconds
+and fit within 8 KiB. Slow login bodies receive HTTP 408 without creating a session;
+the deadline does not apply to authenticated torrent uploads or streaming.
+
 The web UI supports authenticated login and logout. It provides torrent management, streaming, log viewing, settings, category management, and the server's public IP address. After the UI is authenticated, rqbit obtains that address through an outbound HTTPS request to `api64.ipify.org`; if the lookup is unavailable, the UI continues without displaying it.
 
 ## qBittorrent Web API compatibility

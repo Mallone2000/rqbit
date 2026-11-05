@@ -891,6 +891,82 @@ mod tests {
 
     #[cfg(feature = "webui")]
     #[tokio::test]
+    async fn slow_login_bodies_time_out_without_issuing_sessions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+        let addr = listener.bind_addr();
+        let server = tokio::spawn(
+            HttpApi::new(
+                Api::new(session.clone(), None, None),
+                Some(HttpApiOptions {
+                    basic_auth: Some(("user".into(), "secret".into())),
+                    enable_qbittorrent_api: true,
+                    ..Default::default()
+                }),
+            )
+            .make_http_api_and_run(listener, None),
+        );
+        let check = |path: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST /{path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 29\r\n\r\nusername=user&"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            // A timed-out HTTP/1 request must close, rather than continuing to
+            // drain an attacker-controlled unfinished body for connection reuse.
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                stream.read_to_end(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let response = std::str::from_utf8(&response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+            assert!(!response.to_ascii_lowercase().contains("set-cookie:"));
+        };
+        tokio::join!(check("web/auth/login"), check("api/v2/auth/login"));
+        let client = reqwest::Client::new();
+        for path in ["web/auth/login", "api/v2/auth/login"] {
+            let response = client
+                .post(format!("http://{addr}/{path}"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("username=user&password=secret")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            assert!(response.headers().contains_key("set-cookie"));
+        }
+        server.abort();
+        session.stop().await;
+    }
+
+    #[cfg(feature = "webui")]
+    #[tokio::test]
     async fn logins_rotate_presented_sessions_and_block_sibling_browser_requests() {
         let downloads = tempfile::tempdir().unwrap();
         let session = Session::new_with_opts(

@@ -154,3 +154,59 @@ must still be verified in the actual deployment. No deployment was performed.
 - Linux desktop builds, frontend browser execution, a new Docker image, and the
   deployed TLS/reverse-proxy configuration were not verified in this follow-up.
   Nothing was pushed or deployed.
+
+## Additional boundary review — 2026-11-05
+
+- Web UI and qBittorrent login form reads now have a 10-second deadline in
+  addition to the existing 8 KiB limit. An unfinished body returns HTTP 408 and
+  cannot issue a session; HTTP/1 connections are closed rather than draining the
+  unfinished body for reuse. This limits how long unauthenticated slow bodies retain
+  login-handler resources; it is not a global connection/concurrency limit.
+  Authenticated uploads and long-lived streaming keep their existing behavior.
+- A peer could send a validly encoded `ut_metadata` data message before the
+  extended handshake and reach an `unwrap()` on absent transfer state. A second
+  data message after completion could reach the same assumption. Release builds
+  abort on panic, making this a remotely triggerable denial of service during
+  magnet metadata discovery. Both cases now return connection errors.
+- Repeated metadata handshakes retain received pieces and do not allocate a new
+  buffer or enqueue another full set of requests. Peers that change metadata size
+  during transfer are disconnected, as are handshakes after completion. Zero-size
+  metadata is rejected before initialization. Normal initial handshakes and
+  verified metadata completion remain supported.
+- Refreshed npm audit reports zero vulnerabilities. Refreshed RustSec still
+  reports ringbuf 0.4.8, desktop glib unsoundness, and the maintenance notices
+  documented above. `cargo info librqbit-utp` resolves to 0.7.0. No dependency
+  findings were suppressed; these findings remain unresolved. Fixing those chains
+  needs a maintained backport or dependency migration with appropriate platform
+  testing, rather than an unchecked incompatible version override.
+- The existing HTTP security tests cover valid/invalid/missing credentials,
+  Basic/Bearer scope, session rotation, revocation and expiry, cookie security,
+  throttling and browser-origin checks. This review did not establish an
+  authentication bypass. Passing those checks is not proof that authentication
+  is unbreachable.
+
+The workspace version advances to `9.0.1-servarr.14`. No changes were pushed or
+deployed, and production HTTPS/proxy settings and Linux desktop behavior remain
+outside the validation performed here.
+
+### Additional review validation
+
+- `CARGO_INCREMENTAL=0 cargo test --workspace --exclude rqbit-desktop --offline -- --test-threads=1`
+  passed: 308 tests passed, none failed, 11 ignored. This includes
+  HTTP compatibility/authentication, persistence and TCP/uTP transfer tests.
+- `cargo fmt --all -- --check`, `git diff --check`, `cargo check --offline`, and
+  `CARGO_INCREMENTAL=0 cargo clippy --all-targets --offline` passed. Clippy retains
+  only the existing JSON persistence `fetch_update` deprecation warning.
+- Final targeted HTTP authentication tests passed (11), including real socket
+  checks that both slow login endpoints return 408, close the connection, issue
+  no cookie, and still accept subsequent valid logins. Final peer metadata
+  regression tests passed (4), covering unsolicited/replayed data, zero/oversized
+  metadata, repeated handshakes and successful completion.
+- `npm test --workspace crates/librqbit/webui` passed all 48 tests. The refreshed
+  `npm audit` reports zero vulnerabilities; `cargo audit` still exits unsuccessfully
+  for the unresolved findings above.
+- An initial reduced-feature Rust test command exposed the pre-existing requirement
+  for `tracing-subscriber-utils` in HTTP handlers/tests; the corrected feature set
+  compiled and passed. Broader attempts initially ran out of disk space and lacked
+  permission to bind test sockets. Generated project build artifacts were cleared
+  and tests were rerun with local socket access.

@@ -30,6 +30,28 @@ const AUTH_BAN_DURATION: Duration = Duration::from_secs(60 * 60);
 const MAX_AUTH_FAILURES: u8 = 5;
 const MAX_TRACKED_CLIENTS: usize = 1024;
 const MAX_PUBLIC_IP_RESPONSE_SIZE: usize = 64;
+const LOGIN_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn read_login(request: Request, state: &ApiState) -> Result<Login, Box<Response>> {
+    // A size limit alone does not bound unauthenticated slow request bodies.
+    match tokio::time::timeout(
+        LOGIN_BODY_TIMEOUT,
+        Form::<Login>::from_request(request, state),
+    )
+    .await
+    {
+        Ok(Ok(Form(login))) => Ok(login),
+        Ok(Err(error)) => Err(Box::new(error.into_response())),
+        Err(_) => Err(Box::new(
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                [(http::header::CONNECTION, "close")],
+                "Login request timed out",
+            )
+                .into_response(),
+        )),
+    }
+}
 
 struct AuthFailures {
     count: u8,
@@ -183,9 +205,9 @@ pub(super) async fn login(State(state): State<ApiState>, request: Request) -> Re
         return (StatusCode::TOO_MANY_REQUESTS, "Fails.").into_response();
     }
     let previous_sid = sid_from_headers(request.headers()).map(str::to_owned);
-    let Form(login) = match Form::<Login>::from_request(request, &state).await {
+    let login = match read_login(request, &state).await {
         Ok(login) => login,
-        Err(error) => return error.into_response(),
+        Err(response) => return *response,
     };
 
     // Reading a body yields. A ban may have been established by another request
@@ -312,9 +334,9 @@ pub(in crate::http_api) async fn web_login(
             .into_response();
     }
     let previous_sid = sid_from_headers(request.headers()).map(str::to_owned);
-    let Form(login) = match Form::<Login>::from_request(request, &state).await {
+    let login = match read_login(request, &state).await {
         Ok(login) => login,
-        Err(error) => return error.into_response(),
+        Err(response) => return *response,
     };
 
     // Reading a body yields. A ban may have been established by another request
