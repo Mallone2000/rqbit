@@ -260,7 +260,17 @@ async fn set_preferences(
                 .set_excluded_file_names(enabled, patterns)
                 .await
                 .map_err(|e| {
-                    QbitError::internal(StatusCode::BAD_REQUEST, "invalid excluded file names", e)
+                    if let Some(validation) =
+                        e.downcast_ref::<crate::session::ExcludedFileNamesError>()
+                    {
+                        QbitError::bad_request(validation.to_string())
+                    } else {
+                        QbitError::internal(
+                            StatusCode::CONFLICT,
+                            "could not persist excluded file names",
+                            e,
+                        )
+                    }
                 })?;
         }
         return Ok(StatusCode::OK);
@@ -272,7 +282,7 @@ async fn set_preferences(
         enabled.unwrap_or(old_filter.0),
         patterns.clone().unwrap_or(old_filter.1),
     )
-    .map_err(|_| QbitError::bad_request("invalid excluded file names"))?;
+    .map_err(|e| QbitError::bad_request(e.to_string()))?;
     state
         .api
         .session()
@@ -2117,6 +2127,111 @@ mod tests {
         .make_http_api_and_run(listener, None);
         let task = tokio::spawn(async move { server.await.unwrap() });
         (format!("http://{address}/api/v2"), task)
+    }
+
+    #[tokio::test]
+    async fn large_exclusion_preferences_survive_restart_and_report_save_failures() {
+        let downloads = tempfile::tempdir().unwrap();
+        let persistence = tempfile::tempdir().unwrap();
+        let make_session = || {
+            Session::new_with_opts(
+                downloads.path().to_path_buf(),
+                SessionOptions {
+                    dht: None,
+                    listen: None,
+                    disable_local_service_discovery: true,
+                    persistence: Some(SessionPersistenceConfig::Json {
+                        folder: Some(persistence.path().to_path_buf()),
+                    }),
+                    ..Default::default()
+                },
+            )
+        };
+        let session = make_session().await.unwrap();
+        let (base, server) = start_full_http_api(session.clone(), true).await;
+        let client = reqwest::Client::new();
+        let patterns = (0..1024)
+            .map(|index| format!("*.blocked{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Exercise both the filter-only and atomic queue/filter request paths.
+        for with_queue in [false, true] {
+            let mut settings = serde_json::json!({
+                "excluded_file_names_enabled": true,
+                "excluded_file_names": patterns,
+            });
+            if with_queue {
+                settings["max_active_downloads"] = 7.into();
+            }
+            let response = client
+                .post(format!("{base}/app/setPreferences"))
+                .basic_auth("test", Some("secret"))
+                .form(&[("json", settings.to_string())])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+        assert_eq!(session.excluded_file_names(), (true, patterns.clone()));
+
+        let blocked = persistence.path().join("session.json.tmp");
+        crate::session_persistence::block_json_writes(&blocked).await;
+        for (invalid, status, message) in [
+            (
+                "*.exe".to_owned(),
+                reqwest::StatusCode::CONFLICT,
+                "could not persist excluded file names",
+            ),
+            (
+                "*\n".repeat(4097),
+                reqwest::StatusCode::BAD_REQUEST,
+                "excluded file names exceed 4096 patterns",
+            ),
+            (
+                "x".repeat(64 * 1024 + 1),
+                reqwest::StatusCode::BAD_REQUEST,
+                "excluded file names exceed 64 KiB",
+            ),
+            (
+                "[z-a]".to_owned(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "invalid excluded file name wildcard pattern",
+            ),
+        ] {
+            for with_queue in [false, true] {
+                let mut settings = serde_json::json!({
+                    "excluded_file_names": invalid,
+                    "excluded_file_names_enabled": false,
+                });
+                if with_queue {
+                    settings["max_active_downloads"] = 3.into();
+                }
+                let response = client
+                    .post(format!("{base}/app/setPreferences"))
+                    .basic_auth("test", Some("secret"))
+                    .form(&[("json", settings.to_string())])
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status);
+                let expected_message = if with_queue && status == reqwest::StatusCode::CONFLICT {
+                    "could not persist preferences"
+                } else {
+                    message
+                };
+                assert_eq!(response.text().await.unwrap(), expected_message);
+                assert_eq!(session.excluded_file_names(), (true, patterns.clone()));
+                assert_eq!(session.queue_config().max_active_downloads, 7);
+            }
+        }
+        std::fs::remove_dir(&blocked).unwrap();
+        server.abort();
+        session.stop().await;
+        drop(session);
+        let restored = make_session().await.unwrap();
+        assert_eq!(restored.excluded_file_names(), (true, patterns));
+        assert_eq!(restored.queue_config().max_active_downloads, 7);
+        restored.stop().await;
     }
 
     #[tokio::test]

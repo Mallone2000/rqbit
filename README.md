@@ -75,6 +75,25 @@ The compatibility API also exposes file priorities, private-torrent status, tags
 
 Cleanuparr's blacklist synchronizer writes qBittorrent's `excluded_file_names` preference. This fork stores those newline-separated wildcard patterns but leaves `excluded_file_names_enabled` off by default; enable it explicitly through `/api/v2/app/setPreferences` if you want future additions filtered. Matching is case-insensitive and checks file and parent directory names. The setting applies to CLI, watch-folder, native API, and qBittorrent additions; it does not change file selections already saved for existing torrents.
 
+Exclusion lists support up to 4096 non-empty patterns and 64 KiB of text, including
+when filtering is disabled. This accommodates Cleanuparr's standard blacklist.
+Invalid or oversized lists return HTTP 400 with a sanitized validation reason;
+failure to save valid exclusions returns HTTP 409 and preserves the previous
+settings. An hourly exclusion warning on older versions can be caused by their
+256-pattern limit; check the synchronizer's HTTP response to distinguish a list
+validation failure from an unwritable persistence directory.
+
+After a container restart, `Could not initialize torrent files` with `Permission
+denied` means the container user cannot access the saved download files or their
+parent directories. Check the running container's UID/GID against the bind-mounted
+downloads and state directories, including existing files; see the deployment
+guide's user and permissions setup. Missing `.torrent` files in the session
+directory cause restoration to fall back to magnet discovery; preserve the whole
+state directory in backups. Metadata timeouts mean no verified metadata arrived
+within the discovery deadline, and do not establish corruption. A non-empty
+download directory is deliberately retained during deletion to preserve remaining
+files.
+
 The temporary `RQBIT_SONARR_*` and `RQBIT_RADARR_*` settings from the direct recovery build are no longer read. Remove those service keys from rqbit's environment and configure the connections in Cleanuparr instead. Pending jobs saved by that build remain readable; their recovery progress is ignored, and timed-out jobs remain available for external cleanup.
 
 Torrent-add boolean fields (`paused`, `sequentialDownload`, and `firstLastPiecePrio`) accept case-insensitive `true`/`false` and `1`/`0` in both URL-encoded and multipart forms, including Radarr's `True`/`False` values. Invalid boolean values are rejected.

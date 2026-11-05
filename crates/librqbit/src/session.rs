@@ -281,15 +281,27 @@ pub(crate) struct ExcludedFileNames {
     compiled: Vec<regex::Regex>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ExcludedFileNamesError {
+    #[error("excluded file names exceed 64 KiB")]
+    TooLong,
+    #[error("excluded file names exceed 4096 patterns")]
+    TooManyPatterns,
+    #[error("invalid excluded file name wildcard pattern")]
+    InvalidPattern,
+}
+
 impl ExcludedFileNames {
-    pub(crate) fn new(enabled: bool, patterns: String) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            patterns.len() <= 64 * 1024,
-            "excluded file names are too long"
-        );
+    pub(crate) fn new(enabled: bool, patterns: String) -> Result<Self, ExcludedFileNamesError> {
+        if patterns.len() > 64 * 1024 {
+            return Err(ExcludedFileNamesError::TooLong);
+        }
         let mut compiled = Vec::new();
         for pattern in patterns.lines().map(str::trim).filter(|p| !p.is_empty()) {
-            anyhow::ensure!(compiled.len() < 256, "too many excluded file name patterns");
+            // Cleanuparr's standard blacklist has more than 800 entries.
+            if compiled.len() >= 4096 {
+                return Err(ExcludedFileNamesError::TooManyPatterns);
+            }
             let mut expression = String::from("(?i)^");
             let mut chars = pattern.chars().peekable();
             while let Some(ch) = chars.next() {
@@ -327,7 +339,10 @@ impl ExcludedFileNames {
                 }
             }
             expression.push('$');
-            compiled.push(regex::Regex::new(&expression)?);
+            compiled.push(
+                regex::Regex::new(&expression)
+                    .map_err(|_| ExcludedFileNamesError::InvalidPattern)?,
+            );
         }
         Ok(Self {
             enabled,
@@ -3053,6 +3068,29 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn excluded_file_names_accept_large_lists_and_enforce_resource_limits() {
+        let patterns = (0..4096)
+            .map(|index| format!("*.blocked{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let settings = super::ExcludedFileNames::new(true, patterns.clone()).unwrap();
+        assert!(settings.excludes(std::path::Path::new("Movie/file.blocked4095")));
+        assert!(!settings.excludes(std::path::Path::new("Movie/video.mkv")));
+        assert!(matches!(
+            super::ExcludedFileNames::new(true, format!("{patterns}\n*.extra")),
+            Err(super::ExcludedFileNamesError::TooManyPatterns)
+        ));
+        assert!(matches!(
+            super::ExcludedFileNames::new(false, "x".repeat(64 * 1024 + 1)),
+            Err(super::ExcludedFileNamesError::TooLong)
+        ));
+        assert!(matches!(
+            super::ExcludedFileNames::new(true, "[z-a]".to_owned()),
+            Err(super::ExcludedFileNamesError::InvalidPattern)
+        ));
+    }
+
     #[test]
     fn excluded_file_names_match_case_insensitive_files_and_parent_directories() {
         let settings =
