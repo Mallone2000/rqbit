@@ -397,7 +397,7 @@ mod tests {
             info: bencode::WithRawBytes {
                 data: TorrentMetaV1Info {
                     name: name.map(|n| n.as_bytes().into()),
-                    pieces: b""[..].into(),
+                    pieces: vec![0; files.len() * 20].into(),
                     piece_length: 1,
                     length: None,
                     md5sum: None,

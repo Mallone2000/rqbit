@@ -14,6 +14,12 @@ pub enum Error {
     BadTorrentInvalidPathComponent,
     #[error("torrent with 0 length is useless")]
     BadTorrentZeroLength,
+    #[error("torrent piece length must be non-zero")]
+    BadTorrentZeroPieceLength,
+    #[error("torrent length exceeds supported piece or chunk counts")]
+    BadTorrentLengthOverflow,
+    #[error("torrent piece hashes do not match its declared length")]
+    BadTorrentPieceHashes,
     #[error("invalid piece index {0}")]
     InvalidPieceIndex(u32),
     #[error("no files in torrent")]

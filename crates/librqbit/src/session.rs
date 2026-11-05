@@ -3186,6 +3186,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            // Finish reading the request before responding: newer HTTP clients
+            // reject an unsolicited response sent immediately after accept().
+            let mut request_headers = Vec::new();
+            while !request_headers.ends_with(b"\r\n\r\n") {
+                assert!(request_headers.len() < 8192);
+                request_headers.push(tokio::io::AsyncReadExt::read_u8(&mut stream).await.unwrap());
+            }
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 MAX_REMOTE_TORRENT_SIZE + 1

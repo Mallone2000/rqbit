@@ -77,7 +77,8 @@ impl Lengths {
         let total_length = torrent
             .iter_file_details_raw(encoding_rs::UTF_8)?
             .map(|d| d.len)
-            .sum();
+            .try_fold(0u64, |total, length| total.checked_add(length))
+            .ok_or(Error::BadTorrentLengthOverflow)?;
         Lengths::new(total_length, torrent.piece_length)
     }
 
@@ -85,13 +86,26 @@ impl Lengths {
         if total_length == 0 {
             return Err(Error::BadTorrentZeroLength);
         }
-        let total_pieces = total_length.div_ceil(piece_length as u64) as u32;
+        if piece_length == 0 {
+            return Err(Error::BadTorrentZeroPieceLength);
+        }
+        // Counts and absolute chunk indices are u32 throughout the engine.
+        // Validate before narrowing, allocating bitfields, or doing arithmetic.
+        let total_pieces = u32::try_from(total_length.div_ceil(piece_length as u64))
+            .map_err(|_| Error::BadTorrentLengthOverflow)?;
+        let chunks_per_piece = (piece_length as u64).div_ceil(CHUNK_SIZE as u64);
+        let last_piece_length = last_element_size(total_length, piece_length as u64) as u32;
+        let total_chunks = (total_pieces as u64 - 1) * chunks_per_piece
+            + (last_piece_length as u64).div_ceil(CHUNK_SIZE as u64);
+        if total_chunks > u32::MAX as u64 {
+            return Err(Error::BadTorrentLengthOverflow);
+        }
         Ok(Self {
             piece_length,
             total_length,
-            chunks_per_piece: (piece_length as u64).div_ceil(CHUNK_SIZE as u64) as u32,
+            chunks_per_piece: chunks_per_piece as u32,
             last_piece_id: total_pieces - 1,
-            last_piece_length: last_element_size(total_length, piece_length as u64) as u32,
+            last_piece_length,
         })
     }
 
@@ -161,7 +175,7 @@ impl Lengths {
     pub fn iter_pieces_within_offset(&self, offset_bytes: u64, len: u64) -> std::ops::Range<u32> {
         // Validation and correction
         let offset_bytes = offset_bytes.min(self.total_length);
-        let end_bytes = (offset_bytes + len).min(self.total_length);
+        let end_bytes = offset_bytes.saturating_add(len).min(self.total_length);
 
         let start_piece_id = (offset_bytes / self.piece_length as u64) as u32;
         let end_piece_id = if end_bytes == offset_bytes {
@@ -299,6 +313,65 @@ mod tests {
 
     fn make_lengths() -> Lengths {
         Lengths::new(1174243328, 262144).unwrap()
+    }
+
+    #[test]
+    fn rejects_untrusted_lengths_before_arithmetic_or_narrowing() {
+        assert!(matches!(
+            Lengths::new(1, 0),
+            Err(Error::BadTorrentZeroPieceLength)
+        ));
+        assert!(matches!(
+            Lengths::new(u64::MAX, 1),
+            Err(Error::BadTorrentLengthOverflow)
+        ));
+        assert!(matches!(
+            Lengths::new(u32::MAX as u64 + 1, 1),
+            Err(Error::BadTorrentLengthOverflow)
+        ));
+        assert!(matches!(
+            Lengths::new(u64::MAX, u32::MAX),
+            Err(Error::BadTorrentLengthOverflow)
+        ));
+        // Piece count fits, but the absolute chunk indices do not.
+        assert!(matches!(
+            Lengths::new(u32::MAX as u64 * 32768, 32768),
+            Err(Error::BadTorrentLengthOverflow)
+        ));
+        let lengths = Lengths::new(u32::MAX as u64, 1).unwrap();
+        assert_eq!(lengths.total_pieces(), u32::MAX);
+        assert_eq!(lengths.total_chunks(), u32::MAX);
+        let lengths = Lengths::new(100, 10).unwrap();
+        assert_eq!(lengths.iter_pieces_within_offset(50, u64::MAX), 5..10);
+    }
+
+    #[test]
+    fn rejects_overflowing_sum_of_file_lengths() {
+        use crate::torrent_metainfo::{TorrentMetaV1File, TorrentMetaV1Info};
+        let info = TorrentMetaV1Info::<Vec<u8>> {
+            piece_length: 16384,
+            files: Some(vec![
+                TorrentMetaV1File {
+                    length: u64::MAX,
+                    path: vec![b"a".to_vec()],
+                    attr: None,
+                    sha1: None,
+                    symlink_path: None,
+                },
+                TorrentMetaV1File {
+                    length: 1,
+                    path: vec![b"b".to_vec()],
+                    attr: None,
+                    sha1: None,
+                    symlink_path: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            info.validate(),
+            Err(Error::BadTorrentLengthOverflow)
+        ));
     }
 
     #[test]

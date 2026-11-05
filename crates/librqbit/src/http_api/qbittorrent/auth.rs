@@ -23,6 +23,7 @@ use super::ApiState;
 use crate::http_api::credentials_match_basic;
 
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
+const SESSION_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_SESSIONS: usize = 256;
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 const AUTH_BAN_DURATION: Duration = Duration::from_secs(60 * 60);
@@ -37,34 +38,54 @@ struct AuthFailures {
     banned_until: Option<Instant>,
 }
 
+struct SessionEntry {
+    expires: Instant,
+    last_used: Instant,
+}
+
+impl SessionEntry {
+    fn is_active(&self, now: Instant) -> bool {
+        self.expires > now && now.duration_since(self.last_used) < SESSION_IDLE_TTL
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Sessions {
-    entries: Mutex<HashMap<[u8; 32], Instant>>,
+    entries: Mutex<HashMap<[u8; 32], SessionEntry>>,
     auth_failures: Mutex<HashMap<Option<IpAddr>, AuthFailures>>,
 }
 
 impl Sessions {
-    fn issue(&self) -> String {
+    fn issue(&self, previous_sid: Option<&str>) -> String {
         let now = Instant::now();
         let mut entries = self.entries.lock();
-        entries.retain(|_, expires| *expires > now);
+        entries.retain(|_, entry| entry.is_active(now));
+        if let Some(sid) = previous_sid {
+            entries.remove(&crate::http_api::credential_digest(sid));
+        }
         if entries.len() >= MAX_SESSIONS
             && let Some(oldest) = entries
                 .iter()
-                .min_by_key(|(_, expires)| **expires)
+                .min_by_key(|(_, entry)| entry.expires)
                 .map(|(sid, _)| *sid)
         {
             entries.remove(&oldest);
         }
         let sid = hex::encode(rand::random::<[u8; 32]>());
-        entries.insert(crate::http_api::credential_digest(&sid), now + SESSION_TTL);
+        entries.insert(
+            crate::http_api::credential_digest(&sid),
+            SessionEntry {
+                expires: now + SESSION_TTL,
+                last_used: now,
+            },
+        );
         sid
     }
 
     fn is_valid(&self, sid: &str) -> bool {
         let now = Instant::now();
         let mut entries = self.entries.lock();
-        entries.retain(|_, expires| *expires > now);
+        entries.retain(|_, entry| entry.is_active(now));
         if sid.len() != 64 || !sid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return false;
         }
@@ -72,8 +93,12 @@ impl Sessions {
         // Scan the bounded store without secret-dependent early returns. Raw session
         // credentials are never retained in the server's session records.
         let mut found = subtle::Choice::from(0);
-        for expected in entries.keys() {
-            found |= expected.ct_eq(&supplied);
+        for (expected, entry) in entries.iter_mut() {
+            let matches = expected.ct_eq(&supplied);
+            if bool::from(matches) {
+                entry.last_used = now;
+            }
+            found |= matches;
         }
         bool::from(found)
     }
@@ -157,6 +182,7 @@ pub(super) async fn login(State(state): State<ApiState>, request: Request) -> Re
     if !state.qbittorrent_sessions.login_is_allowed(client_ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "Fails.").into_response();
     }
+    let previous_sid = sid_from_headers(request.headers()).map(str::to_owned);
     let Form(login) = match Form::<Login>::from_request(request, &state).await {
         Ok(login) => login,
         Err(error) => return error.into_response(),
@@ -180,7 +206,7 @@ pub(super) async fn login(State(state): State<ApiState>, request: Request) -> Re
     }
 
     state.qbittorrent_sessions.clear_login_failures(client_ip);
-    let sid = state.qbittorrent_sessions.issue();
+    let sid = state.qbittorrent_sessions.issue(previous_sid.as_deref());
     let mut response = (StatusCode::OK, "Ok.").into_response();
     response.headers_mut().insert(
         SET_COOKIE,
@@ -285,6 +311,7 @@ pub(in crate::http_api) async fn web_login(
         )
             .into_response();
     }
+    let previous_sid = sid_from_headers(request.headers()).map(str::to_owned);
     let Form(login) = match Form::<Login>::from_request(request, &state).await {
         Ok(login) => login,
         Err(error) => return error.into_response(),
@@ -311,7 +338,7 @@ pub(in crate::http_api) async fn web_login(
     }
 
     state.qbittorrent_sessions.clear_login_failures(client_ip);
-    let sid = state.qbittorrent_sessions.issue();
+    let sid = state.qbittorrent_sessions.issue(previous_sid.as_deref());
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         SET_COOKIE,
@@ -352,7 +379,11 @@ fn logout_response(state: &ApiState, headers: &HeaderMap, mut response: Response
     }
     response.headers_mut().insert(
         SET_COOKIE,
-        HeaderValue::from_static("SID=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
+        HeaderValue::from_static(if state.opts.insecure_session_cookies {
+            "SID=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+        } else {
+            "SID=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure"
+        }),
     );
     response
         .headers_mut()
@@ -386,14 +417,12 @@ pub(super) async fn require_auth(
             .into_response();
     }
     if credentials_match_basic(state.opts.basic_auth.as_ref(), &headers) {
-        state.qbittorrent_sessions.clear_login_failures(client_ip);
         return next.run(request).await;
     }
     if crate::http_api::credentials_match_bearer(
         state.opts.qbittorrent_api_key.as_deref(),
         &headers,
     ) {
-        state.qbittorrent_sessions.clear_login_failures(client_ip);
         return next.run(request).await;
     }
 
@@ -420,6 +449,7 @@ fn request_source_matches_host(headers: &HeaderMap) -> bool {
     if headers.get_all(ORIGIN).iter().count() > 1
         || headers.get_all(REFERER).iter().count() > 1
         || headers.get_all(HOST).iter().count() > 1
+        || headers.get_all("sec-fetch-site").iter().count() > 1
     {
         return false;
     }
@@ -432,7 +462,11 @@ fn request_source_matches_host(headers: &HeaderMap) -> bool {
     }
     let source = headers.get(ORIGIN).or_else(|| headers.get(REFERER));
     let Some(source) = source else {
-        return true;
+        // SameSite cookies also reach sibling origins (including other ports).
+        // A browser that suppresses its referrer must still prove same-origin.
+        return headers
+            .get("sec-fetch-site")
+            .is_none_or(|site| site == "same-origin" || site == "none");
     };
     let Ok(source) = source.to_str() else {
         return false;
@@ -512,6 +546,48 @@ mod tests {
         MAX_AUTH_FAILURES, MAX_PUBLIC_IP_RESPONSE_SIZE, Sessions, parse_public_ip_response,
         request_source_matches_host,
     };
+
+    #[test]
+    fn session_idle_timeout_rotation_and_absolute_lifetime() {
+        let sessions = Sessions::default();
+        let sid = sessions.issue(None);
+        let other = sessions.issue(None);
+        let replacement = sessions.issue(Some(&sid));
+        assert!(!sessions.is_valid(&sid));
+        assert!(sessions.is_valid(&replacement));
+        assert!(sessions.is_valid(&other));
+        let key = crate::http_api::credential_digest(&replacement);
+        let now = std::time::Instant::now();
+        sessions.entries.lock().get_mut(&key).unwrap().last_used = now - super::SESSION_IDLE_TTL;
+        assert!(!sessions.is_valid(&replacement));
+        assert!(!sessions.entries.lock().contains_key(&key));
+        let key = crate::http_api::credential_digest(&other);
+        let expires = sessions.entries.lock()[&key].expires;
+        sessions.entries.lock().get_mut(&key).unwrap().last_used =
+            now - std::time::Duration::from_secs(60);
+        assert!(sessions.is_valid(&other));
+        let entries = sessions.entries.lock();
+        assert!(entries[&key].last_used >= now);
+        assert_eq!(entries[&key].expires, expires);
+    }
+
+    #[test]
+    fn referrer_suppression_cannot_bypass_sibling_origin_checks() {
+        let mut headers = HeaderMap::new();
+        headers.insert(super::HOST, HeaderValue::from_static("localhost:3030"));
+        for site in ["same-site", "cross-site", "invalid"] {
+            headers.insert("sec-fetch-site", HeaderValue::from_static(site));
+            assert!(!request_source_matches_host(&headers));
+        }
+        for site in ["same-origin", "none"] {
+            headers.insert("sec-fetch-site", HeaderValue::from_static(site));
+            assert!(request_source_matches_host(&headers));
+        }
+        headers.append("sec-fetch-site", HeaderValue::from_static("same-site"));
+        assert!(!request_source_matches_host(&headers));
+        headers.remove("sec-fetch-site");
+        assert!(request_source_matches_host(&headers)); // Non-browser automation.
+    }
 
     #[test]
     fn repeated_authentication_failures_are_rate_limited() {
@@ -706,7 +782,7 @@ mod tests {
     #[test]
     fn session_tokens_reject_forgery_expiry_and_duplicate_cookies() {
         let sessions = Sessions::default();
-        let sid = sessions.issue();
+        let sid = sessions.issue(None);
         assert_eq!(sid.len(), 64);
         assert!(sessions.is_valid(&sid));
         for value in [
@@ -734,7 +810,10 @@ mod tests {
         assert!(!sessions.authenticates(&headers));
         sessions.entries.lock().insert(
             crate::http_api::credential_digest(&sid),
-            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            super::SessionEntry {
+                expires: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                last_used: std::time::Instant::now(),
+            },
         );
         assert!(!sessions.is_valid(&sid));
         assert!(!Sessions::default().is_valid(&sid));
@@ -759,7 +838,7 @@ mod tests {
     #[test]
     fn revoked_session_is_invalid() {
         let sessions = Sessions::default();
-        let sid = sessions.issue();
+        let sid = sessions.issue(None);
         assert!(sessions.is_valid(&sid));
 
         sessions.revoke(&sid);

@@ -97,6 +97,8 @@ async fn create_torrent_raw<'a>(
         .piece_length
         .unwrap_or_else(|| choose_piece_length(&input_files));
 
+    anyhow::ensure!(piece_length > 0, "piece length must be non-zero");
+
     // Calculate hashes etc.
     const READ_SIZE: u32 = 8192; // todo: twea
     let mut read_buf = vec![0; READ_SIZE as usize];
@@ -154,7 +156,7 @@ async fn create_torrent_raw<'a>(
         }
     }
 
-    if remaining_piece_length > 0 && length > 0 {
+    if remaining_piece_length != piece_length {
         piece_hashes.extend_from_slice(&piece_checksum.finish());
     }
     Ok(CreateTorrentRawResult {
@@ -246,6 +248,43 @@ mod tests {
     use librqbit_core::torrent_metainfo::torrent_from_bytes;
 
     use crate::{create_torrent, spawn_utils::BlockingSpawner};
+
+    #[tokio::test]
+    async fn created_piece_hashes_match_declared_lengths() {
+        for size in [1, 1024, 1025, 2048] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("file"), vec![1; size]).unwrap();
+            let torrent = create_torrent(
+                dir.path(),
+                crate::CreateTorrentOptions {
+                    piece_length: Some(1024),
+                    ..Default::default()
+                },
+                &BlockingSpawner::new(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                torrent.meta.info.data.pieces.as_ref().len(),
+                size.div_ceil(1024) * 20
+            );
+            assert!(torrent.meta.info.data.validate().is_ok());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), [1]).unwrap();
+        assert!(
+            create_torrent(
+                dir.path(),
+                crate::CreateTorrentOptions {
+                    piece_length: Some(0),
+                    ..Default::default()
+                },
+                &BlockingSpawner::new(1)
+            )
+            .await
+            .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn test_create_torrent() {

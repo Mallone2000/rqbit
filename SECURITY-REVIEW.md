@@ -100,3 +100,57 @@ Constant-time comparisons use the [subtle crate](https://docs.rs/subtle/latest/s
 Tests ran on macOS. Linux desktop execution, adversarial protocol fuzzing, a fresh
 Docker image build, and deployed reverse-proxy/TLS configuration were not verified.
 No changes were pushed or deployed.
+
+## Follow-up review — 2026-11-05
+
+- Successful native Web UI and qBittorrent logins revoke the SID presented with
+  the login request before issuing a replacement. Failed login leaves existing
+  sessions intact; independent clients retain their sessions.
+- Successful background Basic/Bearer API traffic no longer resets the address's
+  password failure counter. This prevents automation behind a shared proxy from
+  repeatedly clearing an attacker's failed guesses. Successful form login still
+  clears earlier failures.
+- Sessions have a 15-minute idle timeout in addition to the existing one-hour
+  absolute lifetime. Authenticated requests refresh activity without extending
+  the absolute deadline. Logout cookie deletion preserves Secure by default.
+- Fetch Metadata from sibling origins cannot bypass source checks by suppressing
+  Origin/Referer. Duplicate Fetch Metadata headers fail closed. Non-browser
+  automation without browser source headers remains supported.
+- The default content policy restricts scripts, connections, and forms to the
+  management origin, while retaining inline styles used by the UI. The stricter
+  sandbox policy on untrusted torrent streams is preserved.
+- Torrent validation rejects zero piece length, overflowing file-length sums,
+  unrepresentable piece/chunk counts, and inconsistent piece-hash tables before
+  allocating torrent tracking state. These inputs could otherwise panic (aborting
+  the process in release builds), wrap counters, or inflate allocations.
+- Torrent creation no longer appends an empty piece hash at exact boundaries and
+  rejects zero piece length. Validation retains the narrowly identified legacy
+  empty trailing hash so existing sessions created by rqbit still restore.
+- Refreshed npm audit reports zero vulnerabilities. Refreshed RustSec still
+  reports ringbuf 0.4.8 (RUSTSEC-2026-0293), glib 0.18.5 unsoundness, and the
+  maintenance warnings described above. `cargo info librqbit-utp` still resolves
+  to 0.7.0. These findings are not suppressed or claimed fixed. Resolving them
+  requires upstream changes or separately maintained dependency backports; a
+  forced semver-incompatible transitive upgrade would not be a verified fix.
+
+This follow-up does not certify that every security issue has been found. HTTPS,
+reverse-proxy configuration, host access controls, and Linux desktop behavior
+must still be verified in the actual deployment. No deployment was performed.
+
+### Follow-up validation
+
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+- `cargo check` and `cargo clippy --all-targets` passed, retaining the existing
+  JSON persistence `fetch_update` deprecation warning.
+- `cargo test --workspace --exclude rqbit-desktop -- --test-threads=1` passed:
+  303 tests passed, 11 ignored. This includes HTTP authentication/compatibility,
+  session rotation/idle and absolute expiry, throttling amid successful API
+  traffic, browser source checks, torrent validation/creation, persistence,
+  streaming and TCP/uTP transfer tests.
+- The oversized metadata HTTP test server now reads the request before replying;
+  its size-limit assertion is unchanged. UPnP test torrents now include the
+  declared piece hashes, so they exercise valid metadata under stricter validation.
+- npm audit reports zero vulnerabilities. RustSec findings remain as listed above.
+- Linux desktop builds, frontend browser execution, a new Docker image, and the
+  deployed TLS/reverse-proxy configuration were not verified in this follow-up.
+  Nothing was pushed or deployed.

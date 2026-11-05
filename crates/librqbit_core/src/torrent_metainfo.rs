@@ -311,6 +311,22 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
 impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
     pub fn validate(self) -> crate::Result<ValidatedTorrentMetaV1Info<BufType>> {
         let lengths = Lengths::from_torrent(&self)?;
+        // Check before the engine allocates tracking state from declared lengths.
+        let hashes_len = self.pieces.as_ref().len();
+        let expected_len = lengths.total_pieces() as u64 * 20;
+        // Older rqbit creators appended SHA1(empty) after an exact piece boundary.
+        // Retain compatibility with those stored torrents without allowing a
+        // missing hash table or arbitrary surplus hashes.
+        const EMPTY_SHA1: [u8; 20] = [
+            0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60,
+            0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09,
+        ];
+        let legacy_empty_hash = hashes_len as u64 == expected_len + 20
+            && lengths.total_length() % self.piece_length as u64 == 0
+            && self.pieces.as_ref().ends_with(&EMPTY_SHA1);
+        if hashes_len as u64 != expected_len && !legacy_empty_hash {
+            return Err(Error::BadTorrentPieceHashes);
+        }
         let encoding = self.detect_encoding();
         let validated = ValidatedTorrentMetaV1Info {
             encoding,
@@ -594,6 +610,50 @@ mod tests {
         let buf = include_bytes!("resources/test/private.torrent");
         let torrent: TorrentMetaV1Borrowed = from_bytes(buf).unwrap();
         assert!(torrent.info.data.private);
+    }
+
+    #[test]
+    fn validation_rejects_inconsistent_piece_hashes() {
+        for hashes_len in [0, 19, 21, 40] {
+            let info = TorrentMetaV1Info {
+                name: Some(ByteBufOwned::from(&b"file"[..])),
+                pieces: ByteBufOwned::from(vec![0; hashes_len]),
+                piece_length: 16384,
+                length: Some(1),
+                ..Default::default()
+            };
+            assert!(matches!(info.validate(), Err(Error::BadTorrentPieceHashes)));
+        }
+        let info = TorrentMetaV1Info {
+            name: Some(ByteBufOwned::from(&b"file"[..])),
+            pieces: ByteBufOwned::from(vec![0; 20]),
+            piece_length: 16384,
+            length: Some(1),
+            ..Default::default()
+        };
+        assert!(info.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_preserves_legacy_empty_trailing_hash() {
+        let hashes = hex::decode(
+            "0000000000000000000000000000000000000000da39a3ee5e6b4b0d3255bfef95601890afd80709",
+        )
+        .unwrap();
+        let info = TorrentMetaV1Info {
+            name: Some(ByteBufOwned::from(&b"file"[..])),
+            pieces: ByteBufOwned::from(hashes),
+            piece_length: 16384,
+            length: Some(16384),
+            ..Default::default()
+        };
+        assert!(info.clone().validate().is_ok());
+        let mut partial = info;
+        partial.length = Some(1);
+        assert!(matches!(
+            partial.validate(),
+            Err(Error::BadTorrentPieceHashes)
+        ));
     }
 
     #[test]

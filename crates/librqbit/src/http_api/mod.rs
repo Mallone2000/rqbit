@@ -134,7 +134,8 @@ async fn simple_basic_auth(
         }
         return Err(ApiError::unauthorized());
     }
-    sessions.clear_login_failures(client_ip);
+    // Background API traffic must not reset another client's password failures
+    // when they share an address (for example, behind a reverse proxy).
     Ok(next.run(request).await)
 }
 
@@ -233,7 +234,7 @@ async fn security_headers(request: Request, next: Next) -> axum::response::Respo
     headers
         .entry("content-security-policy")
         .or_insert(http::HeaderValue::from_static(
-            "frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'",
         ));
     headers.insert(
         "referrer-policy",
@@ -890,6 +891,250 @@ mod tests {
 
     #[cfg(feature = "webui")]
     #[tokio::test]
+    async fn logins_rotate_presented_sessions_and_block_sibling_browser_requests() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+        let base = format!("http://{}", listener.bind_addr());
+        let server = tokio::spawn(
+            HttpApi::new(
+                Api::new(session.clone(), None, None),
+                Some(HttpApiOptions {
+                    basic_auth: Some(("user".into(), "secret".into())),
+                    enable_qbittorrent_api: true,
+                    qbittorrent_api_key: Some("0123456789abcdef0123456789abcdef".into()),
+                    ..Default::default()
+                }),
+            )
+            .make_http_api_and_run(listener, None),
+        );
+        let client = reqwest::Client::new();
+        for login in ["web/auth/login", "api/v2/auth/login"] {
+            let response = client
+                .post(format!("{base}/{login}"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("username=user&password=secret")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let old_cookie = response.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            // A failed reauthentication must not revoke a valid session.
+            let response = client
+                .post(format!("{base}/{login}"))
+                .header("cookie", &old_cookie)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("username=user&password=wrong")
+                .send()
+                .await
+                .unwrap();
+            assert!(!response.headers().contains_key("set-cookie"));
+            assert_eq!(
+                client
+                    .get(format!("{base}/stats"))
+                    .header("cookie", &old_cookie)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+            let response = client
+                .post(format!("{base}/{login}"))
+                .header("cookie", &old_cookie)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("username=user&password=secret")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let cookie = response.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            assert_ne!(old_cookie, cookie);
+            for path in ["stats", "api/v2/app/version"] {
+                assert!(
+                    !client
+                        .get(format!("{base}/{path}"))
+                        .header("cookie", &old_cookie)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status()
+                        .is_success()
+                );
+                assert_eq!(
+                    client
+                        .get(format!("{base}/{path}"))
+                        .header("cookie", &cookie)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    200
+                );
+                assert_eq!(
+                    client
+                        .get(format!("{base}/{path}"))
+                        .header("cookie", &cookie)
+                        .header("sec-fetch-site", "same-site")
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    403
+                );
+            }
+            let response = client
+                .post(format!("{base}/web/auth/logout"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 204);
+            assert!(
+                response.headers()["set-cookie"]
+                    .to_str()
+                    .unwrap()
+                    .contains("; Secure")
+            );
+            assert!(
+                !client
+                    .get(format!("{base}/stats"))
+                    .header("cookie", &cookie)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .is_success()
+            );
+        }
+        let response = client
+            .post(format!("{base}/web/auth/login"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body("username=user&password=secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+        let cookie = response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        for _ in 0..4 {
+            assert_eq!(
+                client
+                    .get(format!("{base}/stats"))
+                    .basic_auth("user", Some("wrong"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                401
+            );
+            for path in ["stats", "api/v2/app/version"] {
+                assert_eq!(
+                    client
+                        .get(format!("{base}/{path}"))
+                        .basic_auth("user", Some("secret"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    200
+                );
+            }
+            assert_eq!(
+                client
+                    .get(format!("{base}/api/v2/app/version"))
+                    .bearer_auth("0123456789abcdef0123456789abcdef")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        assert_eq!(
+            client
+                .get(format!("{base}/stats"))
+                .basic_auth("user", Some("wrong"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/stats"))
+                .basic_auth("user", Some("secret"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            429
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/api/v2/app/version"))
+                .bearer_auth("0123456789abcdef0123456789abcdef")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            429
+        );
+        // An existing session still works during an address ban.
+        assert_eq!(
+            client
+                .get(format!("{base}/stats"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let response = client.get(format!("{base}/web/")).send().await.unwrap();
+        let policy = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap();
+        assert!(policy.contains("script-src 'self'"));
+        assert!(policy.contains("form-action 'self'"));
+        server.abort();
+        session.stop().await;
+    }
+
+    #[cfg(feature = "webui")]
+    #[tokio::test]
     async fn web_login_uses_a_session_and_keeps_basic_auth_compatible() {
         let public_ip_listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
             (Ipv4Addr::LOCALHOST, 0).into(),
@@ -1056,7 +1301,7 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
         assert_eq!(
             response.headers().get("Set-Cookie").unwrap(),
-            "SID=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+            "SID=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0; Secure"
         );
         assert!(response.bytes().await.unwrap().is_empty());
 
