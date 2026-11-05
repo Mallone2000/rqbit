@@ -258,6 +258,15 @@ once so Docker hosts can pull it without registry credentials. Subsequent
 successful `main` builds update the same tag automatically, and the example's
 `pull_policy: always` checks for that update whenever it starts.
 
+To start a fresh remote Docker build manually, run:
+
+```sh
+gh workflow run release-main.yml --ref main --repo Mallone2000/rqbit
+```
+
+Manual builds are restricted to `main` and run the same version checks, image
+builds, and smoke test as push builds.
+
 The rolling `latest` tag is convenient for tracking `main`; pin a reviewed
 digest when deployments require controlled updates. The [automation stack
 deployment guide](docker/compose-examples/automation-stack.md) documents the
