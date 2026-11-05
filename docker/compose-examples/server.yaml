@@ -2,27 +2,19 @@ services:
   rqbit:
     image: ghcr.io/mallone2000/rqbit:latest
     pull_policy: always
-    # Host network required for several things to work:
-    # - upnp discovery for port forwarding to your router
-    # - upnp UDP multicast announce MediaServer
-    # - upnp server UDP multicast
-    network_mode: host
+    restart: unless-stopped
     ports:
-      - 3030:3030 # HTTP API port
-      - 4240:4240 # TCP/uTP BitTorrent port
+      # Keep the plaintext management API private, even without the TLS overlay.
+      - "127.0.0.1:3030:3030"
+      - "4240:4240/tcp"
+      - "4240:4240/udp"
     environment:
-      # Replace this with your LAN hostname or IP, resolvable from other devices in your LAN
-      RQBIT_UPNP_SERVER_ENABLE: "true"
-      RQBIT_UPNP_SERVER_FRIENDLY_NAME: rqbit-docker
-
-      # Replace this if you want to change the HTTP/Web UI port
-      # RQBIT_HTTP_API_LISTEN_ADDR: 0.0.0.0:3030
-
+      RQBIT_HTTP_API_LISTEN_ADDR: "0.0.0.0:3030"
+      RQBIT_HTTP_API_INSECURE_COOKIES: "false"
+      # Bridge networking does not support LAN multicast discovery.
+      RQBIT_UPNP_SERVER_ENABLE: "false"
+      RQBIT_UPNP_PORT_FORWARD_DISABLE: "true"
       # Required on every listener, including loopback and read-only mode.
-      # Use an HTTPS reverse proxy; session cookies are Secure by default.
-      # UPnP HTTP routes also require authentication (anonymous players will fail).
-      # For trusted plaintext HTTP only, explicitly opt in:
-      # RQBIT_HTTP_API_INSECURE_COOKIES: "true"
       RQBIT_HTTP_BASIC_AUTH_USERPASS: "${RQBIT_USER:?}:${RQBIT_PASSWORD:?}"
     volumes:
       - db:/home/rqbit/db

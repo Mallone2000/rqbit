@@ -1,0 +1,14 @@
+https://{$RQBIT_DOMAIN} {
+	# Apply only to this hostname; do not force HTTPS on unrelated subdomains.
+	header Strict-Transport-Security "max-age=31536000"
+
+	reverse_proxy rqbit:3030 {
+		# rqbit validates Origin/Referer against the original Host, including port.
+		header_up Host {http.request.hostport}
+		# rqbit uses the socket peer for throttling, never client-supplied IPs.
+		header_up -Forwarded
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Host
+		header_up -X-Forwarded-Proto
+	}
+}

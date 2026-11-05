@@ -1,0 +1,21 @@
+# Combine with server.yaml; see https.md for DNS and certificate requirements.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    environment:
+      RQBIT_DOMAIN: "${RQBIT_DOMAIN:?Set RQBIT_DOMAIN to your public DNS hostname}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - rqbit
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}

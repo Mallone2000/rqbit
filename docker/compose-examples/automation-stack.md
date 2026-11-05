@@ -13,6 +13,9 @@ Publish all three plaintext HTTP interfaces on the Docker host's loopback
 address only. Do not configure these mappings to listen on every interface.
 For remote access, keep the application ports private and place an authenticated
 HTTPS reverse proxy or another trusted encrypted access layer in front of them.
+For a standalone rqbit deployment, the [HTTPS guide](https.md) includes a Caddy
+configuration. Its bridge-network Compose files are separate from this shared
+Gluetun namespace topology.
 rqbit refuses to start the qBittorrent compatibility API unless a non-empty
 `RQBIT_HTTP_BASIC_AUTH_USERPASS` value is configured.
 For Cleanuparr's optional API key connection, add a random 32–256 character

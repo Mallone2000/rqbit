@@ -38,8 +38,10 @@ Every HTTP listener requires a non-empty username and password, including loopba
 
 ```sh
 RQBIT_HTTP_BASIC_AUTH_USERPASS='username:password' \
-  rqbit --http-api-listen-addr 0.0.0.0:3030 server start /srv/torrents
+  rqbit --http-api-listen-addr 127.0.0.1:3030 server start /srv/torrents
 ```
+
+For Docker, use the [production HTTPS proxy configuration](docker/compose-examples/https.md). A host-based proxy can use the loopback listener above; a container proxy needs a shared private network.
 
 Basic authentication protects access but does not encrypt traffic. Do not expose the HTTP listener directly to an untrusted network.
 
@@ -265,12 +267,17 @@ cargo tauri build
 The repository publishes `ghcr.io/mallone2000/rqbit:latest` from successful
 builds of `main`. The image supports `linux/amd64`, `linux/arm64`, and
 `linux/arm/v7`. The same build also receives the version tag
-`v<workspace version>` (for example, `v9.0.1-servarr.5`). Start the included example with:
+`v<workspace version>` (for example, `v9.0.1-servarr.5`).
+
+The base example keeps HTTP on host loopback and Secure cookies enabled; browser
+access requires the [HTTPS overlay](docker/compose-examples/https.md) or an existing
+TLS proxy. It uses bridge networking with explicit peer ports rather than host
+networking; UPnP discovery and automatic router forwarding are disabled. Start it with:
 
 ```sh
-docker compose -f docker/compose-examples/server.yaml pull
-RQBIT_USER=admin RQBIT_PASSWORD='change-me' \
-  docker compose -f docker/compose-examples/server.yaml up -d
+# Create a private environment file as described in the HTTPS guide.
+docker compose --env-file /path/to/rqbit.env -f docker/compose-examples/server.yaml pull
+docker compose --env-file /path/to/rqbit.env -f docker/compose-examples/server.yaml up -d
 ```
 
 After the first workflow publish, set the GHCR package visibility to **Public**
