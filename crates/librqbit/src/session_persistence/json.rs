@@ -91,6 +91,7 @@ impl JsonSessionPersistenceStore {
             .torrents
             .keys()
             .copied()
+            .chain(db.pending_torrents.values().filter_map(|t| t.reserved_id()))
             .max()
             .map(|id| id.saturating_add(1))
             .unwrap_or(0);
@@ -404,6 +405,65 @@ impl SessionPersistenceStore for JsonSessionPersistenceStore {
             db.pending_torrents.insert(key, previous);
             return Err(error);
         }
+        if previous.reserved_id().is_some()
+            && !db
+                .torrents
+                .values()
+                .any(|torrent| torrent.info_hash == info_hash)
+        {
+            for filename in [
+                self.torrent_bytes_filename(&info_hash),
+                self.bitv_filename(&info_hash),
+            ] {
+                if let Err(error) = Self::remove_file_if_present(&filename).await {
+                    warn!(
+                        ?error,
+                        ?filename,
+                        "error removing deferred torrent persistence file"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn defer_metadata(
+        &self,
+        id: TorrentId,
+        torrent: &SerializedPendingTorrent,
+    ) -> anyhow::Result<()> {
+        let mut db = self.db_content.write().await;
+        let saved = db.torrents.get(&id).context("no torrent found")?;
+        anyhow::ensure!(
+            saved.info_hash == torrent.info_hash,
+            "torrent identity mismatch"
+        );
+        let key = torrent.info_hash.as_string();
+        let pending = db
+            .pending_torrents
+            .get(&key)
+            .unwrap_or(torrent)
+            .clone()
+            .with_reserved_id(id)?;
+        anyhow::ensure!(
+            pending.info_hash == torrent.info_hash,
+            "pending torrent identity mismatch"
+        );
+        let previous_pending = db.pending_torrents.insert(key.clone(), pending);
+        let previous = db.torrents.remove(&id);
+        if let Err(error) = self.flush_db(&db).await {
+            if let Some(previous) = previous {
+                db.torrents.insert(id, previous);
+            }
+            if let Some(previous) = previous_pending {
+                db.pending_torrents.insert(key, previous);
+            } else {
+                db.pending_torrents.remove(&key);
+            }
+            return Err(error);
+        }
+        self.next_torrent_id
+            .fetch_max(id.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -623,6 +683,87 @@ mod tests {
         .await
         .unwrap();
         assert!(restored.get(0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_pending_cleanup_preserves_managed_metadata_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            JsonSessionPersistenceStore::new(directory.path().to_owned(), BlockingSpawner::new(1))
+                .await
+                .unwrap();
+        let torrent: super::SerializedTorrent = serde_json::from_str(
+            r#"{"info_hash":"0000000000000000000000000000000000000000","trackers":[],"output_folder":".","only_files":null,"is_paused":true}"#,
+        ).unwrap();
+        let hash = *torrent.info_hash();
+        let pending = torrent.clone().into_pending(41).unwrap();
+        store.db_content.write().await.torrents.insert(41, torrent);
+        store.store_pending(&pending).await.unwrap();
+        std::fs::write(store.torrent_bytes_filename(&hash), b"managed metadata").unwrap();
+        std::fs::write(store.bitv_filename(&hash), [0u8]).unwrap();
+        store.delete_pending(hash).await.unwrap();
+        assert!(store.load_pending().await.unwrap().is_empty());
+        assert!(store.torrent_bytes_filename(&hash).exists());
+        assert!(store.bitv_filename(&hash).exists());
+        assert!(store.get(41).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn metadata_deferral_is_atomic_and_preserves_existing_pending_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            JsonSessionPersistenceStore::new(directory.path().to_owned(), BlockingSpawner::new(1))
+                .await
+                .unwrap();
+        let torrent: super::SerializedTorrent = serde_json::from_str(
+            r#"{"info_hash":"0000000000000000000000000000000000000000","trackers":[],"output_folder":".","only_files":[0],"is_paused":true}"#,
+        ).unwrap();
+        store
+            .db_content
+            .write()
+            .await
+            .torrents
+            .insert(41, torrent.clone());
+        store.flush().await.unwrap();
+        let pending = torrent.into_pending(41).unwrap();
+
+        // A failed durable transition must leave the managed record intact,
+        // both in memory and when reopening the store.
+        let temp = directory.path().join("session.json.tmp");
+        std::fs::create_dir(&temp).unwrap();
+        assert!(store.defer_metadata(41, &pending).await.is_err());
+        assert!(store.get(41).await.is_ok());
+        assert!(store.load_pending().await.unwrap().is_empty());
+        let reopened =
+            JsonSessionPersistenceStore::new(directory.path().to_owned(), BlockingSpawner::new(1))
+                .await
+                .unwrap();
+        assert!(reopened.get(41).await.is_ok());
+        assert!(reopened.load_pending().await.unwrap().is_empty());
+        std::fs::remove_dir(temp).unwrap();
+
+        let mut existing = pending.clone();
+        existing.paused = false;
+        existing.metadata_attempts = 3;
+        existing.last_error = Some(crate::session::PendingAutomationError::MetadataTimeout);
+        existing.options["preferred_id"] = serde_json::Value::Null;
+        store.store_pending(&existing).await.unwrap();
+        let mut wrong_hash = pending.clone();
+        wrong_hash.info_hash = librqbit_core::Id20::new([1; 20]);
+        assert!(store.defer_metadata(41, &wrong_hash).await.is_err());
+        store.defer_metadata(41, &pending).await.unwrap();
+        assert!(store.get(41).await.is_err());
+        let reopened =
+            JsonSessionPersistenceStore::new(directory.path().to_owned(), BlockingSpawner::new(1))
+                .await
+                .unwrap();
+        assert!(reopened.get(41).await.is_err());
+        let saved = reopened.load_pending().await.unwrap().pop().unwrap();
+        assert!(!saved.paused);
+        assert_eq!(saved.metadata_attempts, 3);
+        assert_eq!(saved.last_error, existing.last_error);
+        assert_eq!(saved.reserved_id(), Some(41));
+        assert_eq!(reopened.next_id().await.unwrap(), 42);
     }
 
     #[tokio::test]

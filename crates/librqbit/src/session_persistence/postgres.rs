@@ -190,6 +190,44 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         Ok(())
     }
 
+    async fn defer_metadata(
+        &self,
+        id: TorrentId,
+        torrent: &SerializedPendingTorrent,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let removed = sqlx::query("DELETE FROM torrents WHERE id = $1 AND info_hash = $2")
+            .bind(i32::try_from(id)?)
+            .bind(&torrent.info_hash.0[..])
+            .execute(&mut *tx)
+            .await?;
+        anyhow::ensure!(removed.rows_affected() == 1, "torrent identity mismatch");
+        let existing = sqlx::query_scalar::<_, String>(
+            "SELECT submission FROM pending_torrents WHERE info_hash = $1 FOR UPDATE",
+        )
+        .bind(&torrent.info_hash.0[..])
+        .fetch_optional(&mut *tx)
+        .await?;
+        let pending = match existing {
+            Some(payload) => serde_json::from_str::<SerializedPendingTorrent>(&payload)
+                .context("invalid pending torrent record")?,
+            None => torrent.clone(),
+        }
+        .with_reserved_id(id)?;
+        anyhow::ensure!(
+            pending.info_hash == torrent.info_hash,
+            "pending torrent identity mismatch"
+        );
+        sqlx::query("INSERT INTO pending_torrents (info_hash, submission) VALUES ($1, $2) ON CONFLICT (info_hash) DO UPDATE SET submission = EXCLUDED.submission")
+            .bind(&torrent.info_hash.0[..])
+            .bind(serde_json::to_string(&pending)?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit()
+            .await
+            .context("error deferring torrent metadata")
+    }
+
     async fn next_id(&self) -> anyhow::Result<TorrentId> {
         let (id,): (i32,) = sqlx::query_as("SELECT nextval('torrents_id')::int")
             .fetch_one(&self.pool)
@@ -545,6 +583,157 @@ mod automation_tests {
                 .is_err()
         );
     }
+    #[tokio::test]
+    #[ignore = "requires a dedicated RQBIT_TEST_POSTGRES_URL database"]
+    async fn missing_metadata_postgres_does_not_block_startup_or_resurrect_after_deletion() {
+        use super::{PostgresSessionStorage, SessionPersistenceStore};
+        use std::time::Duration;
+        let url =
+            std::env::var("RQBIT_TEST_POSTGRES_URL").expect("dedicated test database is required");
+        let store = PostgresSessionStorage::new(&url).await.unwrap();
+        let id = store.next_id().await.unwrap();
+        let hash = librqbit_core::Id20::new([0x6b; 20]);
+        let output = tempfile::tempdir().unwrap();
+        sqlx::query("INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, is_paused) VALUES ($1, $2, $3, $4, $5, $6)")
+            .bind(i32::try_from(id).unwrap()).bind(&hash.0[..]).bind(Vec::<u8>::new())
+            .bind(vec!["udp://127.0.0.1:9/announce"]).bind(output.path().to_str().unwrap()).bind(false)
+            .execute(&store.pool).await.unwrap();
+        let restore = || {
+            crate::Session::new_with_opts(
+                output.path().to_owned(),
+                crate::SessionOptions {
+                    dht: None,
+                    listen: None,
+                    disable_local_service_discovery: true,
+                    persistence: Some(crate::SessionPersistenceConfig::Postgres {
+                        connection_string: url.clone(),
+                    }),
+                    ..Default::default()
+                },
+            )
+        };
+        let session = tokio::time::timeout(Duration::from_secs(3), restore())
+            .await
+            .expect("metadata recovery blocked PostgreSQL startup")
+            .unwrap();
+        let pending = session
+            .pending_automation_torrents()
+            .into_iter()
+            .find(|p| p.info_hash == hash)
+            .unwrap();
+        assert!(!pending.paused);
+        assert_eq!(
+            store
+                .load_pending()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|p| p.info_hash == hash)
+                .unwrap()
+                .reserved_id(),
+            Some(id)
+        );
+        assert!(store.get(id).await.is_err());
+        session
+            .set_pending_automation_paused(hash, true)
+            .await
+            .unwrap();
+        session.stop().await;
+        let restored = restore().await.unwrap();
+        assert!(
+            restored
+                .pending_automation_torrents()
+                .into_iter()
+                .find(|p| p.info_hash == hash)
+                .unwrap()
+                .paused
+        );
+        restored.delete(hash.into(), false).await.unwrap();
+        restored.stop().await;
+        let restored = restore().await.unwrap();
+        assert!(
+            !restored
+                .pending_automation_torrents()
+                .iter()
+                .any(|p| p.info_hash == hash)
+        );
+        assert!(restored.get(hash.into()).is_none());
+        restored.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated RQBIT_TEST_POSTGRES_URL database"]
+    async fn metadata_deferral_postgres_is_atomic_and_survives_reconnection() {
+        use super::{PostgresSessionStorage, SessionPersistenceStore};
+        let url =
+            std::env::var("RQBIT_TEST_POSTGRES_URL").expect("dedicated test database is required");
+        let store = PostgresSessionStorage::new(&url).await.unwrap();
+        let id = store.next_id().await.unwrap();
+        let hash = librqbit_core::Id20::new([0x6a; 20]);
+        sqlx::query("INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, is_paused) VALUES ($1, $2, $3, $4, $5, $6)")
+            .bind(i32::try_from(id).unwrap()).bind(&hash.0[..]).bind(Vec::<u8>::new())
+            .bind(Vec::<String>::new()).bind(".").bind(true)
+            .execute(&store.pool).await.unwrap();
+        let pending = store.get(id).await.unwrap().into_pending(id).unwrap();
+
+        // Force the second half of the transaction to fail after DELETE runs.
+        sqlx::query("ALTER TABLE pending_torrents ADD CONSTRAINT recovery_test_failure CHECK (false) NOT VALID")
+            .execute(&store.pool).await.unwrap();
+        assert!(store.defer_metadata(id, &pending).await.is_err());
+        assert!(
+            store.get(id).await.is_ok(),
+            "failed transaction lost managed record"
+        );
+        assert!(
+            !store
+                .load_pending()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.info_hash == hash)
+        );
+        sqlx::query("ALTER TABLE pending_torrents DROP CONSTRAINT recovery_test_failure")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let mut existing = pending.clone();
+        existing.metadata_attempts = 3;
+        existing.last_error = Some(crate::session::PendingAutomationError::MetadataTimeout);
+        existing.options["preferred_id"] = serde_json::Value::Null;
+        store.store_pending(&existing).await.unwrap();
+        let mut wrong_hash = pending.clone();
+        wrong_hash.info_hash = librqbit_core::Id20::new([1; 20]);
+        assert!(store.defer_metadata(id, &wrong_hash).await.is_err());
+        store.defer_metadata(id, &pending).await.unwrap();
+        drop(store);
+        let reopened = PostgresSessionStorage::new(&url).await.unwrap();
+        assert!(reopened.get(id).await.is_err());
+        let saved = reopened
+            .load_pending()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.info_hash == hash)
+            .unwrap();
+        assert_eq!(saved.reserved_id(), Some(id));
+        assert_eq!(saved.metadata_attempts, 3);
+        assert_eq!(saved.last_error, existing.last_error);
+        assert!(reopened.next_id().await.unwrap() > id);
+        reopened.delete_pending(hash).await.unwrap();
+        drop(reopened);
+        let reopened = PostgresSessionStorage::new(&url).await.unwrap();
+        assert!(reopened.get(id).await.is_err());
+        assert!(
+            !reopened
+                .load_pending()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.info_hash == hash)
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires a dedicated RQBIT_TEST_POSTGRES_URL database"]
     async fn queue_postgres_atomic_preferences_survive_reconnection() {

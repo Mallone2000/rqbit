@@ -35,6 +35,29 @@ pub struct SerializedTorrent {
 }
 
 impl SerializedTorrent {
+    pub(crate) fn needs_metadata(&self) -> bool {
+        self.torrent_bytes.is_empty()
+    }
+
+    pub(crate) fn into_pending(self, id: TorrentId) -> anyhow::Result<SerializedPendingTorrent> {
+        let info_hash = self.info_hash;
+        let (add, mut options) = self.into_add_torrent()?;
+        let AddTorrent::Url(magnet_url) = add else {
+            anyhow::bail!("torrent already has metadata");
+        };
+        options.preferred_id = Some(id);
+        Ok(SerializedPendingTorrent {
+            info_hash,
+            magnet_url: magnet_url.into_owned(),
+            paused: options.paused,
+            options: serde_json::to_value(options)?,
+            state: Default::default(),
+            metadata_attempts: 0,
+            last_error: None,
+            next_retry_at_unix_seconds: None,
+        })
+    }
+
     pub fn info_hash(&self) -> &Id20 {
         &self.info_hash
     }
@@ -93,6 +116,18 @@ pub struct SerializedPendingTorrent {
 }
 
 impl SerializedPendingTorrent {
+    pub(crate) fn with_reserved_id(mut self, id: TorrentId) -> anyhow::Result<Self> {
+        self.options
+            .as_object_mut()
+            .context("invalid pending torrent options")?
+            .insert("preferred_id".into(), serde_json::to_value(id)?);
+        Ok(self)
+    }
+
+    pub(crate) fn reserved_id(&self) -> Option<TorrentId> {
+        self.options.get("preferred_id")?.as_u64()?.try_into().ok()
+    }
+
     pub fn info_hash(&self) -> &Id20 {
         &self.info_hash
     }
@@ -123,6 +158,14 @@ pub trait SessionPersistenceStore: core::fmt::Debug + Send + Sync + BitVFactory 
     async fn store_excluded_file_names(&self, enabled: bool, patterns: &str) -> anyhow::Result<()>;
     async fn load_pending(&self) -> anyhow::Result<Vec<SerializedPendingTorrent>>;
     async fn store_pending(&self, torrent: &SerializedPendingTorrent) -> anyhow::Result<()>;
+    /// Atomically replace a saved managed torrent with metadata recovery work.
+    /// Keep an existing pending record's settings and diagnostics, if any, and
+    /// reserve the original managed ID so retries and user changes survive.
+    async fn defer_metadata(
+        &self,
+        id: TorrentId,
+        torrent: &SerializedPendingTorrent,
+    ) -> anyhow::Result<()>;
     async fn delete_pending(&self, info_hash: Id20) -> anyhow::Result<()>;
     async fn next_id(&self) -> anyhow::Result<TorrentId>;
     async fn store(&self, id: TorrentId, torrent: &ManagedTorrentHandle) -> anyhow::Result<()>;

@@ -87,10 +87,24 @@ After a container restart, `Could not initialize torrent files` with `Permission
 denied` means the container user cannot access the saved download files or their
 parent directories. Check the running container's UID/GID against the bind-mounted
 downloads and state directories, including existing files; see the deployment
-guide's user and permissions setup. Missing `.torrent` files in the session
-directory cause restoration to fall back to magnet discovery; preserve the whole
-state directory in backups. Metadata timeouts mean no verified metadata arrived
-within the discovery deadline, and do not establish corruption. A non-empty
+guide's user and permissions setup. Missing, unreadable, or empty `.torrent` files
+in the session directory are restored as pending metadata recovery jobs. HTTP and
+the Web UI start without waiting for peers; healthy torrents restore normally.
+Recovery retains the saved torrent ID, download path, file selection, pause state,
+trackers, queue position, and automation metadata. Paused jobs stay paused; active
+jobs use the existing five-minute metadata discovery deadline and appear in the
+Web UI and qBittorrent API. Resume/retry restarts discovery after an error. Adding
+the matching original `.torrent` file also completes recovery and retains the saved
+settings. Deleting the pending job removes its saved state without resurrecting it
+on restart. Existing download files are retained for pending jobs: without metadata,
+rqbit cannot safely identify their complete file list for deletion.
+
+The managed-to-pending transition commits atomically in JSON and PostgreSQL storage
+and uses the existing pending-record format. Back up the whole state directory
+before upgrading, including `.torrent` files. Once deferred, a job remains pending
+across restarts; merely copying a metadata file into the state directory does not
+retry it. Submit that file through rqbit instead. Metadata timeouts mean no verified
+metadata arrived within the discovery deadline, and do not establish corruption. A non-empty
 download directory is deliberately retained during deletion to preserve remaining
 files.
 

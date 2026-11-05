@@ -1418,6 +1418,14 @@ impl Session {
                             match st {
                                 Some(st) => {
                                     let (id, st) = st?;
+                                    if st.needs_metadata() {
+                                        // Peer discovery must never hold HTTP startup hostage. Use the
+                                        // durable, cancellable pending lifecycle (including pause/retry).
+                                        let pending = st.into_pending(id)?;
+                                        persistence.defer_metadata(id, &pending).await?;
+                                        warn!(info_hash = ?pending.info_hash, "saved torrent metadata unavailable; recovery deferred to background");
+                                        continue;
+                                    }
                                     let span = add_torrent_span(st.info_hash());
                                     let (add_torrent, mut opts) = st.into_add_torrent()?;
                                     opts.preferred_id = Some(id);
@@ -1716,7 +1724,7 @@ impl Session {
                 return Ok(false);
             }
             anyhow::ensure!(
-                db.pending_automation_torrents.len() < MAX_PENDING_AUTOMATION_TORRENTS,
+                !persist || db.pending_automation_torrents.len() < MAX_PENDING_AUTOMATION_TORRENTS,
                 "too many pending automation torrents (maximum {})",
                 MAX_PENDING_AUTOMATION_TORRENTS
             );
@@ -2176,9 +2184,32 @@ impl Session {
         let InternalAddResult {
             info_hash,
             metadata,
-            trackers,
+            mut trackers,
             name,
         } = add_res;
+
+        // Supplying replacement metadata for a deferred saved torrent is recovery,
+        // so retain its path, selection, pause state and automation settings.
+        if resolution_control.is_none() && !opts.list_only {
+            let recovery = self
+                .db
+                .read()
+                .pending_automation_torrents
+                .get(&info_hash)
+                .filter(|pending| pending.submission.reserved_id().is_some())
+                .map(|pending| pending.serialized())
+                .transpose()?;
+            if let Some(recovery) = recovery {
+                trackers.extend(
+                    Magnet::parse(&recovery.magnet_url)
+                        .context("invalid saved recovery magnet")?
+                        .trackers
+                        .into_iter()
+                        .filter_map(|tracker| url::Url::parse(&tracker).ok()),
+                );
+                opts = serde_json::from_value(recovery.options)?;
+            }
+        }
 
         let now = unix_time_seconds();
         if opts.automation.added_at_unix_seconds == 0 {
@@ -2427,6 +2458,19 @@ impl Session {
         {
             self.db.write().torrents.remove(&id);
             return Err(e.context(PendingAutomationError::PersistenceFailed));
+        }
+
+        if resolution_control.is_none() {
+            // Native replacement metadata completes the same durable handoff as
+            // the resolver. Cancel its old worker only after store() commits.
+            if let Some(pending) = self
+                .db
+                .write()
+                .pending_automation_torrents
+                .remove(&info_hash)
+            {
+                pending.cancellation_token.cancel();
+            }
         }
 
         let _e = managed_torrent.shared.span.clone().entered();
@@ -3581,6 +3625,418 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    // A tracker with no responding peers keeps discovery open. Before the fix,
+    // this fixture never returned from Session::new_with_opts (and HTTP never bound).
+    async fn missing_metadata_fixture(
+        state: &std::path::Path,
+        output: &std::path::Path,
+        paused: bool,
+    ) -> (Id20, bytes::Bytes) {
+        let source = output.join("recovery.bin");
+        std::fs::write(&source, vec![42; 16384]).unwrap();
+        let file = crate::create_torrent(
+            &source,
+            crate::CreateTorrentOptions::default(),
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let bytes = file.as_bytes().unwrap();
+        let hash = torrent_from_bytes(&bytes).unwrap().info_hash;
+        let automation = TorrentAutomationMetadata {
+            category: "movies".into(),
+            tags: ["saved".to_owned()].into_iter().collect(),
+            ratio_limit: Some(1.5),
+            uploaded_bytes: 12345,
+            added_at_unix_seconds: 123,
+            sequential_download: true,
+            ..Default::default()
+        };
+        let record = |hash: Id20, paused: bool| {
+            serde_json::json!({
+                "info_hash": hash.as_string(), "trackers": ["udp://127.0.0.1:9/announce"],
+                "output_folder": output, "only_files": [0], "is_paused": paused,
+                "automation": automation,
+            })
+        };
+        // The second managed record is intentionally paused and has complete metadata.
+        // Use a different info dictionary to give it a distinct real hash.
+        let healthy_source = output.join("healthy.bin");
+        std::fs::write(&healthy_source, vec![24; 16384]).unwrap();
+        let healthy = crate::create_torrent(
+            &healthy_source,
+            crate::CreateTorrentOptions::default(),
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let healthy_hash = torrent_from_bytes(&healthy).unwrap().info_hash;
+        std::fs::write(state.join(format!("{healthy_hash:?}.torrent")), healthy).unwrap();
+        std::fs::write(state.join(format!("{hash:?}.bitv")), [0u8]).unwrap();
+        std::fs::write(
+            state.join("session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "torrents": {"41": record(hash, paused), "7": record(healthy_hash, true)},
+                "queue": crate::QueueSnapshot {
+                    config: crate::QueueConfig { enabled: true, ..Default::default() },
+                    order: vec![hash, healthy_hash],
+                },
+                "automation_categories": {"movies": {"name": "movies"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (hash, bytes)
+    }
+
+    #[tokio::test]
+    async fn missing_metadata_startup_is_nonblocking_and_recovery_survives_restart() {
+        let state = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let (hash, bytes) = missing_metadata_fixture(state.path(), output.path(), false).await;
+        let config = || super::SessionPersistenceConfig::Json {
+            folder: Some(state.path().to_owned()),
+        };
+        let session = tokio::time::timeout(
+            Duration::from_secs(3),
+            persistent_pending_session(output.path(), config()),
+        )
+        .await
+        .expect("missing metadata blocked startup");
+        assert!(
+            session.get(7.into()).is_some(),
+            "healthy torrent was not restored"
+        );
+        assert!(session.get(hash.into()).is_none());
+        assert_eq!(session.pending_automation_torrents().len(), 1);
+        assert_eq!(session.queue_position(hash), Some(1));
+        #[cfg(feature = "http-api")]
+        {
+            use crate::http_api::{HttpApi, HttpApiOptions};
+            let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+                ([127, 0, 0, 1], 0).into(),
+                Default::default(),
+            )
+            .unwrap();
+            let address = listener.bind_addr();
+            let api = crate::Api::new(
+                session.clone(),
+                None,
+                #[cfg(feature = "tracing-subscriber-utils")]
+                None,
+            );
+            let server = HttpApi::new(
+                api,
+                Some(HttpApiOptions {
+                    basic_auth: Some(("test-user".into(), "test-secret".into())),
+                    enable_qbittorrent_api: true,
+                    ..Default::default()
+                }),
+            )
+            .make_http_api_and_run(listener, None);
+            let task = tokio::spawn(server);
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let url = format!("http://{address}/torrents");
+            assert_eq!(
+                client.get(&url).send().await.unwrap().status(),
+                http::StatusCode::UNAUTHORIZED
+            );
+            let native: serde_json::Value = client
+                .get(&url)
+                .basic_auth("test-user", Some("test-secret"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(native["pending_torrents"][0]["info_hash"], hash.as_string());
+            let qbit: serde_json::Value = client
+                .get(format!("http://{address}/api/v2/torrents/info"))
+                .basic_auth("test-user", Some("test-secret"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(
+                qbit.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["hash"] == hash.as_string())
+            );
+            task.abort();
+        }
+        session
+            .set_pending_automation_paused(hash, true)
+            .await
+            .unwrap();
+        session.stop().await;
+
+        let restored = persistent_pending_session(output.path(), config()).await;
+        let pending = restored.pending_automation_torrents().pop().unwrap();
+        assert!(pending.paused);
+        assert_eq!(restored.queue_position(hash), Some(1));
+        assert_eq!(pending.automation.category, "movies");
+        assert_eq!(pending.automation.uploaded_bytes, 12345);
+        assert_eq!(pending.automation.ratio_limit, Some(1.5));
+        assert!(pending.automation.tags.contains("saved"));
+        let options = pending.serialized().unwrap().options;
+        assert_eq!(options["preferred_id"], 41);
+        assert_eq!(options["only_files"], serde_json::json!([0]));
+        assert_eq!(options["output_folder"], output.path().to_str().unwrap());
+        assert!(
+            restored
+                .persistence
+                .as_ref()
+                .unwrap()
+                .next_id()
+                .await
+                .unwrap()
+                > 41
+        );
+
+        // Replacing the metadata file must preserve the original settings and ID,
+        // even when the caller supplies no add options.
+        let managed = restored
+            .add_torrent(crate::AddTorrent::TorrentFileBytes(bytes), None)
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        managed.wait_until_initialized().await.unwrap();
+        assert_eq!(managed.id(), 41);
+        assert!(managed.is_paused());
+        assert_eq!(managed.automation_metadata().category, "movies");
+        assert_eq!(managed.only_files(), Some(vec![0]));
+        assert!(
+            managed
+                .shared()
+                .trackers
+                .iter()
+                .any(|tracker| tracker.as_str() == "udp://127.0.0.1:9/announce")
+        );
+        assert!(restored.pending_automation_torrents().is_empty());
+        assert!(state.path().join(format!("{hash:?}.torrent")).exists());
+        restored.stop().await;
+        let restored = persistent_pending_session(output.path(), config()).await;
+        assert!(restored.get(41.into()).unwrap().is_paused());
+        assert!(restored.pending_automation_torrents().is_empty());
+        restored.stop().await;
+    }
+
+    #[tokio::test]
+    async fn missing_metadata_peer_discovery_restores_original_id_and_settings() {
+        let state = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let seed_output = tempfile::tempdir().unwrap();
+        let (hash, bytes) = missing_metadata_fixture(state.path(), output.path(), true).await;
+        let config = || super::SessionPersistenceConfig::Json {
+            folder: Some(state.path().to_owned()),
+        };
+        let session = persistent_pending_session(output.path(), config()).await;
+        let mut pending = session
+            .pending_automation_torrents()
+            .pop()
+            .unwrap()
+            .serialized()
+            .unwrap();
+        session.stop().await;
+
+        std::fs::copy(
+            output.path().join("recovery.bin"),
+            seed_output.path().join("recovery.bin"),
+        )
+        .unwrap();
+        let seeder = Session::new_with_opts(
+            seed_output.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                listen: Some(crate::ListenerOptions {
+                    listen_addr: ([127, 0, 0, 1], 0).into(),
+                    ..Default::default()
+                }),
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let seed = seeder
+            .add_torrent(
+                crate::AddTorrent::TorrentFileBytes(bytes),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        seed.wait_until_initialized().await.unwrap();
+        assert!(seed.stats().finished);
+        pending.paused = false;
+        pending.options["paused"] = false.into();
+        pending.options["initial_peers"] = serde_json::json!([seeder.listen_addr().unwrap()]);
+        session
+            .persistence
+            .as_ref()
+            .unwrap()
+            .store_pending(&pending)
+            .await
+            .unwrap();
+
+        let restored = persistent_pending_session(output.path(), config()).await;
+        let managed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(managed) = restored.get(hash.into())
+                    && restored.pending_automation_torrents().is_empty()
+                {
+                    break managed;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("metadata recovery did not complete with a local seeder");
+        managed.wait_until_initialized().await.unwrap();
+        assert_eq!(managed.id(), 41);
+        assert_eq!(managed.only_files(), Some(vec![0]));
+        assert_eq!(managed.automation_metadata().category, "movies");
+        assert_eq!(managed.automation_metadata().ratio_limit, Some(1.5));
+        assert_eq!(managed.automation_metadata().uploaded_bytes, 12345);
+        assert!(state.path().join(format!("{hash:?}.torrent")).exists());
+        restored.stop().await;
+        seeder.stop().await;
+        let restored = persistent_pending_session(output.path(), config()).await;
+        assert_eq!(restored.get(hash.into()).unwrap().id(), 41);
+        assert!(restored.pending_automation_torrents().is_empty());
+        restored.stop().await;
+    }
+
+    #[tokio::test]
+    async fn missing_metadata_recovery_times_out_and_can_be_retried_after_restart() {
+        let state = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let (hash, _) = missing_metadata_fixture(state.path(), output.path(), false).await;
+        let config = || super::SessionPersistenceConfig::Json {
+            folder: Some(state.path().to_owned()),
+        };
+        let session = persistent_pending_session(output.path(), config()).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while session.pending_automation_torrents()[0].metadata_attempts == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(301)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let pending = session.pending_automation_torrents().pop().unwrap();
+                if matches!(pending.state, PendingAutomationTorrentState::Error) {
+                    assert_eq!(
+                        pending.last_error,
+                        Some(PendingAutomationError::MetadataTimeout)
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery did not stop at the metadata deadline");
+        session.stop().await;
+        let restored = persistent_pending_session(output.path(), config()).await;
+        let pending = restored.pending_automation_torrents().pop().unwrap();
+        assert!(matches!(
+            pending.state,
+            PendingAutomationTorrentState::Error
+        ));
+        assert_eq!(
+            pending.last_error,
+            Some(PendingAutomationError::MetadataTimeout)
+        );
+        let old_token = pending.cancellation_token;
+        restored
+            .set_pending_automation_paused(hash, false)
+            .await
+            .unwrap();
+        assert!(old_token.is_cancelled());
+        let pending = restored.pending_automation_torrents().pop().unwrap();
+        assert!(matches!(
+            pending.state,
+            PendingAutomationTorrentState::ResolvingMetadata
+        ));
+        assert!(pending.last_error.is_none());
+        restored.stop().await;
+    }
+
+    #[tokio::test]
+    async fn missing_metadata_empty_and_unreadable_files_are_deferred() {
+        for unreadable in [false, true] {
+            let state = tempfile::tempdir().unwrap();
+            let output = tempfile::tempdir().unwrap();
+            let (hash, _) = missing_metadata_fixture(state.path(), output.path(), true).await;
+            let filename = state.path().join(format!("{hash:?}.torrent"));
+            if unreadable {
+                std::fs::create_dir(filename).unwrap();
+            } else {
+                std::fs::write(filename, []).unwrap();
+            }
+            let session = persistent_pending_session(
+                output.path(),
+                super::SessionPersistenceConfig::Json {
+                    folder: Some(state.path().to_owned()),
+                },
+            )
+            .await;
+            assert!(session.get(hash.into()).is_none());
+            let pending = session.pending_automation_torrents().pop().unwrap();
+            assert_eq!(pending.info_hash, hash);
+            assert!(pending.paused);
+            assert_eq!(pending.metadata_attempts, 0);
+            session.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_metadata_paused_torrent_stays_paused_and_deleted_after_restart() {
+        let state = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let (hash, _) = missing_metadata_fixture(state.path(), output.path(), true).await;
+        let config = || super::SessionPersistenceConfig::Json {
+            folder: Some(state.path().to_owned()),
+        };
+        let session = persistent_pending_session(output.path(), config()).await;
+        let pending = session.pending_automation_torrents().pop().unwrap();
+        assert!(pending.paused);
+        assert_eq!(pending.metadata_attempts, 0);
+        session.delete(hash.into(), false).await.unwrap();
+        assert!(!state.path().join(format!("{hash:?}.bitv")).exists());
+        assert!(output.path().join("recovery.bin").exists());
+        session.stop().await;
+        let restored = persistent_pending_session(output.path(), config()).await;
+        assert!(restored.pending_automation_torrents().is_empty());
+        assert!(restored.get(hash.into()).is_none());
+        assert!(restored.get(7.into()).is_some());
+        restored.stop().await;
     }
 
     async fn pending_restart_contract(config: impl Fn() -> super::SessionPersistenceConfig) {
