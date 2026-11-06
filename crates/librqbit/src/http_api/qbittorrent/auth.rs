@@ -30,9 +30,22 @@ const AUTH_BAN_DURATION: Duration = Duration::from_secs(60 * 60);
 const MAX_AUTH_FAILURES: u8 = 5;
 const MAX_TRACKED_CLIENTS: usize = 1024;
 const MAX_PUBLIC_IP_RESPONSE_SIZE: usize = 64;
+const MAX_CONCURRENT_LOGIN_BODIES: usize = 16;
 const LOGIN_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn read_login(request: Request, state: &ApiState) -> Result<Login, Box<Response>> {
+    // Bound pending bodies globally across both login endpoints. Do not queue
+    // excess callers: that would just move the unbounded allocation to waiters.
+    let Ok(_permit) = state.qbittorrent_sessions.login_bodies.try_acquire() else {
+        return Err(Box::new(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(http::header::CONNECTION, "close")],
+                "Too many login requests",
+            )
+                .into_response(),
+        ));
+    };
     // A size limit alone does not bound unauthenticated slow request bodies.
     match tokio::time::timeout(
         LOGIN_BODY_TIMEOUT,
@@ -71,10 +84,22 @@ impl SessionEntry {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct Sessions {
+    login_bodies: std::sync::Arc<tokio::sync::Semaphore>,
     entries: Mutex<HashMap<[u8; 32], SessionEntry>>,
     auth_failures: Mutex<HashMap<Option<IpAddr>, AuthFailures>>,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self {
+            login_bodies: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_LOGIN_BODIES,
+            )),
+            entries: Default::default(),
+            auth_failures: Default::default(),
+        }
+    }
 }
 
 impl Sessions {
@@ -169,6 +194,11 @@ impl Sessions {
             last_failure: now,
             banned_until: None,
         });
+        // Concurrent callers may have passed their admission check before the
+        // ban was recorded. A late failure must never reset an active ban.
+        if entry.banned_until.is_some_and(|until| until > now) {
+            return;
+        }
         if now.duration_since(entry.first_failure) > AUTH_FAILURE_WINDOW {
             entry.count = 0;
             entry.first_failure = now;
@@ -475,10 +505,11 @@ fn request_source_matches_host(headers: &HeaderMap) -> bool {
     {
         return false;
     }
-    // Fetch Metadata covers browser requests that omit Origin and Referer.
+    // Reject unknown Fetch Metadata values even when Origin/Referer is present.
+    // same-site still needs the explicit source check below for development UIs.
     if headers
         .get("sec-fetch-site")
-        .is_some_and(|site| site == "cross-site")
+        .is_some_and(|site| !matches!(site.as_bytes(), b"same-origin" | b"same-site" | b"none"))
     {
         return false;
     }
@@ -503,6 +534,14 @@ fn request_source_matches_host(headers: &HeaderMap) -> bool {
         return false;
     };
     if !matches!(source.scheme_str(), Some("http" | "https" | "tauri")) {
+        return false;
+    }
+    if headers.contains_key(ORIGIN)
+        && (source
+            .path_and_query()
+            .is_some_and(|path| path.as_str() != "/")
+            || source_authority.as_str().contains('@'))
+    {
         return false;
     }
     if source_authority.as_str().eq_ignore_ascii_case(host) {
@@ -568,6 +607,153 @@ mod tests {
         MAX_AUTH_FAILURES, MAX_PUBLIC_IP_RESPONSE_SIZE, Sessions, parse_public_ip_response,
         request_source_matches_host,
     };
+
+    #[cfg(feature = "webui")]
+    #[tokio::test]
+    async fn login_body_capacity_is_shared_and_recovers_after_disconnect() {
+        use crate::{
+            Api, Session, SessionOptions,
+            http_api::{HttpApi, HttpApiOptions},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .unwrap();
+        let addr = listener.bind_addr();
+        let api = HttpApi::new(
+            Api::new(session.clone(), None, None),
+            Some(HttpApiOptions {
+                basic_auth: Some(("user".into(), "secret".into())),
+                enable_qbittorrent_api: true,
+                ..Default::default()
+            }),
+        );
+        let slots = api.qbittorrent_sessions.login_bodies.clone();
+        let server = tokio::spawn(api.make_http_api_and_run(listener, None));
+        let mut pending = Vec::new();
+        let paths = ["web/auth/login", "api/v2/auth/login"];
+        for index in 0..super::MAX_CONCURRENT_LOGIN_BODIES {
+            let mut connection = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let path = paths[index % paths.len()];
+            connection.write_all(format!(
+                "POST /{path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 29\r\n\r\nusername=user&"
+            ).as_bytes()).await.unwrap();
+            pending.push(connection);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while slots.available_permits() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for path in paths {
+            // Rejection must close without waiting for the remaining body.
+            let mut connection = tokio::net::TcpStream::connect(addr).await.unwrap();
+            connection.write_all(format!(
+                "POST /{path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 29\r\n\r\nusername=user&"
+            ).as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                connection.read_to_end(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let response = std::str::from_utf8(&response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 429"), "{response}");
+            assert!(!response.to_ascii_lowercase().contains("set-cookie:"));
+        }
+        drop(pending);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while slots.available_permits() != super::MAX_CONCURRENT_LOGIN_BODIES {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        for path in paths {
+            let response = client
+                .post(format!("http://{addr}/{path}"))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body("username=user&password=secret")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            assert!(response.headers().contains_key("set-cookie"));
+        }
+        server.abort();
+        session.stop().await;
+    }
+
+    #[test]
+    fn late_failures_cannot_clear_an_active_ban() {
+        let sessions = Sessions::default();
+        let ip = Some(Ipv4Addr::LOCALHOST.into());
+        for _ in 0..MAX_AUTH_FAILURES {
+            sessions.record_login_failure(ip);
+        }
+        let until = sessions.auth_failures.lock()[&ip].banned_until;
+        sessions
+            .auth_failures
+            .lock()
+            .get_mut(&ip)
+            .unwrap()
+            .first_failure = std::time::Instant::now()
+            - super::AUTH_FAILURE_WINDOW
+            - std::time::Duration::from_secs(1);
+        sessions.record_login_failure(ip);
+        assert!(!sessions.login_is_allowed(ip));
+        assert_eq!(sessions.auth_failures.lock()[&ip].banned_until, until);
+    }
+
+    #[test]
+    fn malformed_browser_source_headers_are_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert(super::HOST, HeaderValue::from_static("example.test"));
+        headers.insert(
+            super::ORIGIN,
+            HeaderValue::from_static("https://example.test"),
+        );
+        assert!(request_source_matches_host(&headers));
+        for invalid in ["invalid", "", "same-origin, cross-site"] {
+            headers.insert("sec-fetch-site", HeaderValue::from_str(invalid).unwrap());
+            assert!(!request_source_matches_host(&headers));
+        }
+        headers.remove("sec-fetch-site");
+        for origin in [
+            "https://example.test/path",
+            "https://example.test?query",
+            "https://user@example.test",
+        ] {
+            headers.insert(super::ORIGIN, HeaderValue::from_str(origin).unwrap());
+            assert!(!request_source_matches_host(&headers));
+        }
+        headers.remove(super::ORIGIN);
+        headers.insert(
+            super::REFERER,
+            HeaderValue::from_static("https://example.test/web/"),
+        );
+        assert!(request_source_matches_host(&headers));
+    }
 
     #[test]
     fn session_idle_timeout_rotation_and_absolute_lifetime() {

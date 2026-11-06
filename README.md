@@ -49,6 +49,12 @@ There is no anonymous API mode. Native APIs, metrics, logs, streaming, and optio
 
 Session cookies use `Secure`, `HttpOnly`, and `SameSite=Strict` by default and expire server-side after one hour or 15 minutes without authenticated requests; logout revokes the session. Successful login replaces and revokes the SID presented by that client, while independent clients keep their sessions. Use HTTPS for browser access. Only for local development or a trusted plaintext network, explicitly set `RQBIT_HTTP_API_INSECURE_COOKIES=true` (or `--http-api-insecure-cookies`) to allow HTTP login cookies. Forwarded headers cannot disable secure cookies. HTTP Basic credentials and Bearer keys still require TLS to protect them in transit. The desktop app's optional HTTP server uses `RQBIT_HTTP_BASIC_AUTH_USERPASS` too; without it, that listener fails closed while native desktop commands remain available.
 
+Both login endpoints share a limit of 16 unfinished form bodies per HTTP server, in
+addition to the 8 KiB body limit and 10-second body deadline. Excess login bodies
+receive HTTP 429; HTTP/1 connections close without draining the unfinished body.
+Clients can retry after pending logins finish or time out. This bounds login body
+processing, not all network connections; keep connection limits at the HTTPS proxy.
+
 Downloaded active content such as HTML, SVG, scripts, and PDFs is served as an attachment with a sandbox content policy, preventing it from running with the web UI's session. Audio/video and supported raster images remain streamable. API responses are marked `no-store`, and cross-origin browser requests are rejected, including reads authenticated by cookies and same-site requests without a source header. The web UI content policy restricts scripts, connections, and form submissions to its own origin. Hardcoded development HTTP origins are allowed only in debug builds.
 
 Authentication failures remain counted when successful background Basic/Bearer API requests arrive from the same address; a successful form login clears earlier failures.

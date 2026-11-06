@@ -210,3 +210,54 @@ outside the validation performed here.
   compiled and passed. Broader attempts initially ran out of disk space and lacked
   permission to bind test sockets. Generated project build artifacts were cleared
   and tests were rerun with local socket access.
+
+## Login admission review — 2026-11-06
+
+- Native Web UI and qBittorrent login endpoints share a maximum of 16 pending
+  form-body reads per HTTP server. Admission is immediate: excess callers receive
+  HTTP 429 and an HTTP/1 connection-close response, without waiting for or draining
+  the unfinished body. Permits release on completion, malformed bodies, timeout,
+  and disconnect. The existing 8 KiB limit and 10-second deadline remain in place.
+  This bounds login-body processing, not all HTTP connections or transport buffers;
+  deployment connection limits remain the HTTPS proxy's responsibility.
+- A late authentication failure no longer resets an existing ban when the original
+  failure window has elapsed. This closes a concurrency edge case for callers that
+  passed admission before another request recorded the ban.
+- Browser source validation rejects unrecognized Fetch Metadata values even when
+  Origin or Referer is present, and rejects Origin values containing non-root paths, query
+  strings, or user information. Normal Referer paths remain supported.
+- Existing session entropy, hashed server-side tokens, rotation, logout revocation,
+  absolute/idle expiration, secure cookie defaults, Basic/Bearer scope and throttling
+  remain covered by the authentication regression suite.
+- Refreshed dependency audits: npm reports zero vulnerabilities. RustSec still
+  reports ringbuf 0.4.8 (RUSTSEC-2026-0293), desktop glib unsoundness and the
+  maintenance warnings described above. The published librqbit-utp version remains
+  0.7.0; no compatible fixed dependency release was found. These findings have not
+  been suppressed or represented as fixed.
+
+The workspace version advances to `9.0.1-servarr.16`. This review does not guarantee
+unbreachable authentication or establish that all project security issues are fixed.
+Production TLS/proxy settings, platform-specific desktop behavior, and adversarial
+protocol fuzzing still require separate verification. No changes were pushed or deployed.
+
+### Login admission validation
+
+- `cargo fmt --all -- --check`, `git diff --check`, `cargo check --offline`, and
+  `CARGO_INCREMENTAL=0 cargo clippy --all-targets --offline` passed. The existing
+  JSON persistence `fetch_update` deprecation warning remains.
+- `CARGO_INCREMENTAL=0 cargo test -p librqbit --features
+  http-api,webui,tracing-subscriber-utils http_api:: --offline -- --test-threads=1`
+  passed all 55 tests, including shared login-body capacity, immediate connection
+  closure without session issuance, recovery after disconnect, late-failure ban
+  retention, malformed browser source checks, and existing authentication/session
+  and compatibility tests. The initial restricted run could not bind sockets;
+  these tests passed when rerun with local socket access.
+- `npm audit --json` reports zero vulnerabilities. `cargo audit --json` still exits
+  unsuccessfully for the unresolved RustSec finding documented above; glib and
+  maintenance warnings also remain. No dependency ignore entries were added.
+- `CARGO_INCREMENTAL=0 cargo test --workspace --exclude rqbit-desktop --offline
+  -- --test-threads=1` passed: 311 tests passed, 0 failed, 11 ignored. This covers
+  the server workspace, including authentication/compatibility, session persistence,
+  filesystem safety and TCP/uTP transfers. Native desktop builds, frontend browser
+  execution, Docker publication and the deployed TLS/proxy configuration were not
+  verified in this review.
