@@ -91,12 +91,7 @@ async fn simple_basic_auth(
         _ => return Err(ApiError::unauthorized()),
     };
     #[cfg(feature = "webui")]
-    if request.uri().path() == "/"
-        && headers
-            .get(http::header::ACCEPT)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.contains("text/html"))
-    {
+    if request.uri().path() == "/" && webui::accepts_html(&headers) {
         return Ok(next.run(request).await);
     }
     if sessions.authenticates(&headers) {
@@ -1274,6 +1269,52 @@ mod tests {
         let response = client.get(format!("{base}/web/")).send().await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert!(response.headers().get("WWW-Authenticate").is_none());
+
+        let external_request = |method, path: &str, destination, accept| {
+            client
+                .request(method, format!("{base}{path}"))
+                .header("Accept", accept)
+                .header("Referer", "https://dashboard.example/")
+                .header("Sec-Fetch-Site", "cross-site")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Dest", destination)
+        };
+        for (path, status) in [
+            ("/", reqwest::StatusCode::TEMPORARY_REDIRECT),
+            ("/web", reqwest::StatusCode::PERMANENT_REDIRECT),
+            ("/web/", reqwest::StatusCode::OK),
+        ] {
+            let response = external_request(reqwest::Method::GET, path, "document", "text/html")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+            assert!(!response.headers().contains_key("WWW-Authenticate"));
+        }
+
+        for (method, path, destination, accept) in [
+            (reqwest::Method::GET, "/", "document", "application/json"),
+            (reqwest::Method::GET, "/web/", "iframe", "text/html"),
+            (reqwest::Method::GET, "/torrents", "document", "text/html"),
+            (
+                reqwest::Method::GET,
+                "/web/auth/status",
+                "document",
+                "text/html",
+            ),
+            (
+                reqwest::Method::POST,
+                "/web/auth/login",
+                "document",
+                "text/html",
+            ),
+        ] {
+            let response = external_request(method, path, destination, accept)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN, "{path}");
+        }
 
         let status: serde_json::Value = client
             .get(format!("{base}/web/auth/status"))

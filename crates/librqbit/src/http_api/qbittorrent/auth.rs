@@ -490,6 +490,10 @@ pub(in crate::http_api) async fn require_same_origin(
     request: Request,
     next: Next,
 ) -> Response {
+    #[cfg(feature = "webui")]
+    if super::super::webui::is_external_landing_navigation(&request) {
+        return next.run(request).await;
+    }
     if request_source_matches_host(&headers) {
         next.run(request).await
     } else {

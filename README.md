@@ -55,7 +55,7 @@ receive HTTP 429; HTTP/1 connections close without draining the unfinished body.
 Clients can retry after pending logins finish or time out. This bounds login body
 processing, not all network connections; keep connection limits at the HTTPS proxy.
 
-Downloaded active content such as HTML, SVG, scripts, and PDFs is served as an attachment with a sandbox content policy, preventing it from running with the web UI's session. Audio/video and supported raster images remain streamable. API responses are marked `no-store`, and cross-origin browser requests are rejected, including reads authenticated by cookies and same-site requests without a source header. The web UI content policy restricts scripts, connections, and form submissions to its own origin. Hardcoded development HTTP origins are allowed only in debug builds.
+Downloaded active content such as HTML, SVG, scripts, and PDFs is served as an attachment with a sandbox content policy, preventing it from running with the web UI's session. Audio/video and supported raster images remain streamable. API responses are marked `no-store`, and cross-origin API requests are rejected, including reads authenticated by cookies and same-site requests without a source header. Dashboard links can open the Web UI landing page as a top-level browser navigation. The web UI content policy restricts scripts, connections, and form submissions to its own origin. Hardcoded development HTTP origins are allowed only in debug builds.
 
 Authentication failures remain counted when successful background Basic/Bearer API requests arrive from the same address; a successful form login clears earlier failures.
 

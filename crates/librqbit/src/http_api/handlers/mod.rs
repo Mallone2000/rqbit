@@ -26,12 +26,7 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
     // If browser, and webui enabled, redirect to web
     #[cfg(feature = "webui")]
     {
-        if parts
-            .headers
-            .get("Accept")
-            .and_then(|h| h.to_str().ok())
-            .is_some_and(|h| h.contains("text/html"))
-        {
+        if super::webui::accepts_html(&parts.headers) {
             return Redirect::temporary("./web/").into_response();
         }
     }
