@@ -48,7 +48,7 @@ apply to reads as well as writes. Mutations are absent in read-only mode.
 | Blacklist sync | `app/setPreferences` | Persist excluded-file wildcard patterns; filtering must be enabled explicitly |
 | Download Cleaner | paths, tags, category, ratio, seeding time, activity | `save_path` joined with a file's `name` addresses the actual download file, including multi-file folders |
 | Alternate-speed probe | `transfer/speedLimitsMode` | Disabled; rqbit has no alternative-speed schedule |
-| Home Assistant monitoring | `sync/maindata` (GET/POST), `transfer/speedLimitsMode` (GET), `torrents/info` (GET) | Full snapshots with torrent/category maps, speeds, rate limits, connection status and current-session transfer totals; cookie authentication required unless using supported Basic/Bearer credentials |
+| Home Assistant monitoring | `sync/maindata` (GET/POST), `transfer/speedLimitsMode` (GET), `torrents/info` (GET) | Full snapshots with torrent/category maps, speeds, rate limits, connection status and current-session transfer totals; sync snapshots use stopped state names and torrent-list services support Home Assistant's filters; cookie authentication required unless using supported Basic/Bearer credentials |
 
 Home Assistant's alternative-speed switch is unsupported: `setSpeedLimitsMode`
 and `toggleSpeedLimitsMode` are not implemented. Current-session totals reset

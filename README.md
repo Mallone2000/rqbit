@@ -167,6 +167,9 @@ speed mode as disabled (`0`); Home Assistant's **Alternative speed** switch is
 unsupported because rqbit has no second rate-limit profile. Transfer totals are
 for the current rqbit session and reset on restart. This is partial qBittorrent
 compatibility, not support for every feature listed by the integration.
+Home Assistant's torrent-list filters are supported; sync snapshots use its
+`stoppedDL`/`stoppedUP` state names for paused torrents. Other qBittorrent torrent
+list clients continue to receive `pausedDL`/`pausedUP`.
 
 ### Torrent queueing
 

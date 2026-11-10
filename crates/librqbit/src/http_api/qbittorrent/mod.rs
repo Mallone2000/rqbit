@@ -357,6 +357,10 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                     .live
                     .as_ref()
                     .map_or(0, |live| live.download_speed.as_bytes());
+                let upspeed = stats
+                    .live
+                    .as_ref()
+                    .map_or(0, |live| live.upload_speed.as_bytes());
                 let eta = if stats.finished {
                     0
                 } else {
@@ -412,6 +416,7 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
                     progress,
                     eta,
                     dlspeed,
+                    upspeed,
                     downloaded: stats.progress_bytes,
                     added_on: automation.added_at_unix_seconds,
                     completion_on: automation.completed_at_unix_seconds.unwrap_or_default(),
@@ -479,6 +484,7 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
             progress: 0.0,
             eta: UNKNOWN_ETA_SECONDS,
             dlspeed: 0,
+            upspeed: 0,
             downloaded: 0,
             added_on: pending.automation.added_at_unix_seconds,
             completion_on: 0,
@@ -530,7 +536,27 @@ fn collect_torrent_info(state: &ApiState, query: InfoQuery) -> Vec<TorrentInfo> 
             last_activity: 0,
         });
     }
+    if let Some(filter) = query.filter.as_deref() {
+        torrents.retain(|torrent| torrent_matches_filter(torrent, filter));
+    }
     torrents
+}
+
+fn torrent_matches_filter(torrent: &TorrentInfo, filter: &str) -> bool {
+    let stopped = matches!(torrent.state, "pausedDL" | "pausedUP");
+    let active = torrent.dlspeed > 0 || torrent.upspeed > 0;
+    match filter {
+        "active" => active,
+        "inactive" => !active,
+        "paused" | "stopped" => stopped,
+        "started" | "running" | "resumed" => !stopped,
+        "seeding" => matches!(
+            torrent.state,
+            "uploading" | "stalledUP" | "queuedUP" | "forcedUP" | "checkingUP"
+        ),
+        "errored" => matches!(torrent.state, "error" | "missingFiles"),
+        _ => true,
+    }
 }
 
 async fn sync_main_data(State(state): State<ApiState>) -> Json<SyncMainData> {
@@ -541,7 +567,15 @@ async fn sync_main_data(State(state): State<ApiState>) -> Json<SyncMainData> {
     let limits = session.ratelimits.get_config();
     let torrents = collect_torrent_info(&state, InfoQuery::default())
         .into_iter()
-        .map(|torrent| (torrent.hash.clone(), torrent))
+        .map(|mut torrent| {
+            // Home Assistant uses the newer stopped state names in sync data.
+            torrent.state = match torrent.state {
+                "pausedDL" => "stoppedDL",
+                "pausedUP" => "stoppedUP",
+                state => state,
+            };
+            (torrent.hash.clone(), torrent)
+        })
         .collect();
 
     Json(SyncMainData {
@@ -3000,6 +3034,36 @@ mod tests {
             .unwrap();
         assert!(completed_incomplete_hash.as_array().unwrap().is_empty());
 
+        for (filter, expected) in [
+            ("paused", 2),
+            ("inactive", 2),
+            ("active", 0),
+            ("errored", 0),
+            ("seeding", 0),
+            ("started", 0),
+        ] {
+            let response = client
+                .get(format!("{base}/torrents/info?filter={filter}"))
+                .basic_auth("test-user", Some("secret"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let torrents: Value = response.json().await.unwrap();
+            assert_eq!(torrents.as_array().unwrap().len(), expected, "{filter}");
+        }
+        let sync: Value = client
+            .post(format!("{base}/sync/maindata"))
+            .basic_auth("test-user", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(sync["torrents"][&complete_hash]["state"], "stoppedUP");
+        assert_eq!(sync["torrents"][&incomplete_hash]["state"], "stoppedDL");
+
         let trackers_response = client
             .get(format!(
                 "{base}/torrents/trackers?hash={}",
@@ -4772,6 +4836,26 @@ mod tests {
         assert_eq!(info[0]["state"], "pausedDL");
         assert_eq!(info[0]["ratio_limit"], 1.5);
         assert_eq!(info[0]["seeding_time_limit"], 10);
+        let paused: Value = client
+            .get(format!("{base}/torrents/info?filter=paused"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(paused.as_array().unwrap().len(), 1);
+        let sync: Value = client
+            .post(format!("{base}/sync/maindata"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(sync["torrents"][hash]["state"], "stoppedDL");
         assert_eq!(
             session.pending_automation_torrents()[0].metadata_attempts,
             0
@@ -4793,6 +4877,16 @@ mod tests {
                 .status(),
             reqwest::StatusCode::OK
         );
+        let paused: Value = client
+            .get(format!("{base}/torrents/info?filter=paused"))
+            .basic_auth("test", Some("secret"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(paused.as_array().unwrap().is_empty());
         let pause_url = format!("{native}/torrents/{hash}/pause");
         assert_eq!(
             client.post(&pause_url).send().await.unwrap().status(),

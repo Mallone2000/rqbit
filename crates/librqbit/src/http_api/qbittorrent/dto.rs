@@ -58,6 +58,7 @@ pub(super) struct TorrentInfo {
     pub progress: f64,
     pub eta: u64,
     pub dlspeed: u64,
+    pub upspeed: u64,
     pub downloaded: u64,
     pub added_on: u64,
     pub completion_on: u64,
