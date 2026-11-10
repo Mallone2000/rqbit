@@ -128,6 +128,46 @@ Torrent-add boolean fields (`paused`, `sequentialDownload`, and `firstLastPieceP
 
 The compatibility profile advertises Web API 2.9.2. It supports sequential downloading, first/last 1% piece priority, `Original`/`Subfolder` content layout, and per-torrent inactive seeding limits. Force Start bypasses queue and share limits until paused or explicitly cleared. These settings survive pending metadata resolution and restart. Queueing is opt in: enable it in the web UI, CLI or API. Priority requests return 409 only while queueing is disabled. See the [source-based compatibility matrix and validation limits](AUTOMATION-COMPATIBILITY.md).
 
+### Home Assistant
+
+Use Home Assistant's built-in [qBittorrent integration](https://www.home-assistant.io/integrations/qbittorrent/).
+Enable `RQBIT_QBITTORRENT_API_ENABLE=true`, then add the integration under
+**Settings > Devices & services** with rqbit's base URL and the username/password
+from `RQBIT_HTTP_BASIC_AUTH_USERPASS`. Use the server root (for example,
+`https://rqbit.example.com`), without `/web` or `/api/v2`. Prefer the
+[HTTPS proxy deployment](docker/compose-examples/https.md) and keep certificate
+verification enabled.
+
+Home Assistant logs in through `/api/v2/auth/login`, then reuses the SID cookie for
+`POST /api/v2/sync/maindata` and `GET /api/v2/transfer/speedLimitsMode`.
+With the default Secure cookies, connecting over plaintext HTTP can make login
+succeed but polling fail with `403 Forbidden` and a misleading username/password
+error: the client does not send the cookie over HTTP. Changing the password does
+not fix that transport mismatch.
+
+If Home Assistant must connect over HTTP on an explicitly trusted private network,
+set the existing opt-in on the **rqbit** service:
+
+```yaml
+environment:
+  RQBIT_QBITTORRENT_API_ENABLE: "true"
+  RQBIT_HTTP_API_INSECURE_COOKIES: "true"
+  RQBIT_HTTP_BASIC_AUTH_USERPASS: "${RQBIT_USER:?}:${RQBIT_PASSWORD:?}"
+```
+
+Recreate the rqbit container to apply changed environment variables, then reload
+the qBittorrent integration in Home Assistant. For a non-container server, set the
+same environment variables and restart rqbit. This setting affects Web UI cookies
+too; credentials and sessions travel unencrypted over HTTP. Keep the default
+`false` when Home Assistant connects through HTTPS. Forwarded headers do not
+change cookie security.
+
+Monitoring and torrent-list requests are supported. rqbit reports alternative
+speed mode as disabled (`0`); Home Assistant's **Alternative speed** switch is
+unsupported because rqbit has no second rate-limit profile. Transfer totals are
+for the current rqbit session and reset on restart. This is partial qBittorrent
+compatibility, not support for every feature listed by the integration.
+
 ### Torrent queueing
 
 Queueing applies to all managed torrents, independently of the qBittorrent API.

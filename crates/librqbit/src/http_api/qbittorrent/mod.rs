@@ -2560,6 +2560,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn home_assistant_http_cookie_login_requires_explicit_opt_in() {
+        let downloads = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            downloads.path().to_path_buf(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        for insecure in [false, true] {
+            let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                Default::default(),
+            )
+            .unwrap();
+            let address = listener.bind_addr();
+            let base = format!("http://rqbit.test:{}/api/v2", address.port());
+            let server = HttpApi::new(
+                Api::new(session.clone(), None, None),
+                Some(HttpApiOptions {
+                    enable_qbittorrent_api: true,
+                    basic_auth: Some(("test".into(), "secret".into())),
+                    insecure_session_cookies: insecure,
+                    ..Default::default()
+                }),
+            )
+            .make_http_api_and_run(listener, None);
+            let server = tokio::spawn(async move { server.await.unwrap() });
+            // Cookie jars can exempt loopback hosts from Secure-cookie restrictions.
+            let client = reqwest::Client::builder()
+                .cookie_store(true)
+                .no_proxy()
+                .resolve("rqbit.test", address)
+                .build()
+                .unwrap();
+
+            let login = client
+                .post(format!("{base}/auth/login"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("username=test&password=secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(login.status(), reqwest::StatusCode::OK);
+            assert_eq!(login.text().await.unwrap(), "Ok.");
+
+            // Home Assistant reuses its cookie jar, without HTTP Basic credentials.
+            for _ in 0..2 {
+                let response = client
+                    .post(format!("{base}/sync/maindata"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body("rid=0")
+                    .send()
+                    .await
+                    .unwrap();
+                if insecure {
+                    assert_eq!(response.status(), reqwest::StatusCode::OK);
+                    let data: Value = response.json().await.unwrap();
+                    assert_eq!(data["full_update"], true);
+                    assert!(data["server_state"]["dl_info_speed"].is_number());
+                } else {
+                    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+                    assert_eq!(response.text().await.unwrap(), "Forbidden");
+                }
+            }
+
+            let response = client
+                .get(format!("{base}/transfer/speedLimitsMode"))
+                .send()
+                .await
+                .unwrap();
+            if insecure {
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                assert_eq!(response.text().await.unwrap(), "0");
+                let response = client
+                    .post(format!("{base}/auth/logout"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                let response = client
+                    .post(format!("{base}/sync/maindata"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+            } else {
+                assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn home_assistant_monitoring_endpoints_are_available_and_protected() {
         let downloads = tempfile::tempdir().unwrap();
         let session = Session::new_with_opts(

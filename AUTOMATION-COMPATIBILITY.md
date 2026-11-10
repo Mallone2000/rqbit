@@ -1,4 +1,4 @@
-# Sonarr, Radarr, and Cleanuparr compatibility
+# Sonarr, Radarr, Cleanuparr, and Home Assistant compatibility
 
 This fork implements the qBittorrent download-client contract used by these
 applications. Their own REST APIs control library management, searches, queues,
@@ -17,6 +17,13 @@ Reviewed on 2026-10-27 against these source revisions:
 - User-facing [Sonarr API documentation](https://sonarr.tv/docs/api/#v5) and
   [Radarr API documentation](https://radarr.video/docs/api/). The download-client
   requirements below come from the adapters, rather than the Arr REST schemas.
+
+Home Assistant's [integration documentation](https://www.home-assistant.io/integrations/qbittorrent/),
+[login helper](https://github.com/home-assistant/core/blob/dev/homeassistant/components/qbittorrent/helpers.py),
+and [polling coordinator](https://github.com/home-assistant/core/blob/dev/homeassistant/components/qbittorrent/coordinator.py)
+were reviewed on 2026-11-10. Its login uses a SID cookie; polling does not send
+HTTP Basic credentials. Use HTTPS with default Secure cookies, or explicitly opt
+in to insecure cookies for a trusted plaintext network as described in README.
 
 ## Consumer contract
 
@@ -41,6 +48,11 @@ apply to reads as well as writes. Mutations are absent in read-only mode.
 | Blacklist sync | `app/setPreferences` | Persist excluded-file wildcard patterns; filtering must be enabled explicitly |
 | Download Cleaner | paths, tags, category, ratio, seeding time, activity | `save_path` joined with a file's `name` addresses the actual download file, including multi-file folders |
 | Alternate-speed probe | `transfer/speedLimitsMode` | Disabled; rqbit has no alternative-speed schedule |
+| Home Assistant monitoring | `sync/maindata` (GET/POST), `transfer/speedLimitsMode` (GET), `torrents/info` (GET) | Full snapshots with torrent/category maps, speeds, rate limits, connection status and current-session transfer totals; cookie authentication required unless using supported Basic/Bearer credentials |
+
+Home Assistant's alternative-speed switch is unsupported: `setSpeedLimitsMode`
+and `toggleSpeedLimitsMode` are not implemented. Current-session totals reset
+when rqbit restarts; they are not persisted all-time counters.
 
 ## Limits and lifecycle
 
@@ -117,3 +129,9 @@ PostgreSQL record conversion is tested without a database; live PostgreSQL resta
 tests require a dedicated `RQBIT_TEST_POSTGRES_URL` and are ignored by default.
 These tests are not an end-to-end certification with running Sonarr, Radarr, and
 Cleanuparr containers, nor a complete security audit.
+
+Home Assistant regressions use a real HTTP cookie jar to cover successful login
+followed by forbidden HTTP polling with default Secure cookies, successful polling
+with explicit insecure-cookie opt-in, repeated refreshes, the speed-mode probe,
+and logout. They do not run a Home Assistant instance. Run them with
+`cargo test -p librqbit --features http-api,tracing-subscriber-utils home_assistant`.
